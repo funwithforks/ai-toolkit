@@ -111,6 +111,9 @@ def get_optimizer(
         if 'eps' not in optimizer_params:
             optimizer_params['eps'] = 1e-6
         optimizer = AdamConvRot(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type == 'rose':
+        from rose_opt import Rose
+        optimizer = Rose(params, lr=float(learning_rate), **optimizer_params)
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     return optimizer

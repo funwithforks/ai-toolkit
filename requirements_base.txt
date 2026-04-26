@@ -43,3 +43,4 @@ av==16.0.1
 torchcodec==0.15.0
 librosa==0.11.0
 mutagen==1.47.0
+rose-opt
