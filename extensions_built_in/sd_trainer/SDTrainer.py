@@ -1411,7 +1411,10 @@ class SDTrainer(BaseSDTrainProcess):
         )
     
 
-    def train_single_accumulation(self, batch: DataLoaderBatchDTO):
+    def train_single_accumulation(self, batch: DataLoaderBatchDTO, accum_scale: float = 1.0):
+        # accum_scale: 1 / number of micro-batches accumulated per optimizer step, so the
+        # summed gradients equal the mean over the effective batch. Applied to the backward
+        # only; the returned loss stays unscaled for logging.
         with torch.no_grad():
             self.timer.start('preprocess_batch')
             if isinstance(self.adapter, CustomAdapter):
@@ -2281,7 +2284,7 @@ class SDTrainer(BaseSDTrainProcess):
                     # if self.is_bfloat:
                     # loss.backward()
                     # else:
-                    self.accelerator.backward(loss)
+                    self.accelerator.backward(loss * accum_scale if accum_scale != 1.0 else loss)
 
         return loss.detach()
         # flush()
@@ -2293,6 +2296,12 @@ class SDTrainer(BaseSDTrainProcess):
             batch_list = [batch]
         total_loss = None
         self.optimizer.zero_grad()
+        # micro-batches per optimizer step: a batch list (gradient_accumulation) or repeated
+        # calls (gradient_accumulation_steps). -1 (whole epoch) has no fixed count; left summed.
+        n_accum = len(batch_list)
+        if self.train_config.gradient_accumulation_steps > 1:
+            n_accum *= self.train_config.gradient_accumulation_steps
+        accum_scale = 1.0 / n_accum
         for batch in batch_list:
             if self.sd.is_multistage:
                 # handle multistage switching
@@ -2306,7 +2315,7 @@ class SDTrainer(BaseSDTrainProcess):
                         if self.current_boundary_index in self.sd.trainable_multistage_boundaries:
                             # if this boundary is trainable, we can stop looking
                             break
-            loss = self.train_single_accumulation(batch)
+            loss = self.train_single_accumulation(batch, accum_scale=accum_scale)
             self.steps_this_boundary += 1
             if total_loss is None:
                 total_loss = loss
