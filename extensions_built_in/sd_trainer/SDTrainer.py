@@ -1863,6 +1863,12 @@ class SDTrainer(BaseSDTrainProcess):
                             if self.train_config.diff_output_preservation:
                                 # datasets can have their own trigger words, replace per item
                                 def replace_trigger_with_class(prompt, file_item):
+                                    # inline [trigger:X class:Y] tokens were already swapped to
+                                    # their trigger words in the caption, swap those back to classes
+                                    pairs = getattr(file_item, '_inline_dop_pairs', None)
+                                    if pairs is not None:
+                                        for pair_trigger, pair_class in pairs:
+                                            prompt = prompt.replace(pair_trigger, pair_class)
                                     trigger = file_item.trigger_word if file_item.trigger_word is not None else self.trigger_word
                                     if trigger is None:
                                         return prompt

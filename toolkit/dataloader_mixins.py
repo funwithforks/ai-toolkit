@@ -26,7 +26,7 @@ from toolkit.control_generator import ControlGenerator
 from toolkit.dto import DTO, DISK_PREFIX
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatible
-from toolkit.prompt_utils import inject_trigger_into_prompt
+from toolkit.prompt_utils import inject_trigger_into_prompt, extract_inline_dop_pairs, apply_inline_dop
 from torchvision import transforms
 from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageOps import exif_transpose
@@ -327,6 +327,10 @@ class CaptionProcessingDTOMixin:
             self.caption_dop: str = None
             # D-OPSD teacher caption (trigger word replaced by <Picture 1>/<Video 1>)
             self.caption_dopsd: str = None
+            # parsed inline [trigger:X class:Y] tokens [(trigger, class), ...] and the
+            # caption variant with the classes swapped in (None when no inline tokens)
+            self._inline_dop_pairs = None
+            self._inline_dop_caption = None
 
             dataset_config: DatasetConfig = kwargs.get('dataset_config', None)
             self.extra_values: List[float] = dataset_config.extra_values
@@ -370,15 +374,28 @@ class CaptionProcessingDTOMixin:
             self.raw_caption = prompt
             self.raw_caption_short = short_caption
 
-        self.caption = self.get_caption()
+        processed_caption = self.get_caption()
+        self._inline_dop_pairs = extract_inline_dop_pairs(processed_caption) or None
+        self._inline_dop_caption = None
+        if self._inline_dop_pairs is not None:
+            # swap the inline tokens after all caption processing so both variants
+            # keep identical token order. Normal caption takes the trigger word,
+            # the DOP variant takes the class.
+            self.caption = apply_inline_dop(processed_caption, use_class=False)
+            self._inline_dop_caption = apply_inline_dop(processed_caption, use_class=True)
+        else:
+            self.caption = processed_caption
         if self.raw_caption_short is not None:
             self.caption_short = self.get_caption(short_caption=True)
+            if self._inline_dop_pairs is not None:
+                self.caption_short = apply_inline_dop(self.caption_short, use_class=False)
         if self.dataset_config.diff_output_preservation:
             # replace this dataset's trigger word with the preservation class.
             # do it on the final caption so token order matches the normal caption
-            self.caption_dop = self.caption
+            # (if the caption has inline tokens, start from the class-swapped variant)
+            self.caption_dop = self._inline_dop_caption if self._inline_dop_caption is not None else self.caption
             if self.trigger_word is not None:
-                self.caption_dop = self.caption.replace(
+                self.caption_dop = self.caption_dop.replace(
                     self.trigger_word, self.dataset_config.diff_output_preservation_class
                 )
         if getattr(self, 'dopsd_self_ref', False):
@@ -458,6 +475,10 @@ class CaptionProcessingDTOMixin:
 
         # join back together
         caption = ', '.join(token_list) if token_list is not None else raw_caption
+        if add_if_not_present and len(extract_inline_dop_pairs(caption)) > 0:
+            # the inline [trigger:X class:Y] tokens bring their own trigger word.
+            # do not auto-prepend the config trigger on top of them
+            add_if_not_present = False
         caption = inject_trigger_into_prompt(caption, trigger, to_replace_list, add_if_not_present)
 
         if self.dataset_config.random_triggers:
@@ -2298,6 +2319,11 @@ class TextEmbeddingFileItemDTOMixin:
     def get_dropout_caption(self: 'FileItemDTO'):
         # when encoding live, dropped captions still get the trigger word injected
         # downstream (add_if_not_present when not a reg image), so match that here
+        pairs = getattr(self, '_inline_dop_pairs', None)
+        if pairs is not None and not self.is_reg:
+            # inline items carry their own identities. do not add the config
+            # trigger on top, that would inject a different character's name
+            return ' '.join(dict.fromkeys([t for t, c in pairs]))
         if self.trigger_word is not None and not self.is_reg:
             return inject_trigger_into_prompt('', trigger=self.trigger_word, add_if_not_present=True)
         return ''
@@ -2305,6 +2331,10 @@ class TextEmbeddingFileItemDTOMixin:
     def get_dop_dropout_caption(self: 'FileItemDTO'):
         # live encoding replaces the trigger word with the preservation class on the
         # dropped caption (class only), so the cached DOP dropout caption must match
+        pairs = getattr(self, '_inline_dop_pairs', None)
+        if pairs is not None and not self.is_reg:
+            # dropped DOP caption: the inline classes only
+            return ' '.join(dict.fromkeys([c for t, c in pairs]))
         dropout_caption = self.get_dropout_caption()
         if self.trigger_word is not None:
             return dropout_caption.replace(
