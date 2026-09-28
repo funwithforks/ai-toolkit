@@ -403,9 +403,17 @@ class Ideogram4Model(BaseModel):
         self.load_text_encoder()
         self.load_vae()
 
-        # inference-only: the unconditional CFG adapter stays out of the
-        # training phases so it never wraps the transformer during network
-        # building or leaks into saved state dicts
+        # Behavior note: this adapter is loaded here (the all-at-once load
+        # used by inference/generation) and NOT during the phased training
+        # startup. Training configs that set unconditional_lora_path
+        # previously attached it during training, where it sat inactive,
+        # cost wrapper memory, and its tensors appeared in the transformer
+        # state dict (leak risk in fine-tune saves); under the phased load
+        # they now train without it.
+        # TODO: confirm this adapter is inference-only by design. If
+        # training is meant to use it, it should load at the end of
+        # load_transformer() with the same guard, and save_model() must
+        # exclude its keys.
         if self.model_config.unconditional_lora_path is not None:
             self.load_unconditional_lora(self.model)
 
