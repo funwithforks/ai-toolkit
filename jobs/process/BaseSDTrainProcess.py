@@ -389,6 +389,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if self.vae_training_mode == 'reload':
             # free it again until the next sample round
+            print_acc("VAE unloaded until next sample round")
             self.sd.vae = None
             flush()
 
@@ -1585,6 +1586,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set trainable params
         self.sd.adapter = self.adapter
     
+    def _validation_needs_vae(self):
+        # setup_validation re-encodes the validation images every run (memory
+        # only, no disk cache), so any validation items mean the vae is needed
+        val_config = self.train_config.validation_config
+        return val_config is not None and len(
+            getattr(val_config, 'validation_items', None) or []) > 0
+
     def setup_validation(self):
         # caches everything needed for validation (latents, prompt embeds, fixed noise)
         # must be called while the vae and text encoder are still loaded, they may be
@@ -1813,7 +1821,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # ============================================================
 
         # ### phase 1: vae + dataset latent caching ###
-        self.sd.load_vae()
 
         ### HOOK ###
         self.before_dataset_load()
@@ -1845,6 +1852,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self._dataset_reg_objs, _ = build_datasets(
                 self.datasets_reg, self.train_config.batch_size, self.sd, defer_caching=True)
         all_dataset_objs = (self._dataset_objs or []) + (self._dataset_reg_objs or [])
+
+        # decide how the vae lives during training. Ranked by necessity, take
+        # the highest that applies: unload < reload < keep.
+        if not self.is_latents_cached:
+            # training encodes every batch; the vae must stay loaded
+            self.vae_training_mode = 'keep'
+        elif getattr(self.sd, 'require_vae_during_training', False):
+            # the model encodes at train time (e.g. edit-mode reference images)
+            self.vae_training_mode = 'keep'
+        elif not self.train_config.disable_sampling:
+            # only sampling needs it: load on demand per sample round
+            self.vae_training_mode = 'reload'
+        else:
+            self.vae_training_mode = 'unload'
+
+        # load the vae only if something can still use it: live latent
+        # encoding (keep), a latent cache that is not fully populated, clip
+        # vision caching, or validation latents (re-encoded every run).
+        # Otherwise it is loaded on demand around sampling instead.
+        vae_load_needed = self.vae_training_mode == 'keep' or any(
+            dataset.is_caching_clip_vision_to_disk or not dataset.latent_cache_complete()
+            for dataset in all_dataset_objs
+        ) or self._validation_needs_vae()
+        if vae_load_needed:
+            self.sd.load_vae()
+        else:
+            print_acc("Skipping VAE load - every latent is cached to disk")
+        flush()
 
         for dataset in all_dataset_objs:
             if dataset.is_caching_latents:
@@ -1891,24 +1926,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # encoder here when its embeddings are cached.
         self.cache_pre_train_text_embeddings()
 
-        # decide how the vae lives during training. Ranked by necessity, take
-        # the highest that applies: unload < reload < keep.
-        if not self.is_latents_cached:
-            # training encodes every batch; the vae must stay loaded
-            self.vae_training_mode = 'keep'
-        elif getattr(self.sd, 'require_vae_during_training', False):
-            # the model encodes at train time (e.g. edit-mode reference images)
-            self.vae_training_mode = 'keep'
-        elif not self.train_config.disable_sampling:
-            # only sampling needs it: load on demand per sample round
-            self.vae_training_mode = 'reload'
-        else:
-            self.vae_training_mode = 'unload'
-
-        if self.vae_training_mode in ('unload', 'reload'):
-            # every dataset encodes from cache. For 'reload' the vae is loaded
+        if self.vae_training_mode in ('unload', 'reload') and self.sd.vae is not None:
+            # every dataset encoded from cache. For 'reload' the vae is loaded
             # again around each sample round (note: load_vae re-reads from
             # disk, so reload costs a few seconds per sample round).
+            if self.vae_training_mode == 'reload':
+                print_acc("VAE unloaded - it will reload for each sample round")
+            else:
+                print_acc("VAE unloaded for the rest of training")
             self.sd.vae = None
         flush()
 
