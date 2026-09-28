@@ -1645,12 +1645,8 @@ class BaseModel:
 
         active_modules = []
         training_modules = []
-        if device_state_preset in ['cache_latents']:
-            active_modules = ['vae']
         if device_state_preset in ['cache_clip']:
             active_modules = ['clip']
-        if device_state_preset in ['cache_text_encoder']:
-            active_modules = ['text_encoder']
         if device_state_preset in ['generate']:
             active_modules = ['vae', 'unet',
                               'text_encoder', 'adapter', 'refiner_unet']
