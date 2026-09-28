@@ -7,6 +7,7 @@ from safetensors.torch import load_file, save_file
 
 from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConfig
 from toolkit.models.base_model import BaseModel
+from toolkit.models.phased_load import PhasedLoadMixin
 from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.basic import flush
 from toolkit.print import print_acc
@@ -161,8 +162,9 @@ def _load_sharded(base, index_path, is_local, prefix="") -> dict:
     return state_dict
 
 
-class Ideogram4Model(BaseModel):
+class Ideogram4Model(PhasedLoadMixin, BaseModel):
     arch = "ideogram4"
+    display_name = "Ideogram4"
 
     def __init__(
         self,
@@ -214,7 +216,7 @@ class Ideogram4Model(BaseModel):
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
-    def _load_text_encoder(self, base: str):
+    def _load_text_encoder(self):
         dtype = self.torch_dtype
         # The text encoder is frozen, stock Qwen3-VL-8B-Instruct. The ideogram repo
         # only ships an fp8 copy of it, so load the public bf16 model directly --
@@ -230,9 +232,10 @@ class Ideogram4Model(BaseModel):
 
         text_encoder.eval()
         text_encoder.requires_grad_(False)
-        return tokenizer, text_encoder
+        return tokenizer, text_encoder, {}
 
-    def _load_transformer(self, base: str):
+    def _load_transformer(self):
+        base = self.model_config.name_or_path
         dtype = self.torch_dtype
         self.print_and_status_update("Loading transformer")
 
@@ -262,7 +265,8 @@ class Ideogram4Model(BaseModel):
         transformer.rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
         return transformer
 
-    def _load_vae(self, base: str):
+    def _load_vae(self):
+        base = self.model_config.name_or_path
         dtype = self.torch_dtype
         self.print_and_status_update("Loading VAE")
         vae_sd = _load_component_state_dict(base, "vae", "diffusion_pytorch_model")
@@ -356,36 +360,8 @@ class Ideogram4Model(BaseModel):
         self.unconditional_lora = network
         self.print_and_status_update("Unconditional LoRA loaded (inactive)")
 
-    def load_transformer(self):
-        """Load the denoiser, then quantize/offload/place per model_config.
-
-        This is the final load step of the phased training startup, so the
-        holder wiring (noise scheduler + pipeline) is completed here. The
-        pipeline stores only the holder reference, so building it before the
-        other components (as load_model does) is equivalent."""
-        base = self.model_config.name_or_path
-        transformer = self._load_transformer(base)
-
-        # quantize + offload + placement, all driven by model_config
-        transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
-        self.model = transformer
-
-        self.noise_scheduler = Ideogram4Model.get_train_scheduler()
-        self.pipeline = Ideogram4Pipeline(self)
-        flush()
-
-    def load_text_encoder(self):
-        base = self.model_config.name_or_path
-        tokenizer, text_encoder = self._load_text_encoder(base)
-        # quantize + offload + placement, all driven by model_config
-        text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
-        self.text_encoder = text_encoder
-        self.tokenizer = tokenizer
-        flush()
-
     def load_vae(self):
-        base = self.model_config.name_or_path
-        vae = self._load_vae(base)
+        vae = self._load_vae()
         # the latent norm constants are consumed by encode_images/decode_latents
         # (dataset latent caching runs right after this phase), so they are set
         # here alongside the vae
@@ -394,15 +370,10 @@ class Ideogram4Model(BaseModel):
         self._latent_scale = scale.view(1, -1, 1, 1)
         self.vae = vae
 
-    def load_model(self):
-        self.print_and_status_update("Loading Ideogram4 model")
-        # all-at-once load used by inference/generation. The training process
-        # loads these steps one at a time instead, so that dataset prep can
-        # run while only the small helper components are resident.
-        self.load_transformer()
-        self.load_text_encoder()
-        self.load_vae()
+    def _build_pipeline(self):
+        return Ideogram4Pipeline(self)
 
+    def _post_model_load(self):
         # Behavior note: this adapter is loaded here (the all-at-once load
         # used by inference/generation) and NOT during the phased training
         # startup. Training configs that set unconditional_lora_path
@@ -416,8 +387,6 @@ class Ideogram4Model(BaseModel):
         # exclude its keys.
         if self.model_config.unconditional_lora_path is not None:
             self.load_unconditional_lora(self.model)
-
-        self.print_and_status_update("Model Loaded")
 
     # ------------------------------------------------------------------
     # Generation

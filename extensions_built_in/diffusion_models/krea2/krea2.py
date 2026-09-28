@@ -35,6 +35,7 @@ from optimum.quanto import freeze
 from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConfig
 from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.models.base_model import BaseModel
+from toolkit.models.phased_load import PhasedLoadMixin
 from toolkit.models.v2.vae.qwen_image import QwenImageVAE, QwenImageVAEHolderMixin
 from toolkit.models.v2.text_encoders.qwen3_vl import (
     Qwen3VLTextEncoder,
@@ -141,7 +142,7 @@ def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str]) -> dict:
     return load_file(path)
 
 
-class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
+class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
     arch = "krea2"
 
     def __init__(
@@ -260,7 +261,7 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         text_encoder.eval()
         text_encoder.requires_grad_(False)
         flush()
-        return tokenizer, processor, vl_processor, text_encoder
+        return tokenizer, text_encoder, {'processor': processor, 'vl_processor': vl_processor}
 
     def _load_vae(self):
         vae_path = self.model_config.model_kwargs.get("vae_path", QWEN_IMAGE_VAE_PATH)
@@ -372,16 +373,9 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             "last*",
         ]
 
-    def load_transformer(self):
-        """Load the denoiser (including the assistant adapter when configured),
-        then quantize/offload/place per model_config.
+    display_name = "Krea 2"
 
-        This is the final load step of the phased training startup, so the
-        holder wiring (noise scheduler + pipeline) is completed here. The
-        pipeline stores only the holder reference, so building it before the
-        other components (as load_model does) is equivalent."""
-        transformer = self._load_transformer()
-
+    def _transformer_pre_post_load(self, transformer):
         # load assistant lora if specified
         if self.model_config.assistant_lora_path is not None:
             self.load_training_adapter(transformer)
@@ -389,37 +383,8 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             if self.model_config.qtype == "qfloat8":
                 self.model_config.qtype = "float8"
 
-        # quantize + offload + placement, all driven by model_config
-        transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
-        self.model = transformer
-
-        self.noise_scheduler = Krea2Model.get_train_scheduler()
-        self.pipeline = Krea2Pipeline(self)
-        flush()
-
-    def load_text_encoder(self):
-        tokenizer, processor, vl_processor, text_encoder = self._load_text_encoder()
-        text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
-        self.text_encoder = text_encoder
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.vl_processor = vl_processor
-        flush()
-
-    def load_vae(self):
-        vae = self._load_vae()
-        vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
-        self.vae = vae
-
-    def load_model(self):
-        self.print_and_status_update("Loading Krea 2 model")
-        # all-at-once load used by inference/generation. The training process
-        # loads these steps one at a time instead, so that dataset prep can
-        # run while only the small helper components are resident.
-        self.load_transformer()
-        self.load_text_encoder()
-        self.load_vae()
-        self.print_and_status_update("Model Loaded")
+    def _build_pipeline(self):
+        return Krea2Pipeline(self)
 
     # ------------------------------------------------------------------
     # Generation (training previews)
