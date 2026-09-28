@@ -757,13 +757,13 @@ INLINE_DOP_RE = re.compile(
 
 
 def extract_inline_dop_pairs(prompt):
-    if not prompt or not INLINE_DOP_RE.search(prompt):
+    if not prompt or '[trigger' not in prompt.lower():
         return []
     return [(m.group(1).strip(), m.group(2).strip()) for m in INLINE_DOP_RE.finditer(prompt)]
 
 
 def apply_inline_dop(prompt, use_class=False):
-    if not prompt or not INLINE_DOP_RE.search(prompt):
+    if not prompt or '[trigger' not in prompt.lower():
         return prompt
 
     def _repl(m):
