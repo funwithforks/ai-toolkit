@@ -9,7 +9,7 @@ pyyaml
 oyaml
 tensorboard
 kornia
-invisible-watermark
+#invisible-watermark  # disabled: not required for this configuration
 einops
 accelerate
 toml
