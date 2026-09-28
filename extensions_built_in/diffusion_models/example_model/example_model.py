@@ -22,17 +22,16 @@ from safetensors.torch import load_file, save_file
 
 from diffusers import AutoencoderKL
 from transformers import AutoTokenizer, AutoModel
-from optimum.quanto import freeze
 
 from toolkit.accelerator import unwrap_model
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.basic import flush
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.models.base_model import BaseModel
+from toolkit.models.phased_load import PhasedLoadMixin
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
-from toolkit.util.quantize import quantize, get_qtype
 
 from .src.model import ExampleTransformer2DModel
 from .src.pipeline import ExamplePipeline, pad_prompt_embeds
@@ -49,12 +48,15 @@ scheduler_config = {
 }
 
 
-class ExampleModel(BaseModel):
+class ExampleModel(PhasedLoadMixin, BaseModel):
     # ``arch`` is the unique id that ties everything together:
     #  - ``model.arch: "example"`` in the training config YAML selects this class
     #    (resolved by toolkit/util/get_model.py:get_model_class)
     #  - it is the default cache key for text-embedding / latent caches
     arch = "example"
+
+    # short name used in the phased-load status prints
+    display_name = "Example"
 
     # ALL NEW MODELS should set this to False. ``BaseModel`` defaults it to True
     # only for backwards-compatibility with already-released LoKr checkpoints; the
@@ -119,38 +121,41 @@ class ExampleModel(BaseModel):
         return self.vae_scale_factor * self.patch_size
 
     # ------------------------------------------------------------------
-    # Loading
+    # Loading (phased -- see toolkit/models/phased_load.py)
     # ------------------------------------------------------------------
-    def load_model(self):
-        """Load every component and store them on ``self``.
+    # PhasedLoadMixin supplies load_transformer / load_text_encoder /
+    # load_vae / load_model. The model supplies the _load_* builders below
+    # (which return the raw components and assign nothing), plus
+    # get_train_scheduler, _build_pipeline and display_name. The training
+    # process calls the phases one at a time -- vae, text encoder,
+    # transformer -- running dataset prep between phases, so no component
+    # ever has to be shuffled to cpu to make room for prep work.
+    #
+    # MUST be set before the phases finish:
+    #   self.model           the trainable denoiser (transformer/unet)
+    #   self.vae             the (frozen) VAE
+    #   self.text_encoder    one module or a list of modules (frozen unless
+    #                        training the TE)
+    #   self.tokenizer       one tokenizer or a list, parallel to text_encoder
+    #   self.noise_scheduler from get_train_scheduler()
+    #   self.pipeline        anything generate_single_image can use
+    #
+    # Expected layout (diffusers-style folder):
+    #   <name_or_path>/transformer/model.safetensors
+    #   <name_or_path>/text_encoder/  + /tokenizer/  (transformers format)
+    #   <name_or_path>/vae/           (diffusers AutoencoderKL)
 
-        Called once at startup. ``self.model_config`` is the ``model:`` section
-        of the training YAML; the fields used here:
-          - name_or_path: local folder (or HF repo) with the weights
-          - quantize / qtype: quantize the transformer (e.g. "qfloat8")
-          - quantize_te / qtype_te: quantize the text encoder
-          - low_vram: keep big components on CPU; your other overrides then
-            move them to GPU on demand (see the device checks below)
+    def _load_transformer(self):
+        """Build the transformer (the custom model from src/) and return it.
 
-        MUST set, before returning:
-          self.model           the trainable denoiser (transformer/unet)
-          self.vae             the (frozen) VAE
-          self.text_encoder    one module or a list of modules (frozen unless
-                               training the TE)
-          self.tokenizer       one tokenizer or a list, parallel to text_encoder
-          self.noise_scheduler from get_train_scheduler()
-          self.pipeline        anything generate_single_image can use
-        """
+        Quantization/offload/placement is NOT done here: the mixin applies
+        component_load_kwargs("transformer") via aitk_post_load right after
+        this returns. Models whose checkpoint sourcing is standard can
+        collapse the build into that step: ExampleTransformer2DModel.load(
+        path, **kwargs)."""
         dtype = self.torch_dtype
-        self.print_and_status_update("Loading Example model")
-        # Expected layout (diffusers-style folder):
-        #   <name_or_path>/transformer/model.safetensors
-        #   <name_or_path>/text_encoder/  + /tokenizer/  (transformers format)
-        #   <name_or_path>/vae/           (diffusers AutoencoderKL)
-        model_path = self.model_config.name_or_path
-
-        # --- transformer (the custom model from src/) ---
         self.print_and_status_update("Loading transformer")
+        model_path = self.model_config.name_or_path
         # Instantiate on the meta device (no RAM used), then materialize the
         # real tensors straight from the checkpoint with assign=True. This
         # avoids allocating the model twice. If your model has non-persistent
@@ -164,50 +169,41 @@ class ExampleModel(BaseModel):
         transformer.load_state_dict(state_dict, assign=True)
         del state_dict
         flush()  # gc + empty cuda cache; call it after dropping anything big
+        return transformer
 
-        # quantize + offload + placement, all driven by model_config:
-        # component_load_kwargs derives qtype (incl. an accuracy recovery
-        # adapter), the layer-offload fraction and the target device
-        # (low_vram parks on CPU); aitk_post_load applies them. Models whose
-        # checkpoint sourcing is standard can collapse the build + this into
-        # one call: ExampleTransformer2DModel.load(path, **kwargs).
-        transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
-        flush()
+    def _load_text_encoder(self):
+        """Return (tokenizer, text_encoder, extras).
 
-        # --- text encoder + tokenizer (stock transformers model) ---
+        extras is a dict of extra attributes the mixin assigns to self
+        (vision processors etc.; empty here). aitk_post_load applies
+        quantize_te / qtype_te and placement per model_config after this
+        returns -- do not quantize by hand."""
         self.print_and_status_update("Loading text encoder")
+        model_path = self.model_config.name_or_path
         tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
         text_encoder = AutoModel.from_pretrained(
-            model_path, subfolder="text_encoder", torch_dtype=dtype
+            model_path, subfolder="text_encoder", torch_dtype=self.torch_dtype
         )
         text_encoder.to(self.te_device_torch)
         # the TE is frozen here; only set requires_grad if you train it
         text_encoder.eval()
         text_encoder.requires_grad_(False)
         flush()
+        return tokenizer, text_encoder, {}
 
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing text encoder")
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
-            flush()
-
-        # --- VAE ---
+    def _load_vae(self):
+        """Load the VAE and return it. The mixin places it per model_config."""
         self.print_and_status_update("Loading VAE")
-        vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae")
-        vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
+        vae = AutoencoderKL.from_pretrained(
+            self.model_config.name_or_path, subfolder="vae"
+        )
         vae.eval()
         vae.requires_grad_(False)
         flush()
+        return vae
 
-        # --- scheduler + store everything ---
-        self.noise_scheduler = ExampleModel.get_train_scheduler()
-        self.vae = vae
-        self.text_encoder = text_encoder  # could be a list for multi-TE models
-        self.tokenizer = tokenizer        # parallel list if multiple TEs
-        self.model = transformer          # aliased as self.transformer / self.unet
-        self.pipeline = ExamplePipeline(self)
-        self.print_and_status_update("Model Loaded")
+    def _build_pipeline(self):
+        return ExamplePipeline(self)
 
     # ------------------------------------------------------------------
     # Sampling (training previews)

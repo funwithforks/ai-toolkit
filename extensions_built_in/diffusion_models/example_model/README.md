@@ -54,9 +54,13 @@ train:
 
 ## Lifecycle — who calls what, in order
 
-1. **Load** — `load_model()` builds the transformer, text encoder(s),
-   tokenizer(s), VAE and scheduler and stores them on `self`. Everything else
-   reads `self.model` / `self.vae` / `self.text_encoder`.
+1. **Load** — training loads the model in phases: `load_vae()`,
+   `load_text_encoder()`, `load_transformer()`, each building one component
+   and storing it on `self` (the mixin and contract live in
+   `toolkit/models/phased_load.py`; dataset prep runs between phases while
+   only small components are resident). `load_model()` composes the three
+   for inference/generation. Everything
+   else reads `self.model` / `self.vae` / `self.text_encoder`.
 2. **Caching (optional)** — before training, the trainer may call
    `encode_images()` per dataset image (latent cache) and
    `get_prompt_embeds()` per caption (text-embed cache, saved via

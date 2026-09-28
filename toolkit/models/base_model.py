@@ -357,6 +357,26 @@ class BaseModel:
         raise NotImplementedError(
             "load_model must be implemented in child classes")
 
+    # phased training load: each method loads exactly one resident component
+    # (vae, text encoder, transformer). The training process calls them one
+    # at a time and runs dataset prep between phases; load_model composes the
+    # three for inference. See toolkit/models/phased_load.py for the full
+    # contract and shared implementation.
+    def load_vae(self):
+        # override this in child classes
+        raise NotImplementedError(
+            "load_vae must be implemented in child classes")
+
+    def load_text_encoder(self):
+        # override this in child classes
+        raise NotImplementedError(
+            "load_text_encoder must be implemented in child classes")
+
+    def load_transformer(self):
+        # override this in child classes
+        raise NotImplementedError(
+            "load_transformer must be implemented in child classes")
+
     def get_generation_pipeline(self):
         # override this in child classes
         raise NotImplementedError(
