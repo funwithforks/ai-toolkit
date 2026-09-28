@@ -389,6 +389,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             dataset_config: 'DatasetConfig',
             batch_size=1,
             sd: 'StableDiffusion' = None,
+            defer_caching: bool = False,
     ):
         self.dataset_config = dataset_config
         # update bucket divisibility
@@ -398,6 +399,11 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         # text-generating multimodal models take audio, image and video files in one dataset
         self.is_multimodal_llm = getattr(sd, 'is_multimodal_llm', False) if sd is not None else False
         super().__init__()
+        # when True, the phase-specific cache steps (latents, clip, text embeddings,
+        # controls) are skipped in setup_epoch. The caller drives those cache methods
+        # directly, once per model while it is loaded, before wrapping the datasets
+        # into a dataloader.
+        self.defer_caching = defer_caching
         folder_path = dataset_config.folder_path
         self.dataset_path = dataset_config.dataset_path
         if self.dataset_path is None:
@@ -597,15 +603,20 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if self.dataset_config.buckets:
                 # setup buckets
                 self.setup_buckets()
-            if self.is_caching_latents:
-                self.cache_latents_all_latents()
-            if self.is_caching_clip_vision_to_disk:
-                self.cache_clip_vision_to_disk()
-            if self.is_caching_text_embeddings:
-                self.cache_text_embeddings()
-            if self.is_generating_controls:
-                # always do this last
-                self.setup_controls()
+            if self.defer_caching:
+                # caching is driven externally by the training process, one pass
+                # per model while that model is loaded
+                pass
+            else:
+                if self.is_caching_latents:
+                    self.cache_latents_all_latents()
+                if self.is_caching_clip_vision_to_disk:
+                    self.cache_clip_vision_to_disk()
+                if self.is_caching_text_embeddings:
+                    self.cache_text_embeddings()
+                if self.is_generating_controls:
+                    # always do this last
+                    self.setup_controls()
         self.epoch_num += 1
 
     def __getstate__(self):
@@ -669,18 +680,20 @@ def dto_collation(batch: List['FileItemDTO']):
     )
 
 
-def get_dataloader_from_datasets(
+def build_datasets(
         dataset_options,
         batch_size=1,
         sd: 'StableDiffusion' = None,
-) -> DataLoader:
-    if dataset_options is None or len(dataset_options) == 0:
-        return None
+        defer_caching: bool = False,
+):
+    """Construct the AiToolkitDataset list without wrapping it in a DataLoader.
 
+    With defer_caching=True the datasets are scanned and bucketed but not
+    cached; the caller drives each cache method (latents, text embeddings,
+    clip vision, controls) explicitly -- once per helper model while it is
+    loaded -- then builds the dataloader with get_dataloader_from_datasets.
+    Returns (datasets, dataset_config_list)."""
     datasets = []
-    has_buckets = False
-    is_caching_latents = False
-
     dataset_config_list = []
     # preprocess them all
     for dataset_option in dataset_options:
@@ -697,21 +710,45 @@ def get_dataloader_from_datasets(
         if config.type == 'image':
             # dataset level batch_size overrides the train config batch_size when set
             dataset_batch_size = config.batch_size if config.batch_size is not None else batch_size
-            dataset = AiToolkitDataset(config, batch_size=dataset_batch_size, sd=sd)
+            dataset = AiToolkitDataset(config, batch_size=dataset_batch_size, sd=sd,
+                                       defer_caching=defer_caching)
             datasets.append(dataset)
-            if config.buckets:
-                has_buckets = True
-            if config.cache_latents or config.cache_latents_to_disk:
-                is_caching_latents = True
         else:
             raise ValueError(f"invalid dataset type: {config.type}")
 
-    concatenated_dataset = ConcatDataset(datasets)
+    return datasets, dataset_config_list
+
+
+def get_dataloader_from_datasets(
+        dataset_options,
+        batch_size=1,
+        sd: 'StableDiffusion' = None,
+        datasets=None,
+) -> DataLoader:
+    if dataset_options is None or len(dataset_options) == 0:
+        return None
+
+    has_buckets = False
+    is_caching_latents = False
+
+    if datasets is not None:
+        # datasets were built (and cached) earlier via build_datasets
+        dataset_config_list = [d.dataset_config for d in datasets]
+    else:
+        datasets, dataset_config_list = build_datasets(dataset_options, batch_size, sd)
+
+    for config in dataset_config_list:
+        if config.buckets:
+            has_buckets = True
+        if config.cache_latents or config.cache_latents_to_disk:
+            is_caching_latents = True
 
     # todo build scheduler that can get buckets from all datasets that match
     # todo and evenly distribute reg images
 
     # check if is caching latents
+
+    concatenated_dataset = ConcatDataset(datasets)
 
     dataloader_kwargs = {}
 

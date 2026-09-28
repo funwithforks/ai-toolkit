@@ -1975,9 +1975,8 @@ class LatentCachingMixin:
                 print_acc(" - Saving latents to disk")
             if to_memory:
                 print_acc(" - Keeping latents in memory")
-            # move sd items to cpu except for vae. Only done on the first item that
-            # actually needs encoding so fully cached datasets don't shuffle models around
-            did_move = False
+            # encoding pulls the vae to the compute device as needed (see the
+            # model's encode_images); no global device reshuffle is done here.
 
             # prep (video decode, frame extraction, audio load, disk reads) is done by a
             # thread pool so the next items are ready while the current one is encoding.
@@ -2024,9 +2023,6 @@ class LatentCachingMixin:
                         failed_items.append(file_item)
                         pbar.update(1)
                         continue
-                    if needs_encode and not did_move:
-                        self.sd.set_device_state_preset('cache_latents')
-                        did_move = True
                     try:
                         self._cache_one_latent(file_item, latent_path, cached_state_dict, needs_encode, to_disk, to_memory)
                     except UnusableFileError as e:
@@ -2047,10 +2043,6 @@ class LatentCachingMixin:
             if failed_items:
                 print_acc(f"Removed {len(failed_items)} files from the dataset that failed to load or were unusable")
                 self._remove_file_items(failed_items)
-
-            # restore device state
-            if did_move:
-                self.sd.restore_device_state()
 
     def _remove_file_items(self: 'AiToolkitDataset', items_to_remove: List['FileItemDTO']):
         # buckets hold raw indices into file_list, so removal requires remapping them
@@ -2431,8 +2423,6 @@ class TextEmbeddingCachingMixin:
         with accelerator.main_process_first():
             print_acc(f"Caching text_embeddings for {self.dataset_path}")
             print_acc(" - Saving text embeddings to disk")
-            
-            did_move = False
 
             # use tqdm to show progress
             i = 0
@@ -2464,11 +2454,7 @@ class TextEmbeddingCachingMixin:
                 # only process if not saved to disk
                 encode_targets = [t for t in encode_targets if not os.path.exists(t[0])]
                 if len(encode_targets) > 0:
-                    # load if not loaded
-                    if not did_move:
-                        self.sd.set_device_state_preset('cache_text_encoder')
-                        did_move = True
-
+                    # text encoder placement is handled by the model's encode_prompt
                     control_video_paths = getattr(file_item, 'control_video_paths', None) or []
                     if file_item.encode_control_in_text_embeddings and (
                         file_item.control_path is not None or len(control_video_paths) > 0
@@ -2582,9 +2568,6 @@ class TextEmbeddingCachingMixin:
                             dopsd_targets.append((dopsd_blank_path, file_item.get_dopsd_dropout_caption()))
                     dopsd_targets = [t for t in dopsd_targets if not os.path.exists(t[0])]
                     if len(dopsd_targets) > 0:
-                        if not did_move:
-                            self.sd.set_device_state_preset('cache_text_encoder')
-                            did_move = True
                         if file_item.is_video:
                             # own path rides through the video-ref presentation
                             ctrl_img = [file_item.path]
@@ -2609,9 +2592,6 @@ class TextEmbeddingCachingMixin:
                             del prompt_embeds
                 file_item.is_text_embedding_cached = True
                 i += 1
-            # restore device state
-            # if did_move:
-            #     self.sd.restore_device_state()
 
 
 class CLIPCachingMixin:
