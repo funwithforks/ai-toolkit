@@ -186,6 +186,9 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         self.has_multiple_control_images = self.is_edit
         # Reference images keep their own aspect/size (not resized to the target).
         self.use_raw_control_images = self.is_edit
+        # edit mode vae-encodes the reference images at train time, so the
+        # vae must stay resident even when all dataset latents are cached
+        self.require_vae_during_training = self.is_edit
         # model_kwargs.kv_cache = true: train with an asymmetric attention mask
         # where the clean reference tokens attend only to each other (never to
         # text / noisy tokens). Their hidden states then depend only on the

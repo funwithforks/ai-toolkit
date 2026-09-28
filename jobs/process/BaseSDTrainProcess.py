@@ -210,6 +210,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.adapter: Union[T2IAdapter, IPAdapter, ClipVisionAdapter, ReferenceAdapter, CustomAdapter, ControlNetModel, None] = None
         self.embedding: Union[Embedding, None] = None
         self.decorator: Union[Decorator, None] = None
+        # how the vae lives during training: unload | reload | keep
+        # (computed from the config in the phased load block)
+        self.vae_training_mode = 'keep'
 
         is_training_adapter = self.adapter_config is not None and self.adapter_config.train
 
@@ -374,9 +377,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # let adapter know we are sampling
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
-        
+
+        if self.vae_training_mode == 'reload' and self.sd.vae is None:
+            # the vae was freed after dataset prep. Sampling decodes through
+            # it, so load it back for this round (see vae_training_mode).
+            print_acc("Loading vae for sampling")
+            self.sd.load_vae()
+
         # send to be generated
         self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+
+        if self.vae_training_mode == 'reload':
+            # free it again until the next sample round
+            self.sd.vae = None
+            flush()
 
         
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
@@ -1855,16 +1869,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # components can be freed as soon as their own prep is done.
         self.setup_validation()
 
+
         # fixed prompts the training loop needs (unconditional/blank/trigger,
         # sample prompts). The SD trainer implementation also frees the text
         # encoder here when its embeddings are cached.
         self.cache_pre_train_text_embeddings()
 
-        if self.is_latents_cached and self.train_config.disable_sampling:
-            # every dataset encodes from cache and no sampling will run: the
-            # vae is done. With sampling enabled the vae stays loaded, since
-            # preview generation decodes through it.
-            # TODO: load/unload helper models on demand around sampling.
+        # decide how the vae lives during training. Ranked by necessity, take
+        # the highest that applies: unload < reload < keep.
+        if not self.is_latents_cached:
+            # training encodes every batch; the vae must stay loaded
+            self.vae_training_mode = 'keep'
+        elif getattr(self.sd, 'require_vae_during_training', False):
+            # the model encodes at train time (e.g. edit-mode reference images)
+            self.vae_training_mode = 'keep'
+        elif not self.train_config.disable_sampling:
+            # only sampling needs it: load on demand per sample round
+            self.vae_training_mode = 'reload'
+        else:
+            self.vae_training_mode = 'unload'
+
+        if self.vae_training_mode in ('unload', 'reload'):
+            # every dataset encodes from cache. For 'reload' the vae is loaded
+            # again around each sample round (note: load_vae re-reads from
+            # disk, so reload costs a few seconds per sample round).
             self.sd.vae = None
         flush()
 

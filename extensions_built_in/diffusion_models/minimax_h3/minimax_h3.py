@@ -1138,6 +1138,10 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
 
     arch = "minimax_h3_ref2va"
 
+    # reference images are encoded through the video vae at train time, so
+    # the vae must stay resident even when all dataset latents are cached
+    require_vae_during_training = True
+
     def _image_ref_video_frames(self) -> int:
         """Frames a still reference is held for when presented as a static
         video (0 = keep native ``<Picture>`` image references)."""

@@ -605,5 +605,9 @@ class MageFlowEditModel(MageFlowModel):
     arch = "mageflow_edit"
     is_edit = True
 
+    # control images are vae-encoded at train time, so the vae must stay
+    # resident even when all dataset latents are cached
+    require_vae_during_training = True
+
     def get_base_model_version(self):
         return "mageflow_edit"
