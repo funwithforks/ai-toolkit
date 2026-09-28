@@ -748,6 +748,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # encoder is resident and may then free it.
         pass
 
+    def needs_text_encoder_load(self):
+        # Checked before the text encoder phase. A trainer may return False
+        # when every prompt embed it needs (dataset captions and fixed
+        # prompts) is already on disk and nothing encodes live, letting the
+        # process skip loading the encoder entirely.
+        return True
+
     def hook_after_model_load(self):
         # override in subclass
         pass
@@ -1889,7 +1896,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         flush()
 
         # ### phase 2: text encoder + embedding caching ###
-        self.sd.load_text_encoder()
+        if self.needs_text_encoder_load():
+            self.sd.load_text_encoder()
+        else:
+            print_acc("Skipping text encoder load - every embedding is cached")
 
         for dataset in all_dataset_objs:
             if dataset.is_caching_text_embeddings:
