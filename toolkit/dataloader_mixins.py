@@ -1985,6 +1985,18 @@ class LatentCachingMixin:
             super().__init__(**kwargs)
         self.latent_cache = {}
 
+    def latent_cache_complete(self: 'AiToolkitDataset'):
+        # True when the latent cache is fully populated on disk, so a caching
+        # pass would encode nothing. The training process uses this to skip
+        # loading the vae entirely. Memory-only caches are rebuilt every run,
+        # so they never count as complete here.
+        if not self.is_caching_latents or not self.is_caching_latents_to_disk:
+            return False
+        for file_item in self.file_list:
+            if not os.path.exists(file_item.get_latent_path(recalculate=True)):
+                return False
+        return True
+
     def cache_latents_all_latents(self: 'AiToolkitDataset'):
         with accelerator.main_process_first():
             print_acc(f"Caching latents for {self.dataset_path}")
