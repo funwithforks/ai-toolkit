@@ -492,10 +492,14 @@ class MinimaxH3Model(BaseModel):
         flush()
         return MiniMaxH3VaeBundle(video_vae, audio_vae)
 
-    def load_model(self):
-        dtype = self.torch_dtype
-        self.print_and_status_update("Loading MiniMax-H3 model")
+    def load_transformer(self):
+        """Load the denoiser (including the assistant adapter when configured),
+        then quantize/offload/place per model_config.
 
+        This is the final load step of the phased training startup, so the
+        holder wiring (noise scheduler + pipeline) is completed here. The
+        pipeline stores only the holder reference, so building it before the
+        other components (as load_model does) is equivalent."""
         transformer = self._load_transformer()
 
         # load assistant lora if specified (merged into the quantized weights)
@@ -504,26 +508,39 @@ class MinimaxH3Model(BaseModel):
 
         # quantize + offload + placement, all driven by model_config
         transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
+        self.model = transformer
+
+        self.noise_scheduler = self.get_train_scheduler()
+        self.pipeline = MiniMaxH3Pipeline(self)
         flush()
 
+    def load_text_encoder(self):
         tokenizer, processor, text_encoder = self._load_text_encoder()
         if any(isinstance(m, OstrisLinear) for m in text_encoder.modules()):
             # already nvfp4/int8 quantized; aitk_post_load skips quantize_te
             text_encoder.aitk_is_quantized = True
         # quantize + offload + placement, all driven by model_config
         text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
-        flush()
-
-        vae_bundle = self._load_vaes()
-        vae_bundle.to(self.vae_device_torch)
-
-        self.noise_scheduler = self.get_train_scheduler()
-        self.vae = vae_bundle
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.processor = processor
-        self.model = transformer
-        self.pipeline = MiniMaxH3Pipeline(self)
+        flush()
+
+    def load_vae(self):
+        # the bundle holds the video and audio VAEs together; the audio VAE
+        # is needed alongside the video VAE for dataset audio caching
+        vae_bundle = self._load_vaes()
+        vae_bundle.to(self.vae_device_torch)
+        self.vae = vae_bundle
+
+    def load_model(self):
+        self.print_and_status_update("Loading MiniMax-H3 model")
+        # all-at-once load used by inference/generation. The training process
+        # loads these steps one at a time instead, so that dataset prep can
+        # run while only the small helper components are resident.
+        self.load_transformer()
+        self.load_text_encoder()
+        self.load_vae()
         self.print_and_status_update("Model Loaded")
 
     # ------------------------------------------------------------------
