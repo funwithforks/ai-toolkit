@@ -369,10 +369,14 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             "last*",
         ]
 
-    def load_model(self):
-        dtype = self.torch_dtype
-        self.print_and_status_update("Loading Krea 2 model")
+    def load_transformer(self):
+        """Load the denoiser (including the assistant adapter when configured),
+        then quantize/offload/place per model_config.
 
+        This is the final load step of the phased training startup, so the
+        holder wiring (noise scheduler + pipeline) is completed here. The
+        pipeline stores only the holder reference, so building it before the
+        other components (as load_model does) is equivalent."""
         transformer = self._load_transformer()
 
         # load assistant lora if specified
@@ -384,24 +388,34 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
 
         # quantize + offload + placement, all driven by model_config
         transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
-        flush()
-
-        tokenizer, processor, vl_processor, text_encoder = self._load_text_encoder()
-        text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
-        flush()
-
-        vae = self._load_vae()
-        vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
+        self.model = transformer
 
         self.noise_scheduler = Krea2Model.get_train_scheduler()
+        self.pipeline = Krea2Pipeline(self)
+        flush()
 
-        self.vae = vae
+    def load_text_encoder(self):
+        tokenizer, processor, vl_processor, text_encoder = self._load_text_encoder()
+        text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.processor = processor
         self.vl_processor = vl_processor
-        self.model = transformer
-        self.pipeline = Krea2Pipeline(self)
+        flush()
+
+    def load_vae(self):
+        vae = self._load_vae()
+        vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
+        self.vae = vae
+
+    def load_model(self):
+        self.print_and_status_update("Loading Krea 2 model")
+        # all-at-once load used by inference/generation. The training process
+        # loads these steps one at a time instead, so that dataset prep can
+        # run while only the small helper components are resident.
+        self.load_transformer()
+        self.load_text_encoder()
+        self.load_vae()
         self.print_and_status_update("Model Loaded")
 
     # ------------------------------------------------------------------

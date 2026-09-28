@@ -305,12 +305,10 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.eval()
             self.taesd.requires_grad_(False)
 
-    def hook_before_train_loop(self):
-        super().hook_before_train_loop()
-        if self.is_caching_text_embeddings:
-            # make sure model is on cpu for this part so we don't oom.
-            self.sd.unet.to('cpu')
-        
+    def cache_pre_train_text_embeddings(self):
+        # Runs during the text encoder load phase while the encoder is
+        # resident: encode every fixed prompt the training loop needs, then
+        # free the encoder when nothing else uses it.
         # cache unconditional embeds (blank prompt); text-generating models have no text encoder
         if not getattr(self.sd, 'is_llm', False):
             with torch.no_grad():
@@ -321,6 +319,46 @@ class SDTrainer(BaseSDTrainProcess):
                     self.device_torch,
                     dtype=self.sd.torch_dtype
                 ).detach()
+
+        # handle unload text encoder
+        if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
+            print_acc("Caching embeddings and unloading text encoder")
+            with torch.no_grad():
+                if self.train_config.train_text_encoder:
+                    raise ValueError("Cannot unload text encoder if training text encoder")
+                # cache embeddings
+                self.sd.text_encoder_to(self.device_torch)
+                self.cached_blank_embeds = self.encode_static_prompt("")
+                if self.trigger_word is not None:
+                    self.cached_trigger_embeds = self.encode_static_prompt(self.trigger_word)
+                if self.train_config.diff_output_preservation:
+                    self.cached_dop_class_embeds = self.encode_static_prompt(self.train_config.diff_output_preservation_class)
+                    self.diff_output_preservation_embeds = self.cached_dop_class_embeds
+                
+                self.cache_sample_prompts()
+                
+                print_acc("\n***** UNLOADING TEXT ENCODER *****")
+                if self.is_caching_text_embeddings:
+                    print_acc("Embeddings cached to disk. We dont need the text encoder anymore")
+                else:
+                    print_acc("This will train only with a blank prompt or trigger word, if set")
+                    print_acc("If this is not what you want, remove the unload_text_encoder flag")
+                print_acc("***********************************")
+                print_acc("")
+
+                # unload the text encoder
+                if self.is_caching_text_embeddings:
+                    unload_text_encoder(self.sd)
+                else:
+                    # todo once every model is tested to work, unload properly. Though, this will all be merged into one thing.
+                    # keep legacy usage for now. 
+                    self.sd.text_encoder_to("cpu")
+                flush()
+
+    def hook_before_train_loop(self):
+        super().hook_before_train_loop()
+        # fixed prompt embeddings were cached (and the text encoder freed)
+        # during the text encoder load phase; see cache_pre_train_text_embeddings
         
         if self.train_config.do_prior_divergence:
             self.do_prior_prediction = True
@@ -367,41 +405,6 @@ class SDTrainer(BaseSDTrainProcess):
                 # single prompt
                 self.negative_prompt_pool = [self.train_config.negative_prompt]
 
-        # handle unload text encoder
-        if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
-            print_acc("Caching embeddings and unloading text encoder")
-            with torch.no_grad():
-                if self.train_config.train_text_encoder:
-                    raise ValueError("Cannot unload text encoder if training text encoder")
-                # cache embeddings
-                self.sd.text_encoder_to(self.device_torch)
-                self.cached_blank_embeds = self.encode_static_prompt("")
-                if self.trigger_word is not None:
-                    self.cached_trigger_embeds = self.encode_static_prompt(self.trigger_word)
-                if self.train_config.diff_output_preservation:
-                    self.cached_dop_class_embeds = self.encode_static_prompt(self.train_config.diff_output_preservation_class)
-                    self.diff_output_preservation_embeds = self.cached_dop_class_embeds
-                
-                self.cache_sample_prompts()
-                
-                print_acc("\n***** UNLOADING TEXT ENCODER *****")
-                if self.is_caching_text_embeddings:
-                    print_acc("Embeddings cached to disk. We dont need the text encoder anymore")
-                else:
-                    print_acc("This will train only with a blank prompt or trigger word, if set")
-                    print_acc("If this is not what you want, remove the unload_text_encoder flag")
-                print_acc("***********************************")
-                print_acc("")
-
-                # unload the text encoder
-                if self.is_caching_text_embeddings:
-                    unload_text_encoder(self.sd)
-                else:
-                    # todo once every model is tested to work, unload properly. Though, this will all be merged into one thing.
-                    # keep legacy usage for now. 
-                    self.sd.text_encoder_to("cpu")
-                flush()
-        
         if self.train_config.blank_prompt_preservation and self.cached_blank_embeds is None:
             # make sure we have this if not unloading
             self.cached_blank_embeds = self.sd.encode_prompt("").to(
@@ -1470,8 +1473,9 @@ class SDTrainer(BaseSDTrainProcess):
             if isinstance(self.adapter, CustomAdapter):
                 batch = self.adapter.edit_batch_processed(batch)
             dtype = get_torch_dtype(self.train_config.dtype)
-            # sanity check
-            if self.sd.vae.dtype != self.sd.vae_torch_dtype:
+            # sanity check (the vae is unloaded once every dataset encodes
+            # cached latents)
+            if self.sd.vae is not None and self.sd.vae.dtype != self.sd.vae_torch_dtype:
                 self.sd.vae = self.sd.vae.to(self.sd.vae_torch_dtype)
             if isinstance(self.sd.text_encoder, list):
                 for encoder in self.sd.text_encoder:

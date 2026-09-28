@@ -133,13 +133,16 @@ class BaseModel:
 
         self.device_state = None
 
+        # Components start unloaded (None). The training process may load them
+        # one at a time, so every reader must tolerate components being absent
+        # until their load step runs.
         self.pipeline: Union[None, 'StableDiffusionPipeline',
-                             'CustomStableDiffusionXLPipeline', 'PixArtAlphaPipeline']
-        self.vae: Union[None, 'AutoencoderKL']
-        self.model: Union[None, 'Transformer2DModel', 'UNet2DConditionModel']
+                             'CustomStableDiffusionXLPipeline', 'PixArtAlphaPipeline'] = None
+        self.vae: Union[None, 'AutoencoderKL'] = None
+        self.model: Union[None, 'Transformer2DModel', 'UNet2DConditionModel'] = None
         self.text_encoder: Union[None, 'CLIPTextModel',
-                                 List[Union['CLIPTextModel', 'CLIPTextModelWithProjection']]]
-        self.tokenizer: Union[None, 'CLIPTokenizer', List['CLIPTokenizer']]
+                                 List[Union['CLIPTextModel', 'CLIPTextModelWithProjection']]] = None
+        self.tokenizer: Union[None, 'CLIPTokenizer', List['CLIPTokenizer']] = None
         self.noise_scheduler: Union[None, 'DDPMScheduler'] = noise_scheduler
 
         self.refiner_unet: Union[None, 'UNet2DConditionModel'] = None
@@ -1491,8 +1494,7 @@ class BaseModel:
     def save_device_state(self):
         # saves the current device state for all modules
         # this is useful for when we want to alter the state and restore it
-        unet_has_grad = self.get_model_has_grad()
-
+        # unloaded components are recorded as None and skipped on restore
         self.device_state = {
             **empty_preset,
             'vae': {
@@ -1502,8 +1504,8 @@ class BaseModel:
             'unet': {
                 'training': self.unet.training,
                 'device': self.unet.device,
-                'requires_grad': unet_has_grad,
-            },
+                'requires_grad': self.get_model_has_grad(),
+            } if self.unet is not None else None,
         }
         if isinstance(self.text_encoder, list):
             self.device_state['text_encoder']: List[dict] = []
@@ -1572,21 +1574,24 @@ class BaseModel:
         self.device_state = None
 
     def set_device_state(self, state):
+        # components that are unloaded (or were unloaded when the state was
+        # saved) have a None entry and are skipped
         if self.vae is not None and state.get('vae') is not None:
             if state['vae']['training']:
                 self.vae.train()
             else:
                 self.vae.eval()
             self.vae.to(state['vae']['device'])
-        if state['unet']['training']:
-            self.unet.train()
-        else:
-            self.unet.eval()
-        self.unet.to(state['unet']['device'])
-        if state['unet']['requires_grad']:
-            self.unet.requires_grad_(True)
-        else:
-            self.unet.requires_grad_(False)
+        if self.unet is not None and state.get('unet') is not None:
+            if state['unet']['training']:
+                self.unet.train()
+            else:
+                self.unet.eval()
+            self.unet.to(state['unet']['device'])
+            if state['unet']['requires_grad']:
+                self.unet.requires_grad_(True)
+            else:
+                self.unet.requires_grad_(False)
         if isinstance(self.text_encoder, list):
             for i, encoder in enumerate(self.text_encoder):
                 if isinstance(state['text_encoder'], list):

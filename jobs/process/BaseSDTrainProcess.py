@@ -28,7 +28,7 @@ from toolkit.basic import value_map
 from toolkit.buckets import get_bucket_for_image_size
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
-from toolkit.data_loader import get_dataloader_from_datasets, trigger_dataloader_setup_epoch
+from toolkit.data_loader import get_dataloader_from_datasets, build_datasets, trigger_dataloader_setup_epoch
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.ema import ExponentialMovingAverage
 from toolkit.embedding import Embedding
@@ -724,6 +724,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
     # Called before the model is loaded
     def hook_before_model_load(self):
         # override in subclass
+        pass
+
+    def cache_pre_train_text_embeddings(self):
+        # Called during the text encoder load phase, after dataset embedding
+        # caching. Trainers that need fixed prompt embeddings (unconditional,
+        # blank, trigger, sample prompts) encode them here while the text
+        # encoder is resident and may then free it.
         pass
 
     def hook_after_model_load(self):
@@ -1779,14 +1786,93 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         
         self.hook_after_sd_init_before_load()
-        # run base sd process run
-        self.sd.load_model()
-        
+
+        # ============================================================
+        # Phased component load.
+        #
+        # Dataset preparation (latent/text-embedding caching, validation
+        # caches) only ever uses the vae and the text encoder. Load those
+        # first and run all preparation while each is the only loaded model,
+        # then free them and load the (far larger) transformer last. Nothing
+        # ever has to shuffle the transformer between cpu and gpu to make
+        # room for prep work.
+        # ============================================================
+
+        # ### phase 1: vae + dataset latent caching ###
+        self.sd.load_vae()
+
+        ### HOOK ###
+        self.before_dataset_load()
+        if getattr(self.sd, 'require_pixel_tensor_cache', False):
+            # model needs pixel tensors at train time even with cached latents;
+            # storing them changes the latent cache key (first run re-caches)
+            for ds_list in [self.datasets, self.datasets_reg]:
+                if ds_list is None:
+                    continue
+                for ds in ds_list:
+                    if not (ds.cache_latents or ds.cache_latents_to_disk):
+                        # live-loading datasets already have pixels on the batch
+                        continue
+                    if not ds.cache_tensors_to_disk:
+                        print_acc(
+                            f"Model requires cached pixel tensors: forcing "
+                            f"cache_tensors_to_disk on dataset {ds.folder_path}"
+                        )
+                        ds.cache_tensors_to_disk = True
+
+        # build the datasets without triggering their caching: each cache pass
+        # is driven explicitly below, once per model while it is loaded
+        self._dataset_objs = None
+        self._dataset_reg_objs = None
+        if self.datasets is not None:
+            self._dataset_objs, _ = build_datasets(
+                self.datasets, self.train_config.batch_size, self.sd, defer_caching=True)
+        if self.datasets_reg is not None:
+            self._dataset_reg_objs, _ = build_datasets(
+                self.datasets_reg, self.train_config.batch_size, self.sd, defer_caching=True)
+        all_dataset_objs = (self._dataset_objs or []) + (self._dataset_reg_objs or [])
+
+        for dataset in all_dataset_objs:
+            if dataset.is_caching_latents:
+                dataset.cache_latents_all_latents()
+            if dataset.is_caching_clip_vision_to_disk:
+                dataset.cache_clip_vision_to_disk()
+        flush()
+
+        # ### phase 2: text encoder + embedding caching ###
+        self.sd.load_text_encoder()
+
+        for dataset in all_dataset_objs:
+            if dataset.is_caching_text_embeddings:
+                dataset.cache_text_embeddings()
+            if dataset.is_generating_controls:
+                # always do this last
+                dataset.setup_controls()
+
+        # cache validation latents and embeddings while both the vae and the
+        # text encoder are resident
+        # TODO: split into a vae pass (phase 1) and a text encoder pass so the
+        # components can be freed as soon as their own prep is done.
+        self.setup_validation()
+
+        # fixed prompts the training loop needs (unconditional/blank/trigger,
+        # sample prompts). The SD trainer implementation also frees the text
+        # encoder here when its embeddings are cached.
+        self.cache_pre_train_text_embeddings()
+
+        if self.is_latents_cached:
+            # every dataset encodes from cache: the vae is done
+            self.sd.vae = None
+        flush()
+
+        # ### phase 3: transformer ###
+        self.sd.load_transformer()
+
         self.sd.add_after_sample_image_hook(self.sample_step_hook)
 
         dtype = get_torch_dtype(self.train_config.dtype)
 
-        # model is loaded from BaseSDProcess
+        # components are loaded; grab references for the setup below
         unet = self.sd.unet
         vae = self.sd.vae
         tokenizer = self.sd.tokenizer
@@ -2220,34 +2306,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         self.lr_scheduler = lr_scheduler
 
-        # cache validation latents and embeddings now, the vae and text encoder
-        # may be dumped before the train loop starts
-        self.setup_validation()
-
-        ### HOOk ###
-        self.before_dataset_load()
-        if getattr(self.sd, 'require_pixel_tensor_cache', False):
-            # model needs pixel tensors at train time even with cached latents;
-            # storing them changes the latent cache key (first run re-caches)
-            for ds_list in [self.datasets, self.datasets_reg]:
-                if ds_list is None:
-                    continue
-                for ds in ds_list:
-                    if not (ds.cache_latents or ds.cache_latents_to_disk):
-                        # live-loading datasets already have pixels on the batch
-                        continue
-                    if not ds.cache_tensors_to_disk:
-                        print_acc(
-                            f"Model requires cached pixel tensors: forcing "
-                            f"cache_tensors_to_disk on dataset {ds.folder_path}"
-                        )
-                        ds.cache_tensors_to_disk = True
-        # load datasets if passed in the root process
+        # wrap the datasets built during the prep phases into dataloaders
+        # (all caching was already driven explicitly)
         if self.datasets is not None:
-            self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)
+            self.data_loader = get_dataloader_from_datasets(
+                self.datasets, self.train_config.batch_size, self.sd,
+                datasets=self._dataset_objs)
         if self.datasets_reg is not None:
-            self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
-                                                                self.sd)
+            self.data_loader_reg = get_dataloader_from_datasets(
+                self.datasets_reg, self.train_config.batch_size, self.sd,
+                datasets=self._dataset_reg_objs)
 
         flush()
         self.last_save_step = self.step_num
