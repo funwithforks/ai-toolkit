@@ -1649,17 +1649,6 @@ class SDTrainer(BaseSDTrainProcess):
             if isinstance(self.adapter, CustomAdapter):
                 batch = self.adapter.edit_batch_processed(batch)
             dtype = get_torch_dtype(self.train_config.dtype)
-            # sanity check (the vae is unloaded once every dataset encodes
-            # cached latents)
-            if self.sd.vae is not None and self.sd.vae.dtype != self.sd.vae_torch_dtype:
-                self.sd.vae = self.sd.vae.to(self.sd.vae_torch_dtype)
-            if isinstance(self.sd.text_encoder, list):
-                for encoder in self.sd.text_encoder:
-                    if encoder.dtype != self.sd.te_torch_dtype:
-                        encoder.to(self.sd.te_torch_dtype)
-            else:
-                if self.sd.text_encoder.dtype != self.sd.te_torch_dtype:
-                    self.sd.text_encoder.to(self.sd.te_torch_dtype)
 
             noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
             if self.train_config.do_cfg or self.train_config.do_random_cfg:
