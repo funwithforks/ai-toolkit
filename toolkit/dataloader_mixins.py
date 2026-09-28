@@ -2461,6 +2461,62 @@ class TextEmbeddingCachingMixin:
             super().__init__(**kwargs)
         self.is_caching_text_embeddings = self.dataset_config.cache_text_embeddings
 
+    def _caption_embed_targets(self: 'AiToolkitDataset', file_item):
+        # every (path, caption) text-embed target for one item, the subset that
+        # are plain-text dropout variants, and the D-OPSD self-ref targets
+        text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
+        encode_targets = [(text_embedding_path, file_item.caption)]
+        if self.dataset_config.diff_output_preservation:
+            dop_path = file_item.get_dop_text_embedding_path(recalculate=True)
+            if dop_path != text_embedding_path:
+                # trigger word was in the caption, cache the DOP version too
+                encode_targets.append((dop_path, file_item.caption_dop))
+        # dropout embeds are encoded as plain text (no control images)
+        dropout_target_paths = set()
+        if self.dataset_config.caption_dropout_rate > 0:
+            blank_path = file_item.get_blank_text_embedding_path(recalculate=True)
+            if blank_path != text_embedding_path:
+                # cache the dropout caption embedding (blank, or trigger word only)
+                encode_targets.append((blank_path, file_item.get_dropout_caption()))
+                dropout_target_paths.add(blank_path)
+            if self.dataset_config.diff_output_preservation:
+                # cache the DOP version of the dropout caption (class only)
+                dop_blank_path = file_item.get_dop_blank_text_embedding_path(recalculate=True)
+                if dop_blank_path not in [t[0] for t in encode_targets] + [text_embedding_path]:
+                    encode_targets.append((dop_blank_path, file_item.get_dop_dropout_caption()))
+                    dropout_target_paths.add(dop_blank_path)
+        dopsd_targets = []
+        if getattr(file_item, 'dopsd_self_ref', False):
+            # D-OPSD teacher embeds encode with the item's own media as the reference
+            control_video_paths = getattr(file_item, 'control_video_paths', None) or []
+            if file_item.control_path is not None or len(control_video_paths) > 0:
+                raise ValueError(
+                    "D-OPSD self-reference training cannot be combined with "
+                    "control images/videos: the item itself must be the only "
+                    f"reference. Offending item: {file_item.path}"
+                )
+            dopsd_targets.append((
+                file_item.get_dopsd_text_embedding_path(recalculate=True),
+                file_item.caption_dopsd,
+            ))
+            if self.dataset_config.caption_dropout_rate > 0:
+                dopsd_blank_path = file_item.get_dopsd_blank_text_embedding_path(recalculate=True)
+                if dopsd_blank_path != dopsd_targets[0][0]:
+                    dopsd_targets.append((dopsd_blank_path, file_item.get_dopsd_dropout_caption()))
+        return encode_targets, dropout_target_paths, dopsd_targets
+
+    def text_embedding_complete(self: 'AiToolkitDataset'):
+        # True when every text embed this dataset would encode already exists
+        # on disk, so the training process can skip loading the text encoder.
+        if not self.is_caching_text_embeddings:
+            return True
+        for file_item in self.file_list:
+            encode_targets, _, dopsd_targets = self._caption_embed_targets(file_item)
+            for path, _ in encode_targets + dopsd_targets:
+                if not os.path.exists(path):
+                    return False
+        return True
+
     def cache_text_embeddings(self: 'AiToolkitDataset'):
         with accelerator.main_process_first():
             print_acc(f"Caching text_embeddings for {self.dataset_path}")
@@ -2471,30 +2527,10 @@ class TextEmbeddingCachingMixin:
             for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
                 file_item.latent_load_device = self.sd.device
 
-                text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
-                # (path, caption) pairs to encode for this item
-                encode_targets = [(text_embedding_path, file_item.caption)]
-                if self.dataset_config.diff_output_preservation:
-                    dop_path = file_item.get_dop_text_embedding_path(recalculate=True)
-                    if dop_path != text_embedding_path:
-                        # trigger word was in the caption, cache the DOP version too
-                        encode_targets.append((dop_path, file_item.caption_dop))
-                # dropout embeds are encoded as plain text (no control images)
-                dropout_target_paths = set()
-                if self.dataset_config.caption_dropout_rate > 0:
-                    blank_path = file_item.get_blank_text_embedding_path(recalculate=True)
-                    if blank_path != text_embedding_path:
-                        # cache the dropout caption embedding (blank, or trigger word only)
-                        encode_targets.append((blank_path, file_item.get_dropout_caption()))
-                        dropout_target_paths.add(blank_path)
-                    if self.dataset_config.diff_output_preservation:
-                        # cache the DOP version of the dropout caption (class only)
-                        dop_blank_path = file_item.get_dop_blank_text_embedding_path(recalculate=True)
-                        if dop_blank_path not in [t[0] for t in encode_targets] + [text_embedding_path]:
-                            encode_targets.append((dop_blank_path, file_item.get_dop_dropout_caption()))
-                            dropout_target_paths.add(dop_blank_path)
+                encode_targets, dropout_target_paths, dopsd_targets = self._caption_embed_targets(file_item)
                 # only process if not saved to disk
                 encode_targets = [t for t in encode_targets if not os.path.exists(t[0])]
+                dopsd_targets = [t for t in dopsd_targets if not os.path.exists(t[0])]
                 if len(encode_targets) > 0:
                     # text encoder placement is handled by the model's encode_prompt
                     control_video_paths = getattr(file_item, 'control_video_paths', None) or []
@@ -2592,23 +2628,6 @@ class TextEmbeddingCachingMixin:
                             prompt_embeds.save(path)
                             del prompt_embeds
                 if getattr(file_item, 'dopsd_self_ref', False):
-                    # D-OPSD teacher embeds encode with the item's own media as the reference
-                    control_video_paths = getattr(file_item, 'control_video_paths', None) or []
-                    if file_item.control_path is not None or len(control_video_paths) > 0:
-                        raise ValueError(
-                            "D-OPSD self-reference training cannot be combined with "
-                            "control images/videos: the item itself must be the only "
-                            f"reference. Offending item: {file_item.path}"
-                        )
-                    dopsd_targets = [(
-                        file_item.get_dopsd_text_embedding_path(recalculate=True),
-                        file_item.caption_dopsd,
-                    )]
-                    if self.dataset_config.caption_dropout_rate > 0:
-                        dopsd_blank_path = file_item.get_dopsd_blank_text_embedding_path(recalculate=True)
-                        if dopsd_blank_path != dopsd_targets[0][0]:
-                            dopsd_targets.append((dopsd_blank_path, file_item.get_dopsd_dropout_caption()))
-                    dopsd_targets = [t for t in dopsd_targets if not os.path.exists(t[0])]
                     if len(dopsd_targets) > 0:
                         if file_item.is_video:
                             # own path rides through the video-ref presentation

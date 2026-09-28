@@ -1,4 +1,5 @@
 import os
+import hashlib
 import random
 from collections import OrderedDict
 from typing import Union, Literal, List, Optional
@@ -149,6 +150,159 @@ class SDTrainer(BaseSDTrainProcess):
             return self.sd.encode_prompt(prompt, **kwargs)
         except Exception:
             return self.sd.encode_prompt(prompt, control_images=self.get_blank_control_image(), **kwargs)
+
+    # ------------------------------------------------------------------
+    # fixed prompt embed cache (blank/trigger/unconditional/DOP/sample
+    # prompts). Same idea as dataset caption caching: encode once, reuse on
+    # every later run of the same model + prompts, and skip the text encoder
+    # phase entirely when nothing else needs it live.
+    # ------------------------------------------------------------------
+    def _load_negative_prompt_pool(self):
+        # the negative prompt pool is read before deciding on the encoder:
+        # pool negatives are strings, not dataset files, and are encoded
+        # live during training
+        if self.train_config.negative_prompt is not None:
+            if os.path.exists(self.train_config.negative_prompt):
+                with open(self.train_config.negative_prompt, 'r') as f:
+                    self.negative_prompt_pool = f.readlines()
+                    # remove empty
+                    self.negative_prompt_pool = [x.strip() for x in self.negative_prompt_pool if x.strip() != ""]
+            else:
+                # single prompt
+                self.negative_prompt_pool = [self.train_config.negative_prompt]
+
+    def _compute_live_text_encoder_needed(self):
+        # features that still use the text encoder during training, even when
+        # everything cacheable is cached:
+        #  - negative prompt pool: random negatives are encoded per step
+        #  - prompt dropout: only applied at live encode time. Until cached
+        #    embedding variants exist, runs with it enabled keep the encoder
+        #    resident so live encoding is available.
+        return (
+            self.negative_prompt_pool is not None
+            and (self.train_config.do_cfg or self.train_config.do_random_cfg)
+        ) or self.train_config.prompt_dropout_prob > 0
+
+    def _fixed_embed_targets(self):
+        # (kind, text, flags) for every fixed-prompt embed this run needs,
+        # matching exactly what cache_pre_train_text_embeddings encodes.
+        # Returns None when something is not cacheable (sample prompts with
+        # control images, whose embeds depend on model-side presentations).
+        targets = []
+        if not getattr(self.sd, 'is_llm', False):
+            targets.append((
+                'unconditional',
+                self.train_config.unconditional_prompt,
+                {'long_prompts': self.do_long_prompts},
+            ))
+        if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
+            targets.append(('blank', '', {}))
+            if self.trigger_word is not None:
+                targets.append(('trigger', self.trigger_word, {}))
+            if self.train_config.diff_output_preservation:
+                targets.append((
+                    'dop_class',
+                    self.train_config.diff_output_preservation_class,
+                    {},
+                ))
+            if (
+                not self.train_config.disable_sampling
+                and self.sample_config is not None
+                and len(self.sample_config.prompts) > 0
+            ):
+                for i in range(len(self.sample_config.prompts)):
+                    item = self.sample_config.samples[i]
+                    if any(getattr(item, a, None) is not None for a in (
+                            'ctrl_img', 'ctrl_img_1', 'ctrl_img_2', 'ctrl_img_3')):
+                        return None
+                    prompt = self.sample_config.prompts[i]
+                    if self.trigger_word is not None:
+                        prompt = self.sd.inject_trigger_into_prompt(
+                            prompt, self.trigger_word, add_if_not_present=False
+                        )
+                    # autoparse exactly as cache_sample_prompts does
+                    gen_img_config = GenerateImageConfig(
+                        prompt=prompt,
+                        negative_prompt=item.neg,
+                        output_path='placeholder.jpg',
+                    )
+                    targets.append((f'sample_pos_{i}', gen_img_config.prompt, {}))
+                    targets.append((f'sample_neg_{i}', gen_img_config.negative_prompt, {}))
+        return targets
+
+    def _fixed_embed_cache_path(self, kind, text, flags):
+        model_id = f"{self.sd.arch}|{self.sd.model_config.name_or_path}"
+        space_version = getattr(self.sd, 'text_embedding_space_version', 0)
+        flag_str = '|'.join(f'{k}={v}' for k, v in sorted(flags.items()))
+        digest = hashlib.md5(
+            f"{kind}|{model_id}|{space_version}|{text}|{flag_str}".encode()
+        ).hexdigest()[:16]
+        return os.path.join(
+            self.save_root, '.prompt_embed_cache', f"{kind}_{digest}.safetensors"
+        )
+
+    def _save_fixed_embed(self, kind, text, flags, embeds):
+        try:
+            embeds.detach().to('cpu').save(self._fixed_embed_cache_path(kind, text, flags))
+        except Exception as e:
+            print_acc(f" - could not cache {kind} prompt embeds: {e}")
+
+    def fixed_embeds_cached(self):
+        targets = self._fixed_embed_targets()
+        if targets is None:
+            return False
+        return all(
+            os.path.exists(self._fixed_embed_cache_path(kind, text, flags))
+            for kind, text, flags in targets
+        )
+
+    def needs_text_encoder_load(self):
+        # the training process asks before the text encoder phase; False skips
+        # loading it entirely (everything cached, nothing encodes live)
+        for dataset in (self._dataset_objs or []) + (self._dataset_reg_objs or []):
+            if dataset.is_caching_text_embeddings and not dataset.text_embedding_complete():
+                return True
+        if self.train_config.train_text_encoder:
+            return True
+        if self.embed_config is not None:
+            return True
+        if getattr(self.sd, 'is_llm', False):
+            return True
+        if self._validation_needs_vae():
+            # validation prompt embeds are re-encoded into memory every run
+            return True
+        if not (self.train_config.unload_text_encoder or self.is_caching_text_embeddings):
+            # captions are encoded live every epoch
+            return True
+        self._load_negative_prompt_pool()
+        if self._compute_live_text_encoder_needed():
+            return True
+        if not self.fixed_embeds_cached():
+            return True
+        return False
+
+    def _load_fixed_embeds_from_cache(self):
+        print_acc("Loading fixed prompt embeddings from cache")
+        sample_cache = {}
+        for kind, text, flags in self._fixed_embed_targets():
+            embeds = PromptEmbeds.load(self._fixed_embed_cache_path(kind, text, flags))
+            if kind == 'unconditional':
+                self.unconditional_embeds = embeds.to(
+                    self.device_torch, dtype=self.sd.torch_dtype
+                ).detach()
+            elif kind == 'blank':
+                self.cached_blank_embeds = embeds
+            elif kind == 'trigger':
+                self.cached_trigger_embeds = embeds
+            elif kind == 'dop_class':
+                self.cached_dop_class_embeds = embeds
+                self.diff_output_preservation_embeds = embeds
+            elif kind.startswith('sample_pos_'):
+                sample_cache.setdefault(int(kind.rsplit('_', 1)[1]), {})['conditional'] = embeds
+            elif kind.startswith('sample_neg_'):
+                sample_cache.setdefault(int(kind.rsplit('_', 1)[1]), {})['unconditional'] = embeds
+        if sample_cache:
+            self.sd.sample_prompts_cache = [sample_cache[i] for i in sorted(sample_cache)]
     
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
@@ -266,6 +420,11 @@ class SDTrainer(BaseSDTrainProcess):
                 else:
                     positive = self.sd.encode_prompt(gen_img_config.prompt).to('cpu')
                     negative = self.sd.encode_prompt(gen_img_config.negative_prompt).to('cpu')
+                    # plain-text sample embeds are cacheable for later runs
+                    self._save_fixed_embed(
+                        f'sample_pos_{i}', gen_img_config.prompt, {}, positive)
+                    self._save_fixed_embed(
+                        f'sample_neg_{i}', gen_img_config.negative_prompt, {}, negative)
                 
                 self.sd.sample_prompts_cache.append({
                     'conditional': positive,
@@ -310,29 +469,14 @@ class SDTrainer(BaseSDTrainProcess):
         # resident: encode every fixed prompt the training loop needs, then
         # free the encoder when nothing else uses it.
 
-        # the negative prompt pool is read before deciding on the encoder:
-        # pool negatives are strings, not dataset files, and are encoded
-        # live during training
-        if self.train_config.negative_prompt is not None:
-            if os.path.exists(self.train_config.negative_prompt):
-                with open(self.train_config.negative_prompt, 'r') as f:
-                    self.negative_prompt_pool = f.readlines()
-                    # remove empty
-                    self.negative_prompt_pool = [x.strip() for x in self.negative_prompt_pool if x.strip() != ""]
-            else:
-                # single prompt
-                self.negative_prompt_pool = [self.train_config.negative_prompt]
+        self._load_negative_prompt_pool()
+        self.live_text_encoder_needed = self._compute_live_text_encoder_needed()
 
-        # features that still use the text encoder during training, even when
-        # everything cacheable is cached:
-        #  - negative prompt pool: random negatives are encoded per step
-        #  - prompt dropout: only applied at live encode time. Until cached
-        #    embedding variants exist, runs with it enabled keep the encoder
-        #    resident so live encoding is available.
-        self.live_text_encoder_needed = (
-            self.negative_prompt_pool is not None
-            and (self.train_config.do_cfg or self.train_config.do_random_cfg)
-        ) or self.train_config.prompt_dropout_prob > 0
+        if self.sd.text_encoder is None:
+            # the text encoder phase was skipped: needs_text_encoder_load()
+            # already verified every embed this run needs is cached
+            self._load_fixed_embeds_from_cache()
+            return
 
         # cache unconditional embeds (blank prompt); text-generating models have no text encoder
         if not getattr(self.sd, 'is_llm', False):
@@ -344,6 +488,10 @@ class SDTrainer(BaseSDTrainProcess):
                     self.device_torch,
                     dtype=self.sd.torch_dtype
                 ).detach()
+                self._save_fixed_embed(
+                    'unconditional', self.train_config.unconditional_prompt,
+                    {'long_prompts': self.do_long_prompts}, self.unconditional_embeds,
+                )
 
         # handle unload text encoder
         if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
@@ -354,11 +502,17 @@ class SDTrainer(BaseSDTrainProcess):
                 # cache embeddings
                 self.sd.text_encoder_to(self.device_torch)
                 self.cached_blank_embeds = self.encode_static_prompt("")
+                self._save_fixed_embed('blank', '', {}, self.cached_blank_embeds)
                 if self.trigger_word is not None:
                     self.cached_trigger_embeds = self.encode_static_prompt(self.trigger_word)
+                    self._save_fixed_embed(
+                        'trigger', self.trigger_word, {}, self.cached_trigger_embeds)
                 if self.train_config.diff_output_preservation:
                     self.cached_dop_class_embeds = self.encode_static_prompt(self.train_config.diff_output_preservation_class)
                     self.diff_output_preservation_embeds = self.cached_dop_class_embeds
+                    self._save_fixed_embed(
+                        'dop_class', self.train_config.diff_output_preservation_class,
+                        {}, self.cached_dop_class_embeds)
                 
                 self.cache_sample_prompts()
 
