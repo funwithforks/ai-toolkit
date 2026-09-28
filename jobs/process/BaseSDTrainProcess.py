@@ -1870,6 +1870,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.setup_validation()
 
 
+        # embedding training: construct the embedding now, before anything
+        # encodes text. The constructor adds its tokens to the tokenizer and
+        # resizes the (resident) text encoder, so prompts cached below are
+        # encoded with the trained tokens present. Resuming saved vectors also
+        # happens here while the text encoder is resident; the step count and
+        # optimizer params are picked up in the optimizer setup below.
+        if self.embed_config is not None:
+            self.embedding = Embedding(
+                sd=self.sd,
+                embed_config=self.embed_config
+            )
+            latest_save_path = self.get_latest_save_path(self.embed_config.trigger)
+            # load last saved weights
+            if latest_save_path is not None:
+                self.embedding.load_embedding_from_file(latest_save_path, self.device_torch)
+
         # fixed prompts the training loop needs (unconditional/blank/trigger,
         # sample prompts). The SD trainer implementation also frees the text
         # encoder here when its embeddings are cached.
@@ -2165,21 +2181,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     )
 
             if self.embed_config is not None:
-                # we are doing embedding training as well
-                self.embedding = Embedding(
-                    sd=self.sd,
-                    embed_config=self.embed_config
-                )
-                latest_save_path = self.get_latest_save_path(self.embed_config.trigger)
-                # load last saved weights
-                if latest_save_path is not None:
-                    self.embedding.load_embedding_from_file(latest_save_path, self.device_torch)
-                    if self.embedding.step > 1:
-                        self.step_num = self.embedding.step
-                        self.start_step = self.step_num
+                # we are doing embedding training as well. The embedding was
+                # constructed and its saved weights loaded during the text
+                # encoder phase (its tokens must exist before prompts are
+                # encoded); pick up the resumed step and optimizer params here.
+                if self.embedding.step > 1:
+                    self.step_num = self.embedding.step
+                    self.start_step = self.step_num
 
-                # self.step_num = self.embedding.step
-                # self.start_step = self.step_num
                 params.append({
                     'params': list(self.embedding.get_trainable_params()),
                     'lr': self.train_config.embedding_lr
