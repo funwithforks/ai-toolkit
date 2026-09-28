@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Optional, TYPE_CHECKING, List, Union, Tuple
 
 import torch
@@ -746,3 +747,26 @@ def inject_trigger_into_prompt(prompt, trigger=None, to_replace_list=None, add_i
         #         f"Warning: {trigger} token appears {num_instances} times in prompt {output_prompt}. This may cause issues.")
 
     return output_prompt
+
+
+# inline multi-character DOP tokens: [trigger:Bob class:a man]
+# the trigger part is used in the normal caption, the class part in the DOP caption.
+INLINE_DOP_RE = re.compile(
+    r'\[\s*trigger\s*:\s*(.+?)\s*,?\s*class\s*:\s*(.+?)\s*\]', re.IGNORECASE
+)
+
+
+def extract_inline_dop_pairs(prompt):
+    if not prompt or not INLINE_DOP_RE.search(prompt):
+        return []
+    return [(m.group(1).strip(), m.group(2).strip()) for m in INLINE_DOP_RE.finditer(prompt)]
+
+
+def apply_inline_dop(prompt, use_class=False):
+    if not prompt or not INLINE_DOP_RE.search(prompt):
+        return prompt
+
+    def _repl(m):
+        return m.group(2).strip() if use_class else m.group(1).strip()
+
+    return INLINE_DOP_RE.sub(_repl, prompt)
