@@ -309,6 +309,31 @@ class SDTrainer(BaseSDTrainProcess):
         # Runs during the text encoder load phase while the encoder is
         # resident: encode every fixed prompt the training loop needs, then
         # free the encoder when nothing else uses it.
+
+        # the negative prompt pool is read before deciding on the encoder:
+        # pool negatives are strings, not dataset files, and are encoded
+        # live during training
+        if self.train_config.negative_prompt is not None:
+            if os.path.exists(self.train_config.negative_prompt):
+                with open(self.train_config.negative_prompt, 'r') as f:
+                    self.negative_prompt_pool = f.readlines()
+                    # remove empty
+                    self.negative_prompt_pool = [x.strip() for x in self.negative_prompt_pool if x.strip() != ""]
+            else:
+                # single prompt
+                self.negative_prompt_pool = [self.train_config.negative_prompt]
+
+        # features that still use the text encoder during training, even when
+        # everything cacheable is cached:
+        #  - negative prompt pool: random negatives are encoded per step
+        #  - prompt dropout: only applied at live encode time. Until cached
+        #    embedding variants exist, runs with it enabled keep the encoder
+        #    resident so live encoding is available.
+        self.live_text_encoder_needed = (
+            self.negative_prompt_pool is not None
+            and (self.train_config.do_cfg or self.train_config.do_random_cfg)
+        ) or self.train_config.prompt_dropout_prob > 0
+
         # cache unconditional embeds (blank prompt); text-generating models have no text encoder
         if not getattr(self.sd, 'is_llm', False):
             with torch.no_grad():
@@ -322,7 +347,7 @@ class SDTrainer(BaseSDTrainProcess):
 
         # handle unload text encoder
         if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
-            print_acc("Caching embeddings and unloading text encoder")
+            print_acc("Caching fixed prompt embeddings")
             with torch.no_grad():
                 if self.train_config.train_text_encoder:
                     raise ValueError("Cannot unload text encoder if training text encoder")
@@ -336,20 +361,27 @@ class SDTrainer(BaseSDTrainProcess):
                     self.diff_output_preservation_embeds = self.cached_dop_class_embeds
                 
                 self.cache_sample_prompts()
-                
-                print_acc("\n***** UNLOADING TEXT ENCODER *****")
-                if self.is_caching_text_embeddings:
-                    print_acc("Embeddings cached to disk. We dont need the text encoder anymore")
-                else:
-                    print_acc("This will train only with a blank prompt or trigger word, if set")
-                    print_acc("If this is not what you want, remove the unload_text_encoder flag")
-                print_acc("***********************************")
-                print_acc("")
 
                 # unload the text encoder
-                if self.is_caching_text_embeddings:
+                if self.is_caching_text_embeddings and self.live_text_encoder_needed:
+                    print_acc("\n***** KEEPING TEXT ENCODER LOADED *****")
+                    print_acc("The current config encodes prompts during training")
+                    print_acc("(negative prompt pool and/or prompt dropout), so the")
+                    print_acc("text encoder stays resident.")
+                    print_acc("************************************")
+                    print_acc("")
+                elif self.is_caching_text_embeddings:
+                    print_acc("\n***** UNLOADING TEXT ENCODER *****")
+                    print_acc("Embeddings cached to disk. We dont need the text encoder anymore")
+                    print_acc("***********************************")
+                    print_acc("")
                     unload_text_encoder(self.sd)
                 else:
+                    print_acc("\n***** UNLOADING TEXT ENCODER *****")
+                    print_acc("This will train only with a blank prompt or trigger word, if set")
+                    print_acc("If this is not what you want, remove the unload_text_encoder flag")
+                    print_acc("***********************************")
+                    print_acc("")
                     # todo once every model is tested to work, unload properly. Though, this will all be merged into one thing.
                     # keep legacy usage for now. 
                     self.sd.text_encoder_to("cpu")
@@ -357,7 +389,7 @@ class SDTrainer(BaseSDTrainProcess):
 
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
-        # fixed prompt embeddings were cached (and the text encoder freed)
+        # fixed prompt embeddings (and the negative prompt pool) were prepared
         # during the text encoder load phase; see cache_pre_train_text_embeddings
         
         if self.train_config.do_prior_divergence:
@@ -394,16 +426,6 @@ class SDTrainer(BaseSDTrainProcess):
                     raise ValueError("No unconditional clip image embeds found. This should not happen")
 
                 self._clip_image_embeds_unconditional = unconditional_clip_image_embeds
-
-        if self.train_config.negative_prompt is not None:
-            if os.path.exists(self.train_config.negative_prompt):
-                with open(self.train_config.negative_prompt, 'r') as f:
-                    self.negative_prompt_pool = f.readlines()
-                    # remove empty
-                    self.negative_prompt_pool = [x.strip() for x in self.negative_prompt_pool if x.strip() != ""]
-            else:
-                # single prompt
-                self.negative_prompt_pool = [self.train_config.negative_prompt]
 
         if self.train_config.blank_prompt_preservation and self.cached_blank_embeds is None:
             # make sure we have this if not unloading
@@ -1777,12 +1799,23 @@ class SDTrainer(BaseSDTrainProcess):
                                     [embeds_to_use] * noisy_latents.shape[0]
                                 )
                             if self.train_config.do_cfg:
-                                unconditional_embeds = self.cached_blank_embeds.clone().detach().to(
-                                    self.device_torch, dtype=dtype
-                                )
-                                unconditional_embeds = concat_prompt_embeds(
-                                    [unconditional_embeds] * noisy_latents.shape[0]
-                                )
+                                if self.negative_prompt_pool is not None:
+                                    # pool negatives are strings, not dataset
+                                    # files: encode them live (the text encoder
+                                    # is kept resident for this)
+                                    unconditional_embeds = self.sd.encode_prompt(
+                                        self.batch_negative_prompt,
+                                        dropout_prob=self.train_config.prompt_dropout_prob,
+                                        long_prompts=self.do_long_prompts,
+                                        **prompt_kwargs
+                                    ).to(self.device_torch, dtype=dtype)
+                                else:
+                                    unconditional_embeds = self.cached_blank_embeds.clone().detach().to(
+                                        self.device_torch, dtype=dtype
+                                    )
+                                    unconditional_embeds = concat_prompt_embeds(
+                                        [unconditional_embeds] * noisy_latents.shape[0]
+                                    )
 
                             if self.train_config.diff_output_preservation:
                                 if batch.dop_prompt_embeds is not None:

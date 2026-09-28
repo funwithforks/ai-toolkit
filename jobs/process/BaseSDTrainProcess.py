@@ -1860,8 +1860,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # encoder here when its embeddings are cached.
         self.cache_pre_train_text_embeddings()
 
-        if self.is_latents_cached:
-            # every dataset encodes from cache: the vae is done
+        if self.is_latents_cached and self.train_config.disable_sampling:
+            # every dataset encodes from cache and no sampling will run: the
+            # vae is done. With sampling enabled the vae stays loaded, since
+            # preview generation decodes through it.
+            # TODO: load/unload helper models on demand around sampling.
             self.sd.vae = None
         flush()
 
