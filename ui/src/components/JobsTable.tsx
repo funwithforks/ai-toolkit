@@ -148,9 +148,6 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
         }
         return (
           <Link href={href} className="font-medium whitespace-nowrap">
-            {['running', 'stopping'].includes(row.status) ? (
-              <CgSpinner className="inline animate-spin mr-2 text-blue-400" />
-            ) : null}
             {title}
           </Link>
         );

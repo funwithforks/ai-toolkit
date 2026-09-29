@@ -1,7 +1,6 @@
 'use client';
 
 import Link from 'next/link';
-import { CgSpinner } from 'react-icons/cg';
 import useJobsList from '@/hooks/useJobsList';
 import { getTotalSteps } from '@/utils/jobs';
 
@@ -22,7 +21,6 @@ export default function ActiveJobWidget() {
               totalSteps = undefined;
             }
             const pct = totalSteps ? Math.min(100, (job.step / totalSteps) * 100) : 0;
-            const isRunning = job.status === 'running' || job.status === 'stopping';
 
             let label = job.name;
             let href = `/jobs/${job.id}`;
@@ -48,7 +46,6 @@ export default function ActiveJobWidget() {
                   className="block px-3 py-2 bg-gray-800 hover:bg-gray-950 rounded-lg transition-colors min-w-0"
                 >
                   <div className="flex items-center gap-1.5 min-w-0">
-                    {isRunning && <CgSpinner className="animate-spin text-blue-400 flex-shrink-0" />}
                     <span className="text-xs text-gray-100 truncate min-w-0 flex-1">{label}</span>
                   </div>
                   {totalSteps ? (
