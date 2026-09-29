@@ -1132,6 +1132,9 @@ class ControlFileItemDTOMixin:
         self.control_path: Union[str, List[str], None] = None
         self.control_tensor: Union[torch.Tensor, None] = None
         self.control_tensor_list: Union[List[torch.Tensor], None] = None
+        # file identity per control image (see load_control_image). Models
+        # that VAE-encode controls may use it to cache the latents.
+        self.control_cache_keys: Union[List, None] = None
         sd = kwargs.get('sd', None)
         self.use_raw_control_images = sd is not None and sd.use_raw_control_images
         dataset_config: 'DatasetConfig' = kwargs.get('dataset_config', None)
@@ -1263,6 +1266,24 @@ class ControlFileItemDTOMixin:
                 tensor = transform(img)
             control_tensors.append(tensor)
             
+        # same-folder pairing picks random files per epoch and non-raw controls
+        # are flipped/bucket-cropped with the target, so only raw disk controls
+        # are a deterministic function of their file
+        self.control_cache_keys = None
+        if (
+            len(control_tensors) == len(control_path_list)
+            and self.use_raw_control_images
+            and self.aug_replay_spatial_transforms is None
+            and not self.dataset_config.control_from_same_folder
+        ):
+            try:
+                self.control_cache_keys = [
+                    (p, os.stat(p).st_mtime_ns, os.stat(p).st_size)
+                    for p in control_path_list
+                ]
+            except OSError:
+                self.control_cache_keys = None
+
         if len(control_tensors) == 0:
             self.control_tensor = None
         elif len(control_tensors) == 1:
@@ -1276,6 +1297,7 @@ class ControlFileItemDTOMixin:
     def cleanup_control(self: 'FileItemDTO'):
         self.control_tensor = None
         self.control_tensor_list = None
+        self.control_cache_keys = None
 
 
 class ClipImageFileItemDTOMixin:
