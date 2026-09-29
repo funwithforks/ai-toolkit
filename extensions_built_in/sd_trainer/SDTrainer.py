@@ -183,11 +183,27 @@ class SDTrainer(BaseSDTrainProcess):
             and (self.train_config.do_cfg or self.train_config.do_random_cfg)
         ) or self.train_config.prompt_dropout_prob > 0
 
+    def _sample_embeds_cacheable(self):
+        # whether sample-prompt embeds are a pure function of their text. Not
+        # when the model feeds control images through the text encoder - then
+        # the embeds depend on the images too. Single source of truth shared
+        # by _fixed_embed_targets and cache_sample_prompts so writer and gate
+        # can never disagree.
+        if not getattr(self.sd, 'encode_control_in_text_embeddings', False):
+            return True
+        if self.sample_config is None:
+            return True
+        return not any(
+            getattr(s, a, None) is not None
+            for s in (self.sample_config.samples or [])
+            for a in ('ctrl_img', 'ctrl_img_1', 'ctrl_img_2', 'ctrl_img_3')
+        )
+
     def _fixed_embed_targets(self):
         # (kind, text, flags) for every fixed-prompt embed this run needs,
         # matching exactly what cache_pre_train_text_embeddings encodes.
-        # Returns None when something is not cacheable (sample prompts with
-        # control images, whose embeds depend on model-side presentations).
+        # Returns None when something is not cacheable (sample prompts whose
+        # embeds are encoded with control images through the text encoder).
         targets = []
         if not getattr(self.sd, 'is_llm', False):
             targets.append((
@@ -210,11 +226,10 @@ class SDTrainer(BaseSDTrainProcess):
                 and self.sample_config is not None
                 and len(self.sample_config.prompts) > 0
             ):
+                if not self._sample_embeds_cacheable():
+                    return None
                 for i in range(len(self.sample_config.prompts)):
                     item = self.sample_config.samples[i]
-                    if any(getattr(item, a, None) is not None for a in (
-                            'ctrl_img', 'ctrl_img_1', 'ctrl_img_2', 'ctrl_img_3')):
-                        return None
                     prompt = self.sample_config.prompts[i]
                     if self.trigger_word is not None:
                         prompt = self.sd.inject_trigger_into_prompt(
@@ -260,7 +275,7 @@ class SDTrainer(BaseSDTrainProcess):
         # the training process asks before the text encoder phase; False skips
         # loading it entirely (everything cached, nothing encodes live)
         for dataset in (self._dataset_objs or []) + (self._dataset_reg_objs or []):
-            if dataset.is_caching_text_embeddings and not dataset.text_embedding_complete():
+            if not dataset.text_embedding_complete():
                 return True
         if self.train_config.train_text_encoder:
             return True
@@ -312,6 +327,12 @@ class SDTrainer(BaseSDTrainProcess):
             self.sd.sample_prompts_cache = []
             sample_folder = os.path.join(self.save_root, 'samples')
             output_path = os.path.join(sample_folder, 'test.jpg')
+            # only persist the plain-text embeds when a later run could reuse
+            # them (same guard as _fixed_embed_targets)
+            embeds_cacheable = (
+                (self.train_config.unload_text_encoder or self.is_caching_text_embeddings)
+                and self._sample_embeds_cacheable()
+            )
             for i in range(len(self.sample_config.prompts)):
                 sample_item = self.sample_config.samples[i]
                 prompt = self.sample_config.prompts[i]
@@ -421,10 +442,11 @@ class SDTrainer(BaseSDTrainProcess):
                     positive = self.sd.encode_prompt(gen_img_config.prompt).to('cpu')
                     negative = self.sd.encode_prompt(gen_img_config.negative_prompt).to('cpu')
                     # plain-text sample embeds are cacheable for later runs
-                    self._save_fixed_embed(
-                        f'sample_pos_{i}', gen_img_config.prompt, {}, positive)
-                    self._save_fixed_embed(
-                        f'sample_neg_{i}', gen_img_config.negative_prompt, {}, negative)
+                    if embeds_cacheable:
+                        self._save_fixed_embed(
+                            f'sample_pos_{i}', gen_img_config.prompt, {}, positive)
+                        self._save_fixed_embed(
+                            f'sample_neg_{i}', gen_img_config.negative_prompt, {}, negative)
                 
                 self.sd.sample_prompts_cache.append({
                     'conditional': positive,
