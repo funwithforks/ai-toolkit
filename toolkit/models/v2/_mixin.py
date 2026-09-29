@@ -284,10 +284,11 @@ class OstrisModelMixin:
         if qtype is not None and "|" in qtype:
             qtype, ara_path = qtype.split("|", 1)
 
-        # pre-quantized checkpoint: keep the shipped quantization IFF it
-        # exactly matches the request. Anything else — no quantization
-        # requested (full finetuning), a different backend, or an ARA —
-        # restores/requantizes to what was asked for.
+        # pre-quantized checkpoint: qtype None means "run as shipped" - keep
+        # the checkpoint's own quantization, load it straight, run no
+        # quantization code. There is no full-precision mode: to full
+        # finetune, download an unquantized checkpoint. A quantization
+        # *request* that mismatches the shipped one requantizes.
         if getattr(self, "aitk_is_quantized", False):
             from toolkit.util.ostris_quant import OstrisLinear
             from toolkit.util.quantize import (
@@ -308,11 +309,14 @@ class OstrisModelMixin:
             # LM linears + int8 embeddings). The request matches when the
             # requested backend is among the shipped ones — the whole shipped
             # quantization is then kept exactly as-is.
-            matches = (
-                qtype is not None
-                and ara_path is None
-                and qtype in shipped
-            )
+            if qtype is None and ara_path is None:
+                matches = True
+            else:
+                matches = (
+                    qtype is not None
+                    and ara_path is None
+                    and qtype in shipped
+                )
             if matches:
                 status_fn(
                     f"Checkpoint is pre-quantized ({'/'.join(shipped)}); keeping it"
@@ -321,10 +325,10 @@ class OstrisModelMixin:
                 target_is_ostris = qtype is not None and isinstance(
                     get_qtype(qtype), ostristype
                 )
-                if qtype is None or ara_path is not None or not target_is_ostris:
-                    # full precision requested, an ARA (quantizes fresh from
-                    # full weights), or a quanto/torchao backend that cannot
-                    # re-quantize an OstrisLinear: dequantize first
+                if ara_path is not None or not target_is_ostris:
+                    # an ARA (quantizes fresh from full weights) or a
+                    # quanto/torchao backend that cannot re-quantize an
+                    # OstrisLinear: dequantize first
                     status_fn(
                         f"Dequantizing shipped {'/'.join(shipped)} weights "
                         f"-> {qtype or 'full precision'}"

@@ -628,6 +628,13 @@ ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'aura
 
 
 class ModelConfig:
+
+    @staticmethod
+    def _quantize_setting(kwargs, key):
+        raw = kwargs.get(key, "none")
+        if isinstance(raw, str):
+            return raw.lower() not in ("none", "false", "off", "")
+        return bool(raw)
     def __init__(self, **kwargs):
         self.name_or_path: str = kwargs.get('name_or_path', None)
         # name or path is updated on fine tuning. Keep a copy of the original
@@ -685,9 +692,16 @@ class ModelConfig:
         self.te_device = kwargs.get("te_device", None)
         self.te_dtype = kwargs.get("te_dtype", self.dtype)
 
-        # only for flux for now
-        self.quantize = kwargs.get("quantize", False)
-        self.quantize_te = kwargs.get("quantize_te", self.quantize)
+        # quantize: 'none' (the default) or false = never run quantization
+        # code and keep whatever the checkpoint ships (including shipped
+        # quantization). There is no full-precision mode: download an
+        # unquantized checkpoint for a full finetune.
+        self.quantize = self._quantize_setting(kwargs, "quantize")
+        quantize_te_raw = kwargs.get("quantize_te", None)
+        if quantize_te_raw is None:
+            self.quantize_te = self.quantize
+        else:
+            self.quantize_te = self._quantize_setting(kwargs, "quantize_te")
         self.qtype = kwargs.get("qtype", "qfloat8")
         self.qtype_te = kwargs.get("qtype_te", "qfloat8")
         self.low_vram = kwargs.get("low_vram", False)
