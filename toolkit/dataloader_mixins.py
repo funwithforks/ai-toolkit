@@ -19,7 +19,7 @@ from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, SiglipImageProcessor
 
 from toolkit.audio.preserve_pitch import time_stretch_preserve_pitch
-from toolkit.basic import UnusableFileError, flush, value_map
+from toolkit.basic import UnusableFileError, flush, get_quick_signature_string, value_map
 from toolkit.buckets import get_bucket_for_image_size, get_resolution
 from toolkit.config_modules import ControlTypes
 from toolkit.control_generator import ControlGenerator
@@ -1276,13 +1276,11 @@ class ControlFileItemDTOMixin:
             and self.aug_replay_spatial_transforms is None
             and not self.dataset_config.control_from_same_folder
         ):
-            try:
-                self.control_cache_keys = [
-                    (p, os.stat(p).st_mtime_ns, os.stat(p).st_size)
-                    for p in control_path_list
-                ]
-            except OSError:
-                self.control_cache_keys = None
+            keys = [
+                (p, get_quick_signature_string(p)) for p in control_path_list
+            ]
+            if all(sig is not None for _, sig in keys):
+                self.control_cache_keys = keys
 
         if len(control_tensors) == 0:
             self.control_tensor = None
