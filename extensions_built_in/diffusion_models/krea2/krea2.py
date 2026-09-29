@@ -470,7 +470,7 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
         return max_pixels
 
     def _encode_ref_latents(
-        self, control_tensors, target_pixels: Optional[int] = None
+        self, control_tensors, target_pixels: Optional[int] = None, cache_keys=None
     ) -> List[torch.Tensor]:
         """Encode ``[0, 1]`` reference image tensors to VAE latents.
 
@@ -479,13 +479,30 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
         ``_ref_target_pixels``) -- preserving aspect ratio -- then snapped so the
         latent grid is divisible by the patch size. ``control_tensors`` is a list
         of ``(C, H, W)`` or ``(1, C, H, W)`` tensors in ``[0, 1]``.
+
+        ``cache_keys`` (optional, parallel to ``control_tensors``): file
+        identity tuples from the dataset for deterministic controls. When given,
+        the latent is computed once per file and kept in RAM, so a dataset
+        reuses its references instead of re-encoding them every step.
         """
         sc = self.get_bucket_divisibility()  # 16: VAE(8) * patch(2)
         budget = self._ref_target_pixels(target_pixels)
         match = self.model_config.model_kwargs.get("match_target_res", False)
 
+        if not hasattr(self, "_ref_latent_cache"):
+            self._ref_latent_cache = {}
+        # budget/match change the latent for the same file
+        params = (budget, match)
+
         latents = []
-        for img in control_tensors:
+        for i, img in enumerate(control_tensors):
+            key = None
+            if cache_keys is not None and i < len(cache_keys) and cache_keys[i] is not None:
+                key = (cache_keys[i], params)
+                hit = self._ref_latent_cache.get(key)
+                if hit is not None:
+                    latents.append(hit.to(self.device_torch, dtype=self.torch_dtype))
+                    continue
             if img.dim() == 3:
                 img = img.unsqueeze(0)
             img = img.to(self.device_torch, dtype=self.torch_dtype)
@@ -512,7 +529,12 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
             latent = self.encode_images(
                 img * 2 - 1, device=self.device_torch, dtype=self.torch_dtype
             )
-            latents.append(latent[0])  # drop batch dim -> (16, h, w)
+            latent = latent[0]  # drop batch dim -> (16, h, w)
+            if key is not None:
+                if len(self._ref_latent_cache) > 512:
+                    self._ref_latent_cache.clear()
+                self._ref_latent_cache[key] = latent.detach().to("cpu").clone()
+            latents.append(latent)
         return latents
 
     def _batch_ref_latents_from_batch(
@@ -529,9 +551,19 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
             return None
         if len(control_list) != batch_size:
             raise ValueError("Control tensor list length does not match batch size")
+        # both collate paths order controls by file item, so item i of
+        # file_items pairs with entry i of control_list
+        item_keys = [
+            getattr(fi, "control_cache_keys", None)
+            for fi in (batch.file_items or [])
+        ]
+        if len(item_keys) != len(control_list):
+            item_keys = [None] * len(control_list)
         return [
-            self._encode_ref_latents(controls, target_pixels=target_pixels)
-            for controls in control_list
+            self._encode_ref_latents(
+                controls, target_pixels=target_pixels, cache_keys=keys
+            )
+            for controls, keys in zip(control_list, item_keys)
         ]
 
     # ------------------------------------------------------------------
