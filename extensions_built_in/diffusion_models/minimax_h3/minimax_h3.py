@@ -435,8 +435,6 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                 text_encoder = Qwen3VLTextEncoder(config)
             text_encoder.lm_head = None
 
-            state_dict = load_file(te_file)
-
             def key_map(prefix: str) -> str:
                 if prefix.startswith("model."):
                     return "model.language_model." + prefix[len("model.") :]
@@ -444,41 +442,130 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                     return "model." + prefix
                 return prefix
 
-            state_dict, num_quantized = import_comfy_quantized_layers(
-                text_encoder,
-                state_dict,
-                orig_dtype=self.te_torch_dtype,
-                key_map=key_map,
-            )
-            self.print_and_status_update(
-                f" - attached {num_quantized} pre-quantized nvfp4/int8 layers"
-            )
-            state_dict = {
-                key_map(k[: k.rfind(".")]) + k[k.rfind(".") :]: v
-                for k, v in state_dict.items()
-            }
-            result = text_encoder.load_state_dict(state_dict, assign=True, strict=False)
-            quantized_keys = set()
-            for name, m in text_encoder.named_modules():
-                if isinstance(m, OstrisLinear):
-                    quantized_keys.add(f"{name}.weight")
-            allowed_missing_prefixes = (
-                "lm_head",
-                "model.language_model.norm",
-                "model.language_model.embed_tokens",
-            )
-            bad_missing = [
-                k
-                for k in result.missing_keys
-                if k not in quantized_keys
-                and not k.startswith(allowed_missing_prefixes)
-            ]
-            if bad_missing or result.unexpected_keys:
-                raise ValueError(
-                    f"MiniMax-H3 text encoder load mismatch: missing {bad_missing[:8]}, "
-                    f"unexpected {result.unexpected_keys[:8]}"
+            if not self.model_config.quantize_te:
+                # as-shipped mode: stream the file straight onto the gpu,
+                # one tensor at a time. No whole-file cpu copy (the file is
+                # larger than this machine's usable ram), no final mass
+                # transfer; quantized modules are attached per layer from
+                # small marker groups.
+                from safetensors import safe_open
+
+                num_quantized = 0
+                unexpected_keys: list = []
+                with safe_open(
+                    te_file, framework="pt", device=self.te_device_torch
+                ) as f:
+                    all_keys = list(f.keys())
+                    marker_prefixes = [
+                        k[: -len(".comfy_quant")]
+                        for k in all_keys
+                        if k.endswith(".comfy_quant")
+                    ]
+                    leftover = {}
+                    for prefix in marker_prefixes:
+                        group = {
+                            k: f.get_tensor(k)
+                            for k in all_keys
+                            if k == f"{prefix}.comfy_quant"
+                            or k.startswith(f"{prefix}.")
+                        }
+                        rest, n = import_comfy_quantized_layers(
+                            text_encoder,
+                            group,
+                            orig_dtype=self.te_torch_dtype,
+                            key_map=key_map,
+                        )
+                        num_quantized += n
+                        leftover.update(rest)
+                    for name, tensor in leftover.items():
+                        res = text_encoder.load_state_dict(
+                            {key_map(name): tensor}, assign=True, strict=False
+                        )
+                        unexpected_keys += list(res.unexpected_keys)
+                    for k in all_keys:
+                        if k.endswith(".comfy_quant") or any(
+                            k.startswith(f"{p}.") for p in marker_prefixes
+                        ):
+                            continue
+                        tensor = f.get_tensor(k)
+                        res = text_encoder.load_state_dict(
+                            {key_map(k): tensor}, assign=True, strict=False
+                        )
+                        unexpected_keys += list(res.unexpected_keys)
+                self.print_and_status_update(
+                    f" - attached {num_quantized} pre-quantized nvfp4/int8 layers"
                 )
-            del state_dict
+                # anything still on meta was neither shipped quantized nor in
+                # the file: the same mismatch check the batched path runs
+                quantized_keys = set()
+                for name, m in text_encoder.named_modules():
+                    if isinstance(m, OstrisLinear):
+                        quantized_keys.add(f"{name}.weight")
+                allowed_missing_prefixes = (
+                    "lm_head",
+                    "model.language_model.norm",
+                    "model.language_model.embed_tokens",
+                )
+                still_meta = [
+                    name
+                    for name, p in text_encoder.named_parameters()
+                    if p.device.type == "meta"
+                ] + [
+                    name
+                    for name, b in text_encoder.named_buffers()
+                    if b is not None and b.device.type == "meta"
+                ]
+                bad_missing = [
+                    k
+                    for k in still_meta
+                    if k not in quantized_keys
+                    and not k.startswith(allowed_missing_prefixes)
+                ]
+                if bad_missing or unexpected_keys:
+                    raise ValueError(
+                        f"MiniMax-H3 text encoder load mismatch: missing {bad_missing[:8]}, "
+                        f"unexpected {unexpected_keys[:8]}"
+                    )
+                del still_meta, bad_missing
+            else:
+                # requantization was requested: the requantizer needs the whole
+                # state dict, so keep the batched cpu load
+                state_dict = load_file(te_file)
+                state_dict, num_quantized = import_comfy_quantized_layers(
+                    text_encoder,
+                    state_dict,
+                    orig_dtype=self.te_torch_dtype,
+                    key_map=key_map,
+                )
+                self.print_and_status_update(
+                    f" - attached {num_quantized} pre-quantized nvfp4/int8 layers"
+                )
+                state_dict = {
+                    key_map(k[: k.rfind(".")]) + k[k.rfind(".") :]: v
+                    for k, v in state_dict.items()
+                }
+                result = text_encoder.load_state_dict(state_dict, assign=True, strict=False)
+                quantized_keys = set()
+                for name, m in text_encoder.named_modules():
+                    if isinstance(m, OstrisLinear):
+                        quantized_keys.add(f"{name}.weight")
+                allowed_missing_prefixes = (
+                    "lm_head",
+                    "model.language_model.norm",
+                    "model.language_model.embed_tokens",
+                )
+                bad_missing = [
+                    k
+                    for k in result.missing_keys
+                    if k not in quantized_keys
+                    and not k.startswith(allowed_missing_prefixes)
+                ]
+                if bad_missing or result.unexpected_keys:
+                    raise ValueError(
+                        f"MiniMax-H3 text encoder load mismatch: missing {bad_missing[:8]}, "
+                        f"unexpected {result.unexpected_keys[:8]}"
+                    )
+                del state_dict
         text_encoder.model.language_model.norm = torch.nn.Identity()
         text_encoder.eval()
         text_encoder.requires_grad_(False)
