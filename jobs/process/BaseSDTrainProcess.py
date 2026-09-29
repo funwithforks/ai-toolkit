@@ -1593,17 +1593,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set trainable params
         self.sd.adapter = self.adapter
     
-    def _validation_needs_vae(self):
-        # setup_validation re-encodes the validation images every run (memory
-        # only, no disk cache), so any validation items mean the vae is needed
-        val_config = self.train_config.validation_config
-        return val_config is not None and len(
-            getattr(val_config, 'validation_items', None) or []) > 0
-
     def setup_validation(self):
         # caches everything needed for validation (latents, prompt embeds, fixed noise)
-        # must be called while the vae and text encoder are still loaded, they may be
-        # dumped later to save memory
+        # TODO: split into a vae pass (phase 1) and a text encoder pass. Until
+        # then this expects both components resident, which the end-of-phase-1
+        # vae free no longer guarantees.
         val_config = self.train_config.validation_config
         if val_config is None:
             return
@@ -1874,14 +1868,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.vae_training_mode = 'unload'
 
-        # load the vae only if something can still use it: live latent
-        # encoding (keep), a latent cache that is not fully populated, clip
-        # vision caching, or validation latents (re-encoded every run).
-        # Otherwise it is loaded on demand around sampling instead.
+        # load the vae only if something in phase 1 can use it: live latent
+        # encoding (keep), a latent cache that is not fully populated, or clip
+        # vision caching. Validation does not count here - it loads the vae on
+        # demand in setup_validation. Otherwise phase 1 frees it (iron rule).
         vae_load_needed = self.vae_training_mode == 'keep' or any(
             dataset.is_caching_clip_vision_to_disk or not dataset.latent_cache_complete()
             for dataset in all_dataset_objs
-        ) or self._validation_needs_vae()
+        )
         if vae_load_needed:
             self.sd.load_vae()
         else:
@@ -1893,6 +1887,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 dataset.cache_latents_all_latents()
             if dataset.is_caching_clip_vision_to_disk:
                 dataset.cache_clip_vision_to_disk()
+        # IRON RULE: at the phase 1 -> 2 boundary the vae must never be left
+        # resident unless vae_training_mode is 'keep' (live per-batch latent
+        # encoding or model-declared train-time encoding, e.g. edit refs).
+        # Anything after this line that needs the vae loads it itself and
+        # frees it again: sampling rounds (sample()) and setup_validation.
+        # Do not "helpfully" keep it alive across the boundary - that was the
+        # bug where a ~6GB video vae sat idle through the entire text encoder
+        # phase after its only job (caching) was already done.
+        if self.vae_training_mode != 'keep' and self.sd.vae is not None:
+            if self.vae_training_mode == 'reload':
+                print_acc("VAE unloaded - it will reload for each sample round")
+            else:
+                print_acc("VAE unloaded for the rest of training")
+            self.sd.vae = None
         flush()
 
         # ### phase 2: text encoder + embedding caching ###
@@ -1908,10 +1916,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # always do this last
                 dataset.setup_controls()
 
-        # cache validation latents and embeddings while both the vae and the
-        # text encoder are resident
-        # TODO: split into a vae pass (phase 1) and a text encoder pass so the
-        # components can be freed as soon as their own prep is done.
+        # validation prep - see setup_validation TODO, not yet component-split
         self.setup_validation()
 
 
