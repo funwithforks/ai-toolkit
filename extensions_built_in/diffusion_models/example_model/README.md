@@ -142,6 +142,13 @@ See `src/model.py` for the full pattern and rationale.
 
 ## Quantization
 
+`quantize` defaults to `none` (same as `false`): no quantization code runs and
+the checkpoint loads exactly as shipped, including any quantization it ships
+with. There is no full-precision mode — to full finetune, download an
+unquantized checkpoint. When migrating an arch to the phased format, also point
+its `registry.py` default `name_or_path` at a pre-quantized release so the
+none default loads straight to GPU with no copies.
+
 With `quantize: true`, `quantize_model` swaps every `nn.Linear` for an
 `optimum.quanto` quantized one. Their matmul kernel **only accepts 2D or 3D
 activations** (`assert activations.ndim in (2, 3)`) — a `Linear` you feed a 4D
