@@ -1266,8 +1266,7 @@ class ControlFileItemDTOMixin:
                 tensor = transform(img)
             control_tensors.append(tensor)
             
-        # same-folder pairing picks fresh random files on every pass through
-        # the dataset and non-raw controls
+        # same-folder pairing picks random files per epoch and non-raw controls
         # are flipped/bucket-cropped with the target, so only raw disk controls
         # are a deterministic function of their file
         self.control_cache_keys = None
