@@ -277,6 +277,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.additional_logs = {}
         # cached latents, prompt embeds, and fixed noise for validation
         self._validation_cache = None
+        self._validation_items = None
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
@@ -1593,11 +1594,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set trainable params
         self.sd.adapter = self.adapter
     
-    def setup_validation(self):
-        # caches everything needed for validation (latents, prompt embeds, fixed noise)
-        # TODO: split into a vae pass (phase 1) and a text encoder pass. Until
-        # then this expects both components resident, which the end-of-phase-1
-        # vae free no longer guarantees.
+    def _has_validation_items(self):
+        val_config = self.train_config.validation_config
+        return val_config is not None and len(val_config.validation_items) > 0
+
+    def setup_validation_latents(self):
+        # phase 1 half of validation prep: images -> latents + fixed noise.
+        # Runs while phase 1 still holds the vae (vae_load_needed counts
+        # validation items; the iron-rule free fires right after this call).
+        self._validation_items = None
         val_config = self.train_config.validation_config
         if val_config is None:
             return
@@ -1615,7 +1620,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if len(validation_items) == 0:
             print_acc("Validation config has no valid validation_items, skipping validation")
             return
-        print_acc(f"Caching validation latents and embeddings for {len(validation_items)} images")
+        self._validation_items = validation_items
+        print_acc(f"Caching validation latents for {len(validation_items)} images")
         device = self.device_torch
         dtype = get_torch_dtype(self.train_config.dtype)
         resolution = val_config.resolution
@@ -1623,7 +1629,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         divisibility = self.sd.get_bucket_divisibility()
 
         image_list = []
-        prompt_list = []
         for item in validation_items:
             img = Image.open(item.image_path)
             img = ImageOps.exif_transpose(img).convert('RGB')
@@ -1637,6 +1642,44 @@ class BaseSDTrainProcess(BaseTrainProcess):
             img = img.resize((bucket['width'], bucket['height']), Image.BICUBIC)
             tensor = transforms.ToTensor()(img) * 2.0 - 1.0
             image_list.append(tensor)
+
+        fork_devices = [device] if device.type == 'cuda' else []
+        with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
+            # seed so the vae latent dist sampling is always identical
+            torch.manual_seed(42)
+            orig_vae_device = self.sd.vae.device
+            # images can have different aspect ratios so they are encoded one at a time
+            latent_list = [
+                self.sd.encode_images([image], device=device, dtype=dtype).to('cpu', dtype=torch.float32)
+                for image in image_list
+            ]
+            self.sd.vae.to(orig_vae_device)
+
+            # fixed noise per image, seeds start at 42 and increment for each image
+            noise_list = []
+            for i, latent in enumerate(latent_list):
+                generator = torch.Generator(device='cpu').manual_seed(42 + i)
+                noise_list.append(
+                    torch.randn(latent.shape, generator=generator, dtype=torch.float32)
+                )
+
+        self._validation_cache = {
+            'latents': latent_list,
+            'noise': noise_list,
+            'embeds': None,
+        }
+        flush()
+
+    def setup_validation_embeds(self):
+        # phase 2 half of validation prep: prompts -> cached embeds. Runs
+        # while phase 2 holds the text encoder (needs_text_encoder_load
+        # counts validation items).
+        if getattr(self, '_validation_items', None) is None:
+            return
+        print_acc(f"Caching validation prompt embeddings for {len(self._validation_items)} images")
+        device = self.device_torch
+        prompt_list = []
+        for item in self._validation_items:
             prompt = item.prompt
             if self.trigger_word is not None:
                 prompt = self.sd.inject_trigger_into_prompt(
@@ -1660,29 +1703,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             for t, te_device in zip(te_list, orig_te_devices):
                 t.to(te_device)
 
-            # seed so the vae latent dist sampling is always identical
-            torch.manual_seed(42)
-            orig_vae_device = self.sd.vae.device
-            # images can have different aspect ratios so they are encoded one at a time
-            latent_list = [
-                self.sd.encode_images([image], device=device, dtype=dtype).to('cpu', dtype=torch.float32)
-                for image in image_list
-            ]
-            self.sd.vae.to(orig_vae_device)
-
-            # fixed noise per image, seeds start at 42 and increment for each image
-            noise_list = []
-            for i, latent in enumerate(latent_list):
-                generator = torch.Generator(device='cpu').manual_seed(42 + i)
-                noise_list.append(
-                    torch.randn(latent.shape, generator=generator, dtype=torch.float32)
-                )
-
-        self._validation_cache = {
-            'latents': latent_list,
-            'noise': noise_list,
-            'embeds': embeds_list,
-        }
+        self._validation_cache['embeds'] = embeds_list
         flush()
 
     def validate(self):
@@ -1869,13 +1890,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.vae_training_mode = 'unload'
 
         # load the vae only if something in phase 1 can use it: live latent
-        # encoding (keep), a latent cache that is not fully populated, or clip
-        # vision caching. Validation does not count here - it loads the vae on
-        # demand in setup_validation. Otherwise phase 1 frees it (iron rule).
+        # encoding (keep), a latent cache that is not fully populated, clip
+        # vision caching, or validation latents (re-encoded every run in
+        # setup_validation_latents). Otherwise the iron rule below frees it.
         vae_load_needed = self.vae_training_mode == 'keep' or any(
             dataset.is_caching_clip_vision_to_disk or not dataset.latent_cache_complete()
             for dataset in all_dataset_objs
-        )
+        ) or self._has_validation_items()
         if vae_load_needed:
             self.sd.load_vae()
         else:
@@ -1887,11 +1908,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 dataset.cache_latents_all_latents()
             if dataset.is_caching_clip_vision_to_disk:
                 dataset.cache_clip_vision_to_disk()
+        self.setup_validation_latents()
         # IRON RULE: at the phase 1 -> 2 boundary the vae must never be left
         # resident unless vae_training_mode is 'keep' (live per-batch latent
         # encoding or model-declared train-time encoding, e.g. edit refs).
         # Anything after this line that needs the vae loads it itself and
-        # frees it again: sampling rounds (sample()) and setup_validation.
+        # frees it again: sampling rounds (sample()). All validation work
+        # that wants the vae happens before this line, in phase 1.
         # Do not "helpfully" keep it alive across the boundary - that was the
         # bug where a ~6GB video vae sat idle through the entire text encoder
         # phase after its only job (caching) was already done.
@@ -1916,8 +1939,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # always do this last
                 dataset.setup_controls()
 
-        # validation prep - see setup_validation TODO, not yet component-split
-        self.setup_validation()
+        # validation prompt embeds (the latents half ran in phase 1)
+        self.setup_validation_embeds()
 
 
         # embedding training: construct the embedding now, before anything
