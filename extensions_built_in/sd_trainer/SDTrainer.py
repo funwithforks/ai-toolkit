@@ -283,9 +283,9 @@ class SDTrainer(BaseSDTrainProcess):
             return True
         if getattr(self.sd, 'is_llm', False):
             return True
-        if self._validation_needs_vae():
-            # validation prompt embeds are re-encoded into memory every run
-            return True
+        # validation prep is inert until split into per-component passes
+        # (BaseSDTrainProcess.setup_validation TODO), so validation items do
+        # not force a text encoder load
         if not (self.train_config.unload_text_encoder or self.is_caching_text_embeddings):
             # captions are encoded live every epoch
             return True
