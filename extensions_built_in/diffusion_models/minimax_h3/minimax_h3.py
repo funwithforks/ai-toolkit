@@ -452,9 +452,10 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
 
                 num_quantized = 0
                 unexpected_keys: list = []
-                with safe_open(
-                    te_file, framework="pt", device=self.te_device_torch
-                ) as f:
+                te_dev = torch.device(self.te_device_torch)
+                if te_dev.type == "cuda" and te_dev.index is None:
+                    te_dev = torch.device("cuda", torch.cuda.current_device())
+                with safe_open(te_file, framework="pt", device=str(te_dev)) as f:
                     all_keys = list(f.keys())
                     marker_prefixes = [
                         k[: -len(".comfy_quant")]
