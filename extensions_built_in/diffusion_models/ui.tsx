@@ -1899,11 +1899,18 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     defaults: {
       "config.name": ["krea2_lora_v1", "my_first_lora_v1"],
       "config.process[0].model.name_or_path": [
-        "krea/Krea-2-Raw",
+        "Comfy-Org/Krea-2",
         defaultNameOrPath,
       ],
-      // loads unquantized bf16 with compile on; low_vram/layer offloading
-      // stay available as opt-in options
+      // int8 convrot checkpoint (already quantized on disk); low_vram/layer
+      // offloading stay available as opt-in options
+      "config.process[0].model.model_kwargs": [
+        {
+          checkpoint_filename:
+            "diffusion_models/krea2_raw_int8_convrot.safetensors",
+        },
+        {},
+      ],
       "config.process[0].model.quantize": [false, false],
       "config.process[0].model.quantize_te": [false, false],
       "config.process[0].model.low_vram": [false, false],
@@ -1970,7 +1977,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     group: "experimental",
     defaults: {
       "config.process[0].model.name_or_path": [
-        "krea/Krea-2-Raw",
+        "Comfy-Org/Krea-2",
         defaultNameOrPath,
       ],
       "config.process[0].model.quantize": [true, false],
@@ -1985,6 +1992,8 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
           edit: true,
           match_target_res: true,
           kv_cache: true,
+          checkpoint_filename:
+            "diffusion_models/krea2_raw_int8_convrot.safetensors",
         },
         {},
       ],
