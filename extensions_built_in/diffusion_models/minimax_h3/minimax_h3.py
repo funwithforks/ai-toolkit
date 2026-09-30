@@ -583,6 +583,11 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
 
     display_name = "MiniMax-H3"
 
+    # sampling decodes through the vae only after every prompt in the round
+    # has denoised (see BaseModel.generate_images / decode_sample_payload):
+    # the video + audio vae bundle does not sit in vram during the denoise
+    staged_sampling = True
+
     def _transformer_pre_post_load(self, transformer):
         # load assistant lora if specified (merged into the quantized weights)
         if self.model_config.assistant_lora_path is not None:
@@ -725,6 +730,11 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         with the released conditioning recipe: seeded posterior sample (seed
         42, independent of the request seed) rounded to fp16 before
         normalization."""
+        # under staged sampling the vae is not resident while denoising:
+        # conditioning encodes borrow it for this call and hand it back
+        loaded_here = self.vae is None
+        if loaded_here:
+            self.load_vae()
         if self.vae.device == torch.device("cpu"):
             self.vae.to(self.vae_device_torch)
         generator = torch.Generator(device="cpu").manual_seed(KEYFRAME_ENCODE_SEED)
@@ -734,7 +744,11 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             generator=generator,
             fp16_round=True,
         )
-        return latents.float()
+        latents = latents.float()
+        if loaded_here:
+            self.vae = None
+            flush()
+        return latents
 
     def decode_latents(self, latents: torch.Tensor, device=None, dtype=None):
         # differentiable: pixel-space losses backprop through the video VAE
@@ -1108,9 +1122,30 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             generator=generator,
             ctrl_img=ctrl_img,
             with_audio=with_audio and is_video,
+            decode=not self.staged_sampling,
         )
+        if self.staged_sampling:
+            # latents payload (still a few MB on gpu, not worth moving):
+            # BaseModel.generate_images decodes it after the whole round
+            return result
         if is_video:
             return result  # dict consumed by new_save_image_function
+        return result[0]
+
+    def decode_sample_payload(self, payload):
+        # staged_sampling hook: called after the denoise loop with the vae
+        # loaded; return exactly what generate_single_image used to return
+        from .src.pipeline import decode_h3_payload
+
+        result = decode_h3_payload(
+            self,
+            payload["video_latents"],
+            payload["audio_latents"],
+            payload["is_video"],
+            payload["with_audio"],
+        )
+        if payload["is_video"]:
+            return result
         return result[0]
 
     # ------------------------------------------------------------------

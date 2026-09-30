@@ -80,6 +80,7 @@ class MiniMaxH3Pipeline:
             list
         ] = None,  # ref2va references, already area-matched (own aspect, /32)
         with_audio: bool = True,
+        decode: bool = True,
         **kwargs,
     ):
         model = self.model
@@ -264,25 +265,41 @@ class MiniMaxH3Pipeline:
 
         # --- decode --------------------------------------------------------
         video_latents = unpatchify_video_tokens(video_rows, t_lat, h_lat, w_lat)
-        video = model.decode_latents(video_latents)  # (1, 3, T, H, W) in [-1, 1]
-        video = ((video.float().clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8)
-        video = video[0].permute(1, 2, 3, 0).cpu()  # (T, H, W, C)
-
-        if not is_video:
-            return [Image.fromarray(video[0].numpy())]
-
-        audio_out = None
-        if with_audio:
+        audio_latents = None
+        if with_audio and is_video:
             audio_latents = unpack_audio_tokens(audio_rows, a_lat)[0]  # (2, 32, A)
-            waveform = model.decode_audio_latents(
-                audio_latents.float()
-            )  # (2, 1, samples)
-            audio_out = waveform[:, 0].cpu()  # (2, samples) stereo
+        if not decode:
+            # staged sampling: the caller decodes after the whole denoise
+            # round, when the vae is loaded for every sample at once
+            return {
+                "video_latents": video_latents,
+                "audio_latents": audio_latents,
+                "is_video": is_video,
+                "with_audio": bool(with_audio),
+            }
+        return decode_h3_payload(model, video_latents, audio_latents, is_video, with_audio)
 
-        return {
-            "video": video,
-            "fps": FPS,
-            "audio": audio_out,
-            "audio_sample_rate": packing.AUDIO_SAMPLE_RATE,
-            "output_path": None,
-        }
+
+def decode_h3_payload(model, video_latents, audio_latents, is_video, with_audio):
+    """VAE side of the pipeline: latents -> PIL list (image) or mp4 dict (video)."""
+    video = model.decode_latents(video_latents)  # (1, 3, T, H, W) in [-1, 1]
+    video = ((video.float().clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8)
+    video = video[0].permute(1, 2, 3, 0).cpu()  # (T, H, W, C)
+
+    if not is_video:
+        return [Image.fromarray(video[0].numpy())]
+
+    audio_out = None
+    if with_audio and audio_latents is not None:
+        waveform = model.decode_audio_latents(
+            audio_latents.float()
+        )  # (2, 1, samples)
+        audio_out = waveform[:, 0].cpu()  # (2, samples) stereo
+
+    return {
+        "video": video,
+        "fps": FPS,
+        "audio": audio_out,
+        "audio_sample_rate": packing.AUDIO_SAMPLE_RATE,
+        "output_path": None,
+    }

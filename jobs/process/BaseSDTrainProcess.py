@@ -379,17 +379,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
 
-        if self.vae_training_mode == 'reload' and self.sd.vae is None:
+        if (
+            self.vae_training_mode == 'reload'
+            and self.sd.vae is None
+            and not getattr(self.sd, 'staged_sampling', False)
+        ):
             # the vae was freed after dataset prep. Sampling decodes through
             # it, so load it back for this round (see vae_training_mode).
+            # staged_sampling models skip this: they want the denoise loop
+            # without the vae and load it themselves for the decode pass.
             print_acc("Loading vae for sampling")
             self.sd.load_vae()
 
         # send to be generated
         self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        if self.vae_training_mode == 'reload':
-            # free it again until the next sample round
+        if self.vae_training_mode in ('reload', 'unload'):
+            # free it again until the next sample round (also catches the vae
+            # a staged model loaded itself for decoding)
             print_acc("VAE unloaded until next sample round")
             self.sd.vae = None
             flush()

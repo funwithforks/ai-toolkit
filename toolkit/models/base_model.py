@@ -382,6 +382,17 @@ class BaseModel:
         raise NotImplementedError(
             "get_generation_pipeline must be implemented in child classes")
 
+    staged_sampling = False
+
+    def decode_sample_payload(self, payload):
+        # staged_sampling models: turn one payload returned by
+        # generate_single_image back into the image object the savers expect.
+        # Called after every sample has denoised, with the vae loaded.
+        raise NotImplementedError(
+            f"{type(self).__name__} sets staged_sampling=True but does not "
+            "implement decode_sample_payload"
+        )
+
     def generate_single_image(
         self,
         pipeline,
@@ -483,6 +494,7 @@ class BaseModel:
     ):
         network = self.network
         merge_multiplier = 1.0
+        staged_samples: list = []
         flush()
         # if using assistant, unfuse it
         if self.model_config.assistant_lora_path is not None:
@@ -800,10 +812,15 @@ class BaseModel:
                         extra,
                     )
 
-                    gen_config.save_image_atomic(img, i)
-                    gen_config.log_image(img, i)
-                    self._after_sample_image(i, len(image_configs))
-                    flush()
+                    if self.staged_sampling:
+                        # the model returned latents, not an image: decode
+                        # every one at the end with the vae loaded
+                        staged_samples.append((gen_config, i, img))
+                    else:
+                        gen_config.save_image_atomic(img, i)
+                        gen_config.log_image(img, i)
+                        self._after_sample_image(i, len(image_configs))
+                        flush()
 
                 if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                     self.adapter.clear_memory()
@@ -812,6 +829,21 @@ class BaseModel:
         # clear pipeline and cache to reduce vram usage
         del pipeline
         torch.cuda.empty_cache()
+
+        if staged_samples:
+            # denoising is over: from here only the vae is needed. This is
+            # staged_sampling (see decode_sample_payload): the vae sat out
+            # the entire denoise loop so the transformer had the memory to
+            # itself, and now the whole round decodes through it at once.
+            if self.vae is None:
+                print_acc("Loading VAE to decode staged samples")
+                self.load_vae()
+            for gen_config, idx, payload in staged_samples:
+                img = self.decode_sample_payload(payload)
+                gen_config.save_image_atomic(img, idx)
+                gen_config.log_image(img, idx)
+                self._after_sample_image(idx, len(image_configs))
+                flush()
 
         # restore training state
         torch.set_rng_state(rng_state)
