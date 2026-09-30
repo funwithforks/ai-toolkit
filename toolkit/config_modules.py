@@ -440,6 +440,9 @@ class TrainConfig:
         self.max_negative_prompts = kwargs.get('max_negative_prompts', 1)
         # multiplier applied to loos on regularization images
         self.reg_weight = kwargs.get('reg_weight', 1.0)
+        # number of main batches served between each regularization batch.
+        # None keeps the legacy every-other-step behaviour.
+        self.reg_ratio = kwargs.get('reg_ratio', None)
         self.num_train_timesteps = kwargs.get('num_train_timesteps', 1000)
         # automatically adapte the vae scaling based on the image norm
         self.adaptive_scaling_factor = kwargs.get('adaptive_scaling_factor', False)

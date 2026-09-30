@@ -2679,6 +2679,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             dataloader_reg = None
             dataloader_iterator_reg = None
 
+        # main batches served since the last reg batch, used when reg_ratio is set
+        main_since_reg = 0
+
         # zero any gradients
         optimizer.zero_grad()
 
@@ -2739,7 +2742,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # keep track to alternate on an accumulation step for reg   
                     batch_step = step
                     # don't do a reg step on sample or save steps as we dont want to normalize on those
-                    if batch_step % 2 == 0 and dataloader_reg is not None and not is_save_step and not is_sample_step:
+                    do_reg = dataloader_reg is not None and not is_save_step and not is_sample_step
+                    if do_reg:
+                        if self.train_config.reg_ratio is not None:
+                            # reg fires after this many main batches have actually been
+                            # served, so skipped slots (sample/save steps) do not skew it
+                            do_reg = main_since_reg >= self.train_config.reg_ratio
+                        else:
+                            do_reg = batch_step % 2 == 0
+                    if do_reg:
                         try:
                             with self.timer('get_batch:reg'):
                                 batch = next(dataloader_iterator_reg)
@@ -2752,6 +2763,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             with self.timer('get_batch:reg'):
                                 batch = next(dataloader_iterator_reg)
                         is_reg_step = True
+                        main_since_reg = 0
                     elif dataloader is not None:
                         try:
                             with self.timer('get_batch'):
@@ -2768,6 +2780,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     self.grad_accumulation_step = 0
                             with self.timer('get_batch'):
                                 batch = next(dataloader_iterator)
+                        main_since_reg += 1
                     else:
                         batch = None
                     batch_list.append(batch)
