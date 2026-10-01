@@ -31,6 +31,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from .kernels import fused_ropeapply as _fused_ropeapply
+from .kernels import fused_sdpa as _fused_sdpa
 
 # Liger-kernel fusions (pure-Triton, gated only by triton availability).
 # They fold the per-block elementwise chains (adaLN-modulated RMSNorm, QK
@@ -114,6 +115,13 @@ def attention(
     # NVIDIA, and the dispatcher falls back to flash/efficient/math elsewhere.
     # (On ROCm gfx11xx the flash path needs
     # TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1; masked attention uses math.)
+    if mask is None:
+        # sm120-native FROST fwd+bwd (torch's bwd is an sm80 WMMA kernel on
+        # consumer Blackwell); falls back to the backend list below when the
+        # frontend/engine is unavailable or rejects the shape.
+        x = _fused_sdpa(q, k, v, scale if scale is not None else q.shape[-1] ** -0.5)
+        if x is not None:
+            return rearrange(x, "B H L D -> B L (H D)")
     with sdpa_kernel(
         [
             SDPBackend.CUDNN_ATTENTION,
