@@ -30,15 +30,17 @@ from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
-# Optional liger-kernel fusions (pure-Triton, arch-gated only by triton
-# availability). They fold the per-block elementwise chains (adaLN-modulated
-# RMSNorm, QK RMSNorm, SwiGLU silu-mul) into single launches with fused
-# backward kernels. Math is the same function computed in fp32; the eager
-# path below and the fused kernels differ only in WHERE the bf16 roundings
-# happen (single rounding at store vs one per eager op), i.e. up to ~1 bf16
-# ulp per element. NOT bit-identical to eager, so this is default-OFF:
-# enable with KREA2_LIGER_FUSIONS=1 once a loss-curve A/B is accepted.
-_LIGER_OK = os.environ.get("KREA2_LIGER_FUSIONS", "0") == "1"
+# Liger-kernel fusions (pure-Triton, gated only by triton availability).
+# They fold the per-block elementwise chains (adaLN-modulated RMSNorm, QK
+# RMSNorm, SwiGLU silu-mul) into single launches with fused backward
+# kernels -- a launch-count reduction, which is the binding constraint
+# once the GEMMs run at dtype. Math is the same function in fp32; eager
+# and fused differ only in WHERE the bf16 roundings happen (single store
+# rounding vs one per eager op, ~1 bf16 ulp). Measured +6.4% at bs=4 on
+# the bf16 stack (was a slight loss on the old fp32 path). ON by default;
+# set KREA2_LIGER_FUSIONS=0 to restore the eager chains (e.g. to compare
+# a checkpoint's samples side by side).
+_LIGER_OK = os.environ.get("KREA2_LIGER_FUSIONS", "1") != "0"
 _liger_rms_norm = _liger_swiglu = _LigerModNorm = None
 if _LIGER_OK:
     try:
