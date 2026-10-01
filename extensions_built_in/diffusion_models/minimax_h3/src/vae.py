@@ -438,6 +438,49 @@ class ViTDecoder3d(nn.Module):
 
 class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
     @classmethod
+    def load_to_device(cls, file_path: str, device) -> "MiniMaxH3VideoVAE":
+        """Stream the checkpoint straight onto ``device``: safetensors
+        materializes every tensor there directly (the process never
+        allocates a CPU copy), the module shell builds with meta
+        parameters, and each tensor is assigned as it lands. Computed
+        buffers (rope inv_freq, latent/pixel stats) keep their real init
+        values via include_buffers=False; stats stored in the file
+        override them, in fp32."""
+        import time as _time
+
+        from accelerate import init_empty_weights
+        from safetensors import safe_open
+
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        t0 = _time.perf_counter()
+        with init_empty_weights(include_buffers=False):
+            model = cls()
+        with safe_open(file_path, framework="pt", device=str(dev)) as f:
+            state = {k: f.get_tensor(k) for k in f.keys()}
+        stats = {
+            k: state.pop(k).float()
+            for k in ("latents_mean", "latents_std")
+            if k in state
+        }
+        model.load_state_dict(state, strict=True, assign=True)
+        del state
+        for k, v in stats.items():
+            if k in model._buffers:
+                model._buffers[k] = v
+        # computed init buffers (include_buffers=False kept them real, hence
+        # on cpu): move the leftovers over. Parameters are already resident,
+        # so this only relocates the small buffers.
+        model.to(dev)
+        model.eval().requires_grad_(False)
+        print(
+            f"[load-timing] MiniMaxH3VideoVAE: streamed to {dev} "
+            f"{(_time.perf_counter() - t0):.1f}s"
+        )
+        return model
+
+    @classmethod
     def load_from_state_dict(cls, state_dict, dtype=None, **kwargs):
         """Comfy single-file load: the normalization stats ride along in the
         file and land in the non-persistent fp32 buffers."""

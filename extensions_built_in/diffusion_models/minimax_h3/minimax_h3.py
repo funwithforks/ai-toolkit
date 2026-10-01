@@ -38,7 +38,7 @@ Conventions bridged to ai-toolkit:
 
 import os
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import yaml
@@ -152,20 +152,28 @@ def blank_log_image_function(self, *args, **kwargs):
 
 
 class MiniMaxH3VaeBundle(torch.nn.Module):
-    """Holds both frozen autoencoders behind the single ``self.vae`` handle."""
+    """Holds both frozen autoencoders behind the single ``self.vae`` handle.
+    Either member may be None: staged sampling loads/decodes one vae at a
+    time and swaps a single-member bundle in for the duration."""
 
-    def __init__(self, video_vae: MiniMaxH3VideoVAE, audio_vae: MiniMaxH3AudioVAE):
+    def __init__(
+        self,
+        video_vae: Union[MiniMaxH3VideoVAE, None] = None,
+        audio_vae: Union[MiniMaxH3AudioVAE, None] = None,
+    ):
         super().__init__()
         self.video_vae = video_vae
         self.audio_vae = audio_vae
 
     @property
     def device(self):
-        return self.video_vae.device
+        vae = self.video_vae if self.video_vae is not None else self.audio_vae
+        return vae.device
 
     @property
     def dtype(self):
-        return self.video_vae.dtype
+        vae = self.video_vae if self.video_vae is not None else self.audio_vae
+        return vae.dtype
 
     def enable_gradient_checkpointing(self, enable: bool = True):
         self.video_vae.enable_gradient_checkpointing(enable)
@@ -575,9 +583,13 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
 
     def _load_vaes(self) -> MiniMaxH3VaeBundle:
         self.print_and_status_update("Loading video VAE")
-        video_vae = MiniMaxH3VideoVAE.load_model(self._resolve_comfy_file("video_vae"))
+        video_vae = MiniMaxH3VideoVAE.load_to_device(
+            self._resolve_comfy_file("video_vae"), self.vae_device_torch
+        )
         self.print_and_status_update("Loading audio VAE")
-        audio_vae = MiniMaxH3AudioVAE.load_model(self._resolve_comfy_file("audio_vae"))
+        audio_vae = MiniMaxH3AudioVAE.load_to_device(
+            self._resolve_comfy_file("audio_vae"), self.vae_device_torch
+        )
         flush()
         return MiniMaxH3VaeBundle(video_vae, audio_vae)
 
@@ -1133,8 +1145,8 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         return result[0]
 
     def decode_sample_payload(self, payload):
-        # staged_sampling hook: called after the denoise loop with the vae
-        # loaded; return exactly what generate_single_image used to return
+        # staged_sampling fallback (unused while decode_staged_samples
+        # exists): both vae bundles resident through one decode
         from .src.pipeline import decode_h3_payload
 
         result = decode_h3_payload(
@@ -1147,6 +1159,63 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         if payload["is_video"]:
             return result
         return result[0]
+
+    def decode_staged_samples(self, staged_samples):
+        """staged_sampling decode phase, one vae at a time: the video vae
+        streams onto the gpu, decodes every payload, and is gone before the
+        audio vae arrives; only after both are freed are the mp4s muxed and
+        saved. Nothing is ever CPU-staged: the vae weights land on the gpu
+        directly and the decoded pixels/waveforms park on the cpu."""
+        from .src.pipeline import (
+            h3_assemble_result,
+            h3_decode_audio_payload,
+            h3_decode_video_payload,
+        )
+
+        # --- video vae alone (or reuse the resident one in keep mode) ---
+        prior = self.vae
+        own_video = prior is None or prior.video_vae is None
+        if own_video:
+            self.print_and_status_update("Loading video VAE")
+            video_vae = MiniMaxH3VideoVAE.load_to_device(
+                self._resolve_comfy_file("video_vae"), self.vae_device_torch
+            )
+            self.vae = MiniMaxH3VaeBundle(video_vae=video_vae)
+        frames = []
+        for _gen_config, _idx, payload in staged_samples:
+            frames.append(h3_decode_video_payload(self, payload))
+        if own_video:
+            self.vae = prior
+            del video_vae
+            flush()
+
+        # --- audio vae alone ---
+        waves = [None] * len(staged_samples)
+        if any(
+            payload.get("with_audio") and payload.get("audio_latents") is not None
+            for _gc, _i, payload in staged_samples
+        ):
+            own_audio = prior is None or prior.audio_vae is None
+            if own_audio:
+                self.print_and_status_update("Loading audio VAE")
+                audio_vae = MiniMaxH3AudioVAE.load_to_device(
+                    self._resolve_comfy_file("audio_vae"), self.vae_device_torch
+                )
+                self.vae = MiniMaxH3VaeBundle(audio_vae=audio_vae)
+            for j, (_gc, _i, payload) in enumerate(staged_samples):
+                waves[j] = h3_decode_audio_payload(self, payload)
+            if own_audio:
+                self.vae = prior
+                del audio_vae
+                flush()
+
+        # --- mux and save, both vae-s long gone ---
+        for j, (gen_config, idx, payload) in enumerate(staged_samples):
+            img = h3_assemble_result(frames[j], waves[j], payload)
+            gen_config.save_image_atomic(img, idx)
+            gen_config.log_image(img, idx)
+            self._after_sample_image(idx, len(staged_samples))
+            flush()
 
     # ------------------------------------------------------------------
     # Saving / bookkeeping

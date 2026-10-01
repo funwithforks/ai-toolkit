@@ -412,7 +412,13 @@ class OstrisModelMixin:
                 ignore_modules=list(self.get_offload_ignore_modules() or []),
             )
         elif device is not None:
+            import time as _time
+
+            _t0 = _time.perf_counter()
             self.to(device)
+            print(
+                f"[load-timing] {type(self).__name__}: cpu->gpu move {(_time.perf_counter() - _t0):.1f}s"
+            )
         return self
 
     @classmethod
@@ -588,8 +594,13 @@ class OstrisModelMixin:
         **kwargs,
     ):
         cls._readahead(file_path)
+        import time as _time
+
+        _t0 = _time.perf_counter()
         state_dict = load_file(file_path)
-        return cls.load_from_state_dict(
+        print(f"[load-timing] {os.path.basename(file_path)}: disk read {(_time.perf_counter() - _t0):.1f}s")
+        _t0 = _time.perf_counter()
+        model = cls.load_from_state_dict(
             state_dict,
             dtype,
             config_path=config_path,
@@ -597,6 +608,8 @@ class OstrisModelMixin:
             subfolder=subfolder,
             **kwargs,
         )
+        print(f"[load-timing] {os.path.basename(file_path)}: build/attach {(_time.perf_counter() - _t0):.1f}s")
+        return model
 
     @classmethod
     def aitk_config_from_state_dict(cls, state_dict: Dict[str, torch.Tensor]):
