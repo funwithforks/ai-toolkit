@@ -2581,6 +2581,38 @@ class SDTrainer(BaseSDTrainProcess):
         # flush()
 
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
+        # Performance instrumentation, inert unless the AITK_* env vars
+        # are set. AITK_PROF_DIR=<dir>: torch-profiler window over
+        # AITK_PROF_START..+AITK_PROF_ACTIVE steps, exports chrome trace
+        # and kernel-averages tables to <dir>. AITK_STEP_TIME=1: prints
+        # rolling fwd+bwd / post-step wall times every 20 steps.
+        import os as _os
+        import time as _time
+        if _os.environ.get('AITK_PROF_DIR'):
+            if not hasattr(self, '_kt_n'):
+                self._kt_n = 0
+                self._kt_prof = None
+            self._kt_n += 1
+            start = int(_os.environ.get('AITK_PROF_START', '60'))
+            active = int(_os.environ.get('AITK_PROF_ACTIVE', '3'))
+            if self._kt_prof == 'done':
+                pass
+            elif self._kt_n == start and self._kt_prof is None:
+                self._kt_prof = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA], record_shapes=True)
+                self._kt_prof.__enter__()
+            elif isinstance(self._kt_prof, torch.profiler.profile) and self._kt_n > start + active:
+                p = self._kt_prof
+                p.__exit__(None, None, None)
+                out = _os.environ['AITK_PROF_DIR']
+                p.export_chrome_trace(out + '/trace.json')
+                with open(out + '/kavgs.txt', 'w') as f:
+                    f.write(p.key_averages().table(sort_by='cuda_time_total', row_limit=60))
+                with open(out + '/kavgs_shapes.txt', 'w') as f:
+                    f.write(p.key_averages(group_by_input_shape=True).table(
+                        sort_by='self_cuda_time_total', row_limit=120))
+                self._kt_prof = 'done'
         if isinstance(batch, list):
             batch_list = batch
         else:
@@ -2593,6 +2625,8 @@ class SDTrainer(BaseSDTrainProcess):
         if self.train_config.gradient_accumulation_steps > 1:
             n_accum *= self.train_config.gradient_accumulation_steps
         accum_scale = 1.0 / n_accum
+        _st = bool(_os.environ.get('AITK_STEP_TIME'))
+        _t0 = _time.perf_counter() if _st else 0
         for batch in batch_list:
             if self.sd.is_multistage:
                 # handle multistage switching
@@ -2607,6 +2641,9 @@ class SDTrainer(BaseSDTrainProcess):
                             # if this boundary is trainable, we can stop looking
                             break
             loss = self.train_single_accumulation(batch, accum_scale=accum_scale)
+            if _st:
+                torch.cuda.synchronize()
+                _t1 = _time.perf_counter()
             self.steps_this_boundary += 1
             if total_loss is None:
                 total_loss = loss
@@ -2657,6 +2694,19 @@ class SDTrainer(BaseSDTrainProcess):
         loss_dict = OrderedDict(
             {'loss': (total_loss / len(batch_list)).item()}
         )
+
+        if _st:
+            torch.cuda.synchronize()
+            _t2 = _time.perf_counter()
+            hist = getattr(self, '_kt_st', None)
+            if hist is None:
+                hist = self._kt_st = []
+            hist.append((_t1 - _t0, _t2 - _t1))
+            if len(hist) > 20 and len(hist) % 20 == 0:
+                fb = sum(h[0] for h in hist[-20:]) / 20 * 1000
+                ot = sum(h[1] for h in hist[-20:]) / 20 * 1000
+                print(f'STEP-TIME fwd+bwd {fb:.1f} ms, post {ot:.1f} ms, '
+                      f'total {fb + ot:.1f} ms', flush=True)
 
         self.end_of_training_loop()
 

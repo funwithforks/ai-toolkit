@@ -188,7 +188,9 @@ class ToolkitModuleMixin:
             if reference is None:
                 runtime_scale = torch.tensor(self.scale, dtype=torch.float32)
             else:
-                runtime_scale = reference.new_tensor(self.scale, dtype=torch.float32)
+                # match the module dtype so the scale multiply does not
+                # promote activations and force a downcast copy
+                runtime_scale = reference.new_tensor(self.scale, dtype=reference.dtype)
             self.register_buffer("_runtime_scale", runtime_scale, persistent=False)
         else:
             with torch.no_grad():

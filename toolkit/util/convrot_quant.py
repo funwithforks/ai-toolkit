@@ -1000,6 +1000,7 @@ def _int8_linear_ste_op(
     bias: Optional[torch.Tensor],
     act_qmax: int,
     out_dtype: str,
+    bwd_mode: str = "eager",
 ) -> torch.Tensor:
     m = x2d.shape[0]
     aq, a_s = _int8_act_quant_padded(x2d, act_qmax)
@@ -1014,22 +1015,66 @@ def _int8_linear_ste_op(
 
 
 @_int8_linear_ste_op.register_fake
-def _int8_linear_ste_fake(x2d, qdata, w_scales_u8, bias, act_qmax, out_dtype):
+def _int8_linear_ste_fake(
+    x2d, qdata, w_scales_u8, bias, act_qmax, out_dtype, bwd_mode="eager"
+):
     return torch.empty(
         x2d.shape[0], qdata.shape[0], device=x2d.device, dtype=getattr(torch, out_dtype)
     )
 
 
 def _int8_linear_ste_setup(ctx, inputs, output):
-    x2d, qdata, w_scales_u8, bias, act_qmax, out_dtype = inputs
+    x2d, qdata, w_scales_u8, bias, act_qmax, out_dtype, bwd_mode = inputs
+    ctx.bwd_mode = str(bwd_mode)
+    ctx.act_qmax = int(act_qmax)
     ctx.save_for_backward(qdata, w_scales_u8)
+
+
+_int8_bwd_warned = False
+_int8_bwd_ones: dict = {}
 
 
 def _int8_linear_ste_backward(ctx, grad):
     qdata, w_scales_u8 = ctx.saved_tensors
+    if getattr(ctx, "bwd_mode", "eager") == "int8":
+        # Opt-in (module.cr8_bwd_mode): run the input-gradient GEMM on the int8
+        # tensor cores too. dx = (grad * w_scales) @ qdata with grad quantized
+        # per-row by the same recipe as forward activations. NOT bit-identical
+        # to the eager backward: the upstream gradient is quantized to int8
+        # (~0.4% per-element, zero-mean), so measured loss/quality impact must
+        # be accepted per model before turning this on.
+        big = qdata.shape[0] * qdata.shape[1] >= 33_554_432
+        # below that the int8 quant/epilogue overhead is not amortized
+        # (measured on sm_120: 6144x1536 is already net slower) -> stay eager
+        if big and (
+            grad.is_cuda
+            and grad.dtype in (torch.bfloat16, torch.float16)
+            and grad.ndim == 2
+        ):
+            w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
+            gq, g_s = _int8_act_quant_padded(grad * w_scales, ctx.act_qmax)
+            i32 = torch._int_mm(gq, qdata)
+            m = grad.shape[0]
+            key = (qdata.shape[1], grad.device)
+            ones = _int8_bwd_ones.get(key)
+            if ones is None:
+                ones = torch.ones(
+                    qdata.shape[1], device=grad.device, dtype=torch.float32
+                )
+                _int8_bwd_ones[key] = ones
+            dx = _int8_epilogue(i32[:m], g_s[:m], ones, None, grad.dtype)
+            return dx, None, None, None, None, None, None
+        global _int8_bwd_warned
+        if big and not _int8_bwd_warned:
+            _int8_bwd_warned = True
+            print_acc(
+                f"ConvRot: cr8_bwd_mode='int8' requested but grad layout is not "
+                f"supported (dtype={grad.dtype}, shape={tuple(grad.shape)}); "
+                f"falling back to the eager backward for every such layer."
+            )
     w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
     w = qdata.to(grad.dtype) * w_scales.unsqueeze(1)
-    return grad @ w, None, None, None, None, None
+    return grad @ w, None, None, None, None, None, None
 
 
 _int8_linear_ste_op.register_autograd(
@@ -1391,6 +1436,7 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
             module.bias,
             self.act_qmax,
             out_dtype,
+            str(getattr(module, "cr8_bwd_mode", "eager")),
         )
 
     def fake_quant_rotated_weight(self, module, w_rot: torch.Tensor) -> torch.Tensor:
