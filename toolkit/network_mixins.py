@@ -196,7 +196,7 @@ class ToolkitModuleMixin:
             with torch.no_grad():
                 runtime_scale.fill_(self.scale)
 
-    def _call_forward(self: Module, x):
+    def _call_forward(self: Module, x, batch_scale=None):
         # module dropout
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
@@ -232,26 +232,26 @@ class ToolkitModuleMixin:
         else:
             scale = self._runtime_scale
 
-        # fold the (scalar / (B,1,1)) scale into the narrow rank activation
-        # instead of the up-projected output: identical math, ~1000x less
-        # elementwise traffic on wide targets (fc1 out=16384 made this lone
-        # mul ~200ms/step at bs=4; rounding order differs by <=1 bf16 ulp)
+        # Fold the scales (module runtime scale + network batch multiplier)
+        # into the narrow rank activation instead of the up-projected
+        # output: same bilinear function, (out_features / rank) times less
+        # elementwise traffic -- on wide targets (fc1 out=16384) the output-
+        # side muls cost ~200ms/step at bs=4 on Blackwell. <=1 bf16 ulp
+        # from rounding order. Locon scalar modules keep the output path.
+        if lx.dim() == 3 and not hasattr(self, 'scalar'):
+            if batch_scale is not None:
+                scale = batch_scale * scale
+            scale = scale.reshape(-1, 1, 1) if scale.dim() else scale
+            lx = (lx * scale).to(self.lora_up.weight.dtype)
+            return self.lora_up(lx)
+
         if hasattr(self, 'scalar'):
             # trainable scaler (locon): keep the multiply on the output path
             scale = scale * self.scalar
-            fold = False
-        else:
-            fold = scale.numel() == 1 or (
-                lx.dim() == 3
-                and scale.numel() == lx.shape[0]
-                and scale.shape[-1] == 1
-            )
-        if fold:
-            lx = lx * scale
 
         lx = self.lora_up(lx)
 
-        return lx if fold else lx * scale
+        return lx * scale
 
     def lorm_forward(self: Network, x, *args, **kwargs):
         network: Network = self.network_ref()
@@ -322,17 +322,27 @@ class ToolkitModuleMixin:
             x = x.dequantize()
         # always cast to float32
         lora_input = x.to(self.lora_down.weight.dtype)
-        lora_output = self._call_forward(lora_input)
         multiplier = self.network_ref().torch_multiplier
 
-        lora_output_batch_size = lora_output.size(0)
+        lora_batch_size = lora_input.size(0)
         multiplier_batch_size = multiplier.size(0)
-        if lora_output_batch_size != multiplier_batch_size:
-            num_interleaves = lora_output_batch_size // multiplier_batch_size
+        if lora_batch_size != multiplier_batch_size:
+            num_interleaves = lora_batch_size // multiplier_batch_size
             # todo check if this is correct, do we just concat when doing cfg?
             multiplier = multiplier.repeat_interleave(num_interleaves)
 
-        scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
+        # LoRA outputs a rank activation when dim==3 (no locon scalar):
+        # _call_forward folds the multiplier there before lora_up, so the
+        # (out_features, batch) broadcast multiply below never runs.
+        fold_batch = lora_input.dim() == 3 and not hasattr(self, 'scalar')
+        lora_output = self._call_forward(
+            lora_input, batch_scale=multiplier if fold_batch else None
+        )
+
+        if fold_batch and torch.is_tensor(lora_output):
+            scaled_lora_output = lora_output
+        else:
+            scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
         scaled_lora_output = scaled_lora_output.to(org_forwarded.dtype)
 
         if self.__class__.__name__ == "DoRAModule":
