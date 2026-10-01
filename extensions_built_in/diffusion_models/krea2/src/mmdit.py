@@ -30,7 +30,6 @@ from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
-from .kernels import fused_gated_residual as _fused_gated_residual
 from .kernels import fused_ropeapply as _fused_ropeapply
 
 # Liger-kernel fusions (pure-Triton, gated only by triton availability).
@@ -474,21 +473,17 @@ class SingleStreamBlock(nn.Module):
             return x
 
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
-        _attn_out = self.attn(
+        x = x + pregate * self.attn(
             _mod_norm(self.prenorm, x, prescale, preshift),
             freqs,
             mask,
             **attn_kwargs,
         )
-        _res = _fused_gated_residual(x, _attn_out, pregate)
-        if _res is None:
-            _res = x + pregate * _attn_out
-        x = _res
-        _mlp_out = self.mlp(_mod_norm(self.postnorm, x, postscale, postshift))
-        _res = _fused_gated_residual(x, _mlp_out, postgate)
-        if _res is not None:
-            return _res
-        return x + postgate * _mlp_out
+        x = x + postgate * self.mlp(
+            _mod_norm(self.postnorm, x, postscale, postshift)
+        )
+
+        return x
 
 
 class SingleStreamDiT(nn.Module, OstrisModelMixin):
