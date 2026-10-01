@@ -30,6 +30,9 @@ from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
+from .kernels import fused_gated_residual as _fused_gated_residual
+from .kernels import fused_ropeapply as _fused_ropeapply
+
 # Liger-kernel fusions (pure-Triton, gated only by triton availability).
 # They fold the per-block elementwise chains (adaLN-modulated RMSNorm, QK
 # RMSNorm, SwiGLU silu-mul) into single launches with fused backward
@@ -49,7 +52,11 @@ if _LIGER_OK:
         from liger_kernel.ops.modulated_rms_norm import (
             LigerModulatedRMSNormFunction as _LigerModNorm,
         )
-    except Exception:
+    except Exception as _e:
+        print(
+            f"[krea2] liger fusions enabled but bindings failed ({_e}); "
+            f"falling back to eager elementwise chains"
+        )
         _liger_rms_norm = _liger_swiglu = _LigerModNorm = None
 
 
@@ -83,6 +90,9 @@ def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
 
 
 def ropeapply(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
+    _fused = _fused_ropeapply(xq, xk, freqs)
+    if _fused is not None:
+        return _fused
     xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
     xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
     freqs = freqs[:, None, :, :, :]
@@ -464,17 +474,21 @@ class SingleStreamBlock(nn.Module):
             return x
 
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
-        x = x + pregate * self.attn(
+        _attn_out = self.attn(
             _mod_norm(self.prenorm, x, prescale, preshift),
             freqs,
             mask,
             **attn_kwargs,
         )
-        x = x + postgate * self.mlp(
-            _mod_norm(self.postnorm, x, postscale, postshift)
-        )
-
-        return x
+        _res = _fused_gated_residual(x, _attn_out, pregate)
+        if _res is None:
+            _res = x + pregate * _attn_out
+        x = _res
+        _mlp_out = self.mlp(_mod_norm(self.postnorm, x, postscale, postshift))
+        _res = _fused_gated_residual(x, _mlp_out, postgate)
+        if _res is not None:
+            return _res
+        return x + postgate * _mlp_out
 
 
 class SingleStreamDiT(nn.Module, OstrisModelMixin):
