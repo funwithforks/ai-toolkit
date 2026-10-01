@@ -881,8 +881,13 @@ def _get_int8_kernels():
         ws_ptr,
         b_ptr,
         o_ptr,
+        r_ptr,
+        u_ptr,
         N,
         HAS_BIAS: tl.constexpr,
+        HAS_LORA: tl.constexpr,
+        KL: tl.constexpr,      # lora rank (power of two when HAS_LORA)
+        N_KL: tl.constexpr,    # u row stride (= KL)
         BLOCK_N: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -895,6 +900,17 @@ def _get_int8_kernels():
         out = acc * (a_s * w_s)
         if HAS_BIAS:
             out += tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        if HAS_LORA:
+            # out += sum_k r[row, k] * u[col, k]: the LoRA up-projection folded
+            # into the dequant epilogue (rank <= KL terms, fp32 accumulation).
+            rk = tl.arange(0, KL)
+            rv = tl.load(r_ptr + row * N_KL + rk).to(tl.float32)
+            ut = tl.load(
+                u_ptr + offs[:, None] * N_KL + rk[None, :],
+                mask=mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            out += tl.sum(ut * rv[None, :], axis=1)
         tl.store(o_ptr + row * N + offs, out.to(o_ptr.dtype.element_ty), mask=mask)
 
     _int8_kernels = (int8_act_quant_kernel, int8_epilogue_kernel)
@@ -938,27 +954,48 @@ def _int8_epilogue_op(
     w_scales: torch.Tensor,
     bias: Optional[torch.Tensor],
     out_dtype: str,
+    lora_r: Optional[torch.Tensor] = None,
+    lora_u: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m, n = i32.shape
     out = torch.empty(m, n, device=i32.device, dtype=getattr(torch, out_dtype))
     _, kernel = _get_int8_kernels()
-    grid = (m, -(-n // 1024))
+    has_lora = lora_r is not None
+    rank = lora_r.shape[1] if has_lora else 16
+    kl = 1 << (rank - 1).bit_length()
+    if has_lora and (rank != kl or rank > 64):
+        # non power-of-two / wide ranks: pad columns of u with zeros instead of
+        # changing the kernel (u buffer is owned by the caller; rank kept as-is,
+        # kernel stride N_KL == actual rank with the KL mask loading padded idx
+        # -> handled by caller pre-padding)
+        raise RuntimeError(
+            f"int8 epilogue lora rank must be a power of two <= 64, got {rank}"
+        )
+    block_n = 256 if has_lora else 1024
+    grid = (m, -(-n // block_n))
     kernel[grid](
         i32,
         a_scales,
         w_scales,
         bias if bias is not None else a_scales,
         out,
+        lora_r if has_lora else a_scales,
+        lora_u if has_lora else a_scales,
         n,
         HAS_BIAS=bias is not None,
-        BLOCK_N=1024,
+        HAS_LORA=has_lora,
+        KL=kl,
+        N_KL=rank,
+        BLOCK_N=block_n,
         num_warps=4,
     )
     return out
 
 
 @_int8_epilogue_op.register_fake
-def _int8_epilogue_fake(i32, a_scales, w_scales, bias, out_dtype):
+def _int8_epilogue_fake(
+    i32, a_scales, w_scales, bias, out_dtype, lora_r=None, lora_u=None
+):
     m, n = i32.shape
     return torch.empty(m, n, device=i32.device, dtype=getattr(torch, out_dtype))
 
@@ -1001,6 +1038,8 @@ def _int8_linear_ste_op(
     act_qmax: int,
     out_dtype: str,
     bwd_mode: str = "eager",
+    lora_r: Optional[torch.Tensor] = None,
+    lora_u: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x2d.shape[0]
     aq, a_s = _int8_act_quant_padded(x2d, act_qmax)
@@ -1011,12 +1050,21 @@ def _int8_linear_ste_op(
         w_scales_u8.view(torch.float32),
         bias,
         getattr(torch, out_dtype),
+        lora=(lora_r, lora_u) if lora_r is not None else None,
     )
 
 
 @_int8_linear_ste_op.register_fake
 def _int8_linear_ste_fake(
-    x2d, qdata, w_scales_u8, bias, act_qmax, out_dtype, bwd_mode="eager"
+    x2d,
+    qdata,
+    w_scales_u8,
+    bias,
+    act_qmax,
+    out_dtype,
+    bwd_mode="eager",
+    lora_r=None,
+    lora_u=None,
 ):
     return torch.empty(
         x2d.shape[0], qdata.shape[0], device=x2d.device, dtype=getattr(torch, out_dtype)
@@ -1024,10 +1072,20 @@ def _int8_linear_ste_fake(
 
 
 def _int8_linear_ste_setup(ctx, inputs, output):
-    x2d, qdata, w_scales_u8, bias, act_qmax, out_dtype, bwd_mode = inputs
+    (
+        x2d,
+        qdata,
+        w_scales_u8,
+        bias,
+        act_qmax,
+        out_dtype,
+        bwd_mode,
+        lora_r,
+        lora_u,
+    ) = inputs
     ctx.bwd_mode = str(bwd_mode)
     ctx.act_qmax = int(act_qmax)
-    ctx.save_for_backward(qdata, w_scales_u8)
+    ctx.save_for_backward(qdata, w_scales_u8, lora_r, lora_u)
 
 
 _int8_bwd_warned = False
@@ -1035,7 +1093,11 @@ _int8_bwd_ones: dict = {}
 
 
 def _int8_linear_ste_backward(ctx, grad):
-    qdata, w_scales_u8 = ctx.saved_tensors
+    qdata, w_scales_u8, lora_r, lora_u = ctx.saved_tensors
+    # LoRA gradients (when the up-projection was folded into the epilogue):
+    # exactly the values autograd would have produced through lora_up.
+    d_r = grad @ lora_u if lora_r is not None else None
+    d_u = grad.t() @ lora_r if lora_u is not None else None
     if getattr(ctx, "bwd_mode", "eager") == "int8":
         # Opt-in (module.cr8_bwd_mode): run the input-gradient GEMM on the int8
         # tensor cores too. dx = (grad * w_scales) @ qdata with grad quantized
@@ -1063,7 +1125,7 @@ def _int8_linear_ste_backward(ctx, grad):
                 )
                 _int8_bwd_ones[key] = ones
             dx = _int8_epilogue(i32[:m], g_s[:m], ones, None, grad.dtype)
-            return dx, None, None, None, None, None, None
+            return dx, None, None, None, None, None, None, d_r, d_u
         global _int8_bwd_warned
         if big and not _int8_bwd_warned:
             _int8_bwd_warned = True
@@ -1074,7 +1136,7 @@ def _int8_linear_ste_backward(ctx, grad):
             )
     w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
     w = qdata.to(grad.dtype) * w_scales.unsqueeze(1)
-    return grad @ w, None, None, None, None, None, None
+    return grad @ w, None, None, None, None, None, None, d_r, d_u
 
 
 _int8_linear_ste_op.register_autograd(
@@ -1088,16 +1150,27 @@ def _int8_epilogue(
     w_scales: torch.Tensor,
     bias,
     out_dtype: torch.dtype,
+    lora=None,
 ) -> torch.Tensor:
-    """out = i32 * a_scales[:, None] * w_scales[None, :] (+ bias), in out_dtype."""
+    """out = i32 * a_scales[:, None] * w_scales[None, :] (+ bias) (+ rank @ u^T)."""
+    r = lora[0] if lora is not None else None
+    u = lora[1] if lora is not None else None
     if _triton_available() and i32.is_cuda:
         return _int8_epilogue_op(
-            i32, a_scales, w_scales, bias, str(out_dtype).split(".")[-1]
+            i32,
+            a_scales,
+            w_scales,
+            bias,
+            str(out_dtype).split(".")[-1],
+            r,
+            u,
         )
     out = i32.float() * w_scales
     out = out * a_scales.unsqueeze(1)
     if bias is not None:
         out = out + bias.float()
+    if r is not None:
+        out = out + r.float() @ u.float().t()
     return out.to(out_dtype)
 
 
@@ -1429,6 +1502,20 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
     def _linear_ste(self, module, x2d: torch.Tensor, out_dtype: str) -> torch.Tensor:
         """Hardware STE linear for the training path. For int8 the saved qdata is
         the resident buffer itself, so autograd holds only a free reference."""
+        # a LoRA attached through the network mixin parks its (rank activation,
+        # up weight) here so the up-projection folds into the epilogue kernel;
+        # cleared ONLY when actually consumed (the wrapper adds the LoRA the
+        # ordinary way if the stash survives the org forward)
+        lora = getattr(module, "_cr8_lora", None)
+        if (
+            lora is not None
+            and getattr(module, "cr8_qdata", None) is not None
+            and lora[0].shape[1] & (lora[0].shape[1] - 1) == 0
+            and lora[0].shape[1] <= 64
+        ):
+            module._cr8_lora = None
+        else:
+            lora = None
         return _int8_linear_ste_op(
             x2d,
             self._qdata(module),
@@ -1437,6 +1524,8 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
             self.act_qmax,
             out_dtype,
             str(getattr(module, "cr8_bwd_mode", "eager")),
+            lora[0] if lora is not None else None,
+            lora[1] if lora is not None else None,
         )
 
     def fake_quant_rotated_weight(self, module, w_rot: torch.Tensor) -> torch.Tensor:
