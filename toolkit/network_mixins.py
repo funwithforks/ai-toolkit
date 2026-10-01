@@ -232,13 +232,26 @@ class ToolkitModuleMixin:
         else:
             scale = self._runtime_scale
 
+        # fold the (scalar / (B,1,1)) scale into the narrow rank activation
+        # instead of the up-projected output: identical math, ~1000x less
+        # elementwise traffic on wide targets (fc1 out=16384 made this lone
+        # mul ~200ms/step at bs=4; rounding order differs by <=1 bf16 ulp)
+        if hasattr(self, 'scalar'):
+            # trainable scaler (locon): keep the multiply on the output path
+            scale = scale * self.scalar
+            fold = False
+        else:
+            fold = scale.numel() == 1 or (
+                lx.dim() == 3
+                and scale.numel() == lx.shape[0]
+                and scale.shape[-1] == 1
+            )
+        if fold:
+            lx = lx * scale
+
         lx = self.lora_up(lx)
 
-        # handle trainable scaler method locon does
-        if hasattr(self, 'scalar'):
-            scale = scale * self.scalar
-
-        return lx * scale
+        return lx if fold else lx * scale
 
     def lorm_forward(self: Network, x, *args, **kwargs):
         network: Network = self.network_ref()
