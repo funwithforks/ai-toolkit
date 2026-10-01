@@ -230,6 +230,23 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
             state_dict, dtype, config=config
         )
         del state_dict
+        # Blackwell training policy: dequant-free int8 STE backward is
+        # the default on quantized linears (quality-validated on this
+        # stack; ~3x faster upstream-gradient GEMMs that run on int8
+        # tensor cores instead of dequantizing to bf16). Disable with
+        # model_kwargs {int8_bwd: false}.
+        if self.model_config.model_kwargs.get("int8_bwd", True):
+            n = 0
+            for m in transformer.modules():
+                if getattr(m, "cr8_qdata", None) is not None:
+                    m.cr8_bwd_mode = "int8"
+                    n += 1
+            if n:
+                self.print_and_status_update(
+                    f"  - int8 STE input-gradient backward enabled on {n} "
+                    f"quantized linears (upstream grads quantized to int8; "
+                    f"set model_kwargs int8_bwd=false for the eager backward)"
+                )
         flush()
         return transformer
 

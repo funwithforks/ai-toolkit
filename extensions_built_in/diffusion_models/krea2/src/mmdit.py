@@ -17,6 +17,7 @@ Differences from the reference (all training-driven, numerically equivalent):
 """
 
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -28,6 +29,44 @@ from einops import rearrange
 from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
+
+# Optional liger-kernel fusions (pure-Triton, arch-gated only by triton
+# availability). They fold the per-block elementwise chains (adaLN-modulated
+# RMSNorm, QK RMSNorm, SwiGLU silu-mul) into single launches with fused
+# backward kernels. Math is the same function computed in fp32; the eager
+# path below and the fused kernels differ only in WHERE the bf16 roundings
+# happen (single rounding at store vs one per eager op), i.e. up to ~1 bf16
+# ulp per element. NOT bit-identical to eager, so this is default-OFF:
+# enable with KREA2_LIGER_FUSIONS=1 once a loss-curve A/B is accepted.
+_LIGER_OK = os.environ.get("KREA2_LIGER_FUSIONS", "0") == "1"
+_liger_rms_norm = _liger_swiglu = _LigerModNorm = None
+if _LIGER_OK:
+    try:
+        from liger_kernel.functional import rms_norm as _liger_rms_norm
+        from liger_kernel.functional import swiglu as _liger_swiglu
+        from liger_kernel.ops.modulated_rms_norm import (
+            LigerModulatedRMSNormFunction as _LigerModNorm,
+        )
+    except Exception:
+        _liger_rms_norm = _liger_swiglu = _LigerModNorm = None
+
+
+def _mod_norm(norm: "RMSNorm", x: Tensor, scale: Tensor, shift: Tensor) -> Tensor:
+    """(1 + scale) * norm(x) + shift -- fused when liger is available."""
+    if _LigerModNorm is None or not x.is_cuda or x.dim() != 3:
+        return (1 + scale) * norm(x) + shift
+    b, l, f = x.shape
+    y = _LigerModNorm.apply(
+        x.reshape(b * l, f),
+        norm.scale,
+        scale.reshape(b, f),
+        shift.reshape(b, f),
+        norm.eps,
+        1.0,
+        "llama",
+        False,
+    )
+    return y.reshape(b, l, f)
 
 
 def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
@@ -178,6 +217,20 @@ class QKNorm(torch.nn.Module):
         self.knorm = RMSNorm(dim)
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        if _liger_rms_norm is not None and q.is_cuda:
+            return (
+                _liger_rms_norm(
+                    q, self.qnorm.scale, eps=self.qnorm.eps, offset=1.0,
+                    casting_mode="llama", in_place=False,
+                    impl="nvidia-triton",
+                ),
+                _liger_rms_norm(
+                    k, self.knorm.scale, eps=self.knorm.eps, offset=1.0,
+                    casting_mode="llama", in_place=False,
+                    impl="nvidia-triton",
+                ),
+                v,
+            )
         return self.qnorm(q), self.knorm(k), v
 
 
@@ -212,6 +265,8 @@ class SwiGLU(torch.nn.Module):
         self.down = torch.nn.Linear(mlpdim, features, bias=bias)
 
     def forward(self, x: Tensor) -> Tensor:
+        if _liger_swiglu is not None and x.is_cuda:
+            return self.down(_liger_swiglu(self.gate(x), self.up(x), impl="nvidia-triton"))
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
@@ -408,9 +463,14 @@ class SingleStreamBlock(nn.Module):
 
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
         x = x + pregate * self.attn(
-            (1 + prescale) * self.prenorm(x) + preshift, freqs, mask, **attn_kwargs
+            _mod_norm(self.prenorm, x, prescale, preshift),
+            freqs,
+            mask,
+            **attn_kwargs,
         )
-        x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
+        x = x + postgate * self.mlp(
+            _mod_norm(self.postnorm, x, postscale, postshift)
+        )
 
         return x
 
@@ -512,7 +572,24 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
         tvec = self.tproj(t)
 
-        txtmask = _mask(mask[:, : context.shape[1]])
+        # With a full (unpadded) sequence and an all-valid key-padding mask the
+        # broadcast (B, 1, L, L) mask is all-true: identical attention output to
+        # passing no mask at all, and dropping it lets SDPA pick its unmasked
+        # kernels (the masked backward path falls back to a slower sm80 kernel
+        # on consumer Blackwell) and skips building the L x L mask each forward.
+        # The single .all() check costs one small reduction + sync per pass;
+        # it MUST stay exact — a wrong hit here would let padded keys leak into
+        # real tokens, so only provably all-valid layouts take the fast path.
+        trivial_mask = (
+            mask is not None
+            and reflen == 0
+            and not isolate_refs
+            and ref_kv_capture is None
+            and ref_kv_cache is None
+            and bool(mask.all())
+        )
+
+        txtmask = None if trivial_mask else _mask(mask[:, : context.shape[1]])
 
         context = self.txtfusion(context, mask=txtmask)
         context = self.txtmlp(context)
@@ -546,7 +623,10 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             blockvec = (tvec, self.tproj(t0), txtlen + imglen - reflen)
 
         padmask = mask  # (B, L) key-padding mask, incl. the 256-alignment pad
-        mask = _mask(mask)
+        if trivial_mask and _padlen == 0:
+            mask = None
+        else:
+            mask = _mask(mask)
 
         if reflen > 0 and isolate_refs:
             # Asymmetric attention (OminiControl2-style "feature reuse"): ref

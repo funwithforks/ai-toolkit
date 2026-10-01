@@ -2167,8 +2167,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
 
 
-                # todo switch everything to proper mixed precision like this
-                self.network.force_to(self.device_torch, dtype=torch.float32)
+                # Train the adapter network at the train dtype (bf16 on
+                # Blackwell): fp32 masters cost per-module upcast/downcast
+                # kernels every step for no information gain on bf16/int8
+                # bases. Optimizer precision for bf16 params is handled by
+                # the optimizers (e.g. automagic2 stochastic rounding).
+                self.network.force_to(self.device_torch, dtype=dtype)
                 # give network to sd so it can use it
                 self.sd.network = self.network
                 self.network._update_torch_multiplier()
