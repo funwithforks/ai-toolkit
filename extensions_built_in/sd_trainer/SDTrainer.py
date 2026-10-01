@@ -245,20 +245,37 @@ class SDTrainer(BaseSDTrainProcess):
                     targets.append((f'sample_neg_{i}', gen_img_config.negative_prompt, {}))
         return targets
 
-    def _fixed_embed_cache_path(self, kind, text, flags):
+    def _fixed_embed_cache_path(self, kind, text, flags, for_write=False):
         model_id = f"{self.sd.arch}|{self.sd.model_config.name_or_path}"
         space_version = getattr(self.sd, 'text_embedding_space_version', 0)
         flag_str = '|'.join(f'{k}={v}' for k, v in sorted(flags.items()))
         digest = hashlib.md5(
             f"{kind}|{model_id}|{space_version}|{text}|{flag_str}".encode()
         ).hexdigest()[:16]
-        return os.path.join(
-            self.save_root, '.prompt_embed_cache', f"{kind}_{digest}.safetensors"
+        filename = f"{kind}_{digest}.safetensors"
+        # Shared cache, keyed by model: what a prompt encodes to does not
+        # depend on which job asks, so a new job must NOT have to load the
+        # (huge) text encoder just to re-encode prompts another job already
+        # cached. The digest already covers model/space/prompt/flags, so one
+        # namespace per model is collision-safe.
+        shared_dir = os.path.join(
+            self.training_folder,
+            '.prompt_embed_cache',
+            hashlib.md5(f"{model_id}|{space_version}".encode()).hexdigest()[:12],
         )
+        shared = os.path.join(shared_dir, filename)
+        if for_write:
+            return shared
+        legacy = os.path.join(self.save_root, '.prompt_embed_cache', filename)
+        if not os.path.exists(shared) and os.path.exists(legacy):
+            return legacy
+        return shared
 
     def _save_fixed_embed(self, kind, text, flags, embeds):
         try:
-            embeds.detach().to('cpu').save(self._fixed_embed_cache_path(kind, text, flags))
+            path = self._fixed_embed_cache_path(kind, text, flags, for_write=True)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            embeds.detach().to('cpu').save(path)
         except Exception as e:
             print_acc(f" - could not cache {kind} prompt embeds: {e}")
 
@@ -266,10 +283,19 @@ class SDTrainer(BaseSDTrainProcess):
         targets = self._fixed_embed_targets()
         if targets is None:
             return False
-        return all(
-            os.path.exists(self._fixed_embed_cache_path(kind, text, flags))
+        missing = [
+            kind
             for kind, text, flags in targets
-        )
+            if not os.path.exists(self._fixed_embed_cache_path(kind, text, flags))
+        ]
+        if missing:
+            # say why the text encoder is being loaded: a silent True from
+            # this branch reads like a regression
+            print_acc(
+                f" - text encoder needed: fixed prompt embeds not cached: "
+                f"{sorted(set(missing))}"
+            )
+        return not missing
 
     def needs_text_encoder_load(self):
         # the training process asks before the text encoder phase; False skips
@@ -284,6 +310,13 @@ class SDTrainer(BaseSDTrainProcess):
         if getattr(self.sd, 'is_llm', False):
             return True
         if self._has_validation_items():
+            # *** DO NOT TOUCH this clause for validation code until we
+            # actually work on validation. *** Validation prompt embeds have
+            # no disk cache by design-debt, so any validation item forces a
+            # full text encoder load. That is known and accepted for now;
+            # "fixing" it (or touching it in passing) while validation is
+            # untested breaks component loading. Paired clause on the VAE
+            # gate: BaseSDTrainProcess vae_load_needed.
             # validation prompt embeds are re-encoded into memory every run
             # (setup_validation_embeds, phase 2)
             return True

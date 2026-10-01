@@ -835,15 +835,21 @@ class BaseModel:
             # staged_sampling (see decode_sample_payload): the vae sat out
             # the entire denoise loop so the transformer had the memory to
             # itself, and now the whole round decodes through it at once.
-            if self.vae is None:
-                print_acc("Loading VAE to decode staged samples")
-                self.load_vae()
-            for gen_config, idx, payload in staged_samples:
-                img = self.decode_sample_payload(payload)
-                gen_config.save_image_atomic(img, idx)
-                gen_config.log_image(img, idx)
-                self._after_sample_image(idx, len(image_configs))
-                flush()
+            if hasattr(self, "decode_staged_samples"):
+                # model owns the entire decode phase (e.g. H3 loads and
+                # frees each vae separately so never more than one is
+                # resident, saving at the very end)
+                self.decode_staged_samples(staged_samples)
+            else:
+                if self.vae is None:
+                    print_acc("Loading VAE to decode staged samples")
+                    self.load_vae()
+                for gen_config, idx, payload in staged_samples:
+                    img = self.decode_sample_payload(payload)
+                    gen_config.save_image_atomic(img, idx)
+                    gen_config.log_image(img, idx)
+                    self._after_sample_image(idx, len(image_configs))
+                    flush()
 
         # restore training state
         torch.set_rng_state(rng_state)

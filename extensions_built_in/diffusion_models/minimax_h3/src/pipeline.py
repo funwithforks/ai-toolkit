@@ -280,26 +280,53 @@ class MiniMaxH3Pipeline:
         return decode_h3_payload(model, video_latents, audio_latents, is_video, with_audio)
 
 
-def decode_h3_payload(model, video_latents, audio_latents, is_video, with_audio):
-    """VAE side of the pipeline: latents -> PIL list (image) or mp4 dict (video)."""
-    video = model.decode_latents(video_latents)  # (1, 3, T, H, W) in [-1, 1]
+def h3_decode_video_payload(model, payload):
+    """Video VAE stage: pixel frames parked on cpu (uint8 (T, H, W, C)) or a
+    PIL image in image mode. model.vae must hold the video vae."""
+    video = model.decode_latents(payload["video_latents"])  # (1, 3, T, H, W) in [-1, 1]
     video = ((video.float().clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8)
     video = video[0].permute(1, 2, 3, 0).cpu()  # (T, H, W, C)
+    if not payload["is_video"]:
+        return Image.fromarray(video[0].numpy())
+    return video
 
-    if not is_video:
-        return [Image.fromarray(video[0].numpy())]
 
-    audio_out = None
-    if with_audio and audio_latents is not None:
-        waveform = model.decode_audio_latents(
-            audio_latents.float()
-        )  # (2, 1, samples)
-        audio_out = waveform[:, 0].cpu()  # (2, samples) stereo
+def h3_decode_audio_payload(model, payload):
+    """Audio VAE stage: stereo waveform on cpu. model.vae must hold the
+    audio vae."""
+    if not payload.get("with_audio") or payload.get("audio_latents") is None:
+        return None
+    waveform = model.decode_audio_latents(payload["audio_latents"].float())
+    return waveform[:, 0].cpu()  # (2, samples) stereo
 
+
+def h3_assemble_result(frames, wave, payload):
+    """Final object the savers expect: mp4 dict (video) or the PIL image."""
+    if not payload["is_video"]:
+        return frames
     return {
-        "video": video,
+        "video": frames,
         "fps": FPS,
-        "audio": audio_out,
+        "audio": wave,
         "audio_sample_rate": packing.AUDIO_SAMPLE_RATE,
         "output_path": None,
     }
+
+
+def decode_h3_payload(model, video_latents, audio_latents, is_video, with_audio):
+    """Fused decode (both vae bundles resident): the staged path uses the
+    per-stream helpers instead so only one vae is ever resident."""
+    payload = {
+        "video_latents": video_latents,
+        "audio_latents": audio_latents,
+        "is_video": is_video,
+        "with_audio": with_audio,
+    }
+    result = h3_assemble_result(
+        h3_decode_video_payload(model, payload),
+        h3_decode_audio_payload(model, payload),
+        payload,
+    )
+    if not is_video:
+        return [result]
+    return result

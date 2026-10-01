@@ -1904,6 +1904,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             dataset.is_caching_clip_vision_to_disk or not dataset.latent_cache_complete()
             for dataset in all_dataset_objs
         ) or self._has_validation_items()
+        # *** The trailing _has_validation_items() clause: DO NOT TOUCH for
+        # validation code until we actually work on validation. ***
+        # Validation latents have no disk cache by design-debt, so any
+        # validation item forces a vae load. Known and accepted for now;
+        # changing it while validation is untested breaks component loading.
+        # Paired clause on the TE gate: SDTrainer.needs_text_encoder_load.
         if vae_load_needed:
             self.sd.load_vae()
         else:
