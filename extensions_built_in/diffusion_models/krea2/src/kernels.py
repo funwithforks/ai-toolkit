@@ -182,6 +182,21 @@ _GATED_FUSE = _TRITON_OK and os.environ.get("KREA2_GATED_RESIDUAL_FUSION", "0") 
 
 _warned: set = set()
 
+try:  # checkpoint control-flow signal, never a kernel failure
+    from torch.utils.checkpoint._checkpoint_error import _StopRecomputationError
+except Exception:  # pragma: no cover
+    try:
+        from torch.utils.checkpoint import _StopRecomputationError  # type: ignore
+    except Exception:
+        _StopRecomputationError = None  # type: ignore
+
+
+def _reraise_if_stop_recompute(e: BaseException):
+    if _StopRecomputationError is not None and isinstance(
+        e, _StopRecomputationError
+    ):
+        raise e
+
 
 def _report_missing(what: str, detail: str):
     """Fallbacks must never be silent: print once per distinct failure so
@@ -241,6 +256,7 @@ def fused_ropeapply(xq, xk, freqs):
     try:
         return _RopeApply.apply(xq, freqs), _RopeApply.apply(xk, freqs)
     except Exception as e:  # kernel failed on this shape/arch
+        _reraise_if_stop_recompute(e)
         _report_missing(
             "rope_fusion",
             f"launch failed for q{tuple(xq.shape)} k{tuple(xk.shape)} {xq.dtype}: "
@@ -250,7 +266,15 @@ def fused_ropeapply(xq, xk, freqs):
 
 
 def fused_gated_residual(x, y, m):
-    """Fused x + m*y ((B,1,F) gate); None if unavailable."""
+    """Fused x + m*y ((B,1,F) gate); None if unavailable.
+
+    NOT wired into the model: enabled under gradient checkpointing it
+    OOMed at batch 4 (save_for_backward(y) retains each block's output
+    activation through the no-grad pass; the eager chain lets the
+    checkpoint machinery reclaim it). A checkpoint-aware rewrite (e.g.
+    recomputing m*y from cheaper saved tensors) must land before the
+    wiring is reinstated.
+    """
     if not _GATED_FUSE or not x.is_cuda:
         return None
     if (
@@ -268,6 +292,7 @@ def fused_gated_residual(x, y, m):
     try:
         return _GatedResidual.apply(x, y, m)
     except Exception as e:
+        _reraise_if_stop_recompute(e)
         _report_missing(
             "gated_residual_fusion",
             f"launch failed for {tuple(x.shape)} {x.dtype} m{tuple(m.shape)}: "
