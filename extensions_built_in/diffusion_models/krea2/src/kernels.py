@@ -73,6 +73,7 @@ if _HAS_TRITON:
     def _rope_launch(x4: torch.Tensor, freq4: torch.Tensor, sign: int):
         b, h, l, d = x4.shape
         x = x4.contiguous().view(-1)
+        freq4 = freq4.contiguous()  # kernel indexes the (B,L,D//2,2,2) flat layout
         y = torch.empty_like(x)
         n = x.numel()
         BLOCK = 512
@@ -178,6 +179,19 @@ if _HAS_TRITON:
 
 _TRITON_OK = _HAS_TRITON and torch.cuda.is_available()
 _ROPE_FUSE = _TRITON_OK
+
+# --- cuDNN frontend FROST attention (sm120 native fwd/bwd) -----------------
+# torch's SDPA on consumer Blackwell runs the sm120 generated fprop but an
+# sm80 WMMA bprop. cudnn-frontend >= 1.28 ships sm120 DSL kernels for both
+# (FROST); torch cannot select them. Wrapped as one autograd.Function;
+# numerics are the standard cudnn bwd class (non-deterministic two-kernel
+# dQK route, bf16 grad rel noise <= ~1e-2 vs the sm80 path on real shapes).
+# Default ON when available; KREA2_FROST_SDPA=0 restores plain torch SDPA.
+os.environ.setdefault("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+from cudnn.sdpa.bwd import sdpa_bwd_wrapper_dsl_sm120 as _frost_bwd
+from cudnn.sdpa.fwd import sdpa_fwd_wrapper_dsl_sm120 as _frost_fwd
+
+_FROST_OK = os.environ.get("KREA2_FROST_SDPA", "1") != "0"
 _GATED_FUSE = _TRITON_OK and os.environ.get("KREA2_GATED_RESIDUAL_FUSION", "0") == "1"
 
 _warned: set = set()
@@ -221,14 +235,6 @@ def _report_missing(what: str, detail: str):
     )
 
 
-def _rope_ok(x, freqs):
-    return (
-        x.is_cuda and x.dim() == 4 and x.is_contiguous()
-        and x.dtype in (torch.bfloat16, torch.float16)
-        and freqs.is_contiguous() and x.shape[-1] % 4 == 0
-    )
-
-
 def fused_ropeapply(xq, xk, freqs):
     """Bitwise-identical fused mmdit.ropeapply; None if unavailable.
 
@@ -236,22 +242,6 @@ def fused_ropeapply(xq, xk, freqs):
     freqs: (B,L,D//2,2,2) fp32 contiguous, broadcast over heads.
     """
     if not _ROPE_FUSE:
-        return None
-    if not xq.is_cuda:
-        return None
-    if not _rope_ok(xq, freqs) or not _rope_ok(xk, freqs):
-        _report_missing(
-            "rope_fusion",
-            f"layout/dtype miss: q {tuple(xq.shape)} {xq.dtype} contig={xq.is_contiguous()} "
-            f"k {tuple(xk.shape)} {xk.dtype} contig={xk.is_contiguous()} "
-            f"freqs {tuple(freqs.shape)} {freqs.dtype} contig={freqs.is_contiguous()}",
-        )
-        return None
-    if freqs.dim() != 5 or freqs.shape[0] != xq.shape[0] or freqs.shape[1] != xq.shape[2]:
-        _report_missing(
-            "rope_fusion",
-            f"freqs shape {tuple(freqs.shape)} vs q {tuple(xq.shape)}",
-        )
         return None
     try:
         return _RopeApply.apply(xq, freqs), _RopeApply.apply(xk, freqs)
@@ -296,6 +286,62 @@ def fused_gated_residual(x, y, m):
         _report_missing(
             "gated_residual_fusion",
             f"launch failed for {tuple(x.shape)} {x.dtype} m{tuple(m.shape)}: "
+            f"{type(e).__name__}: {e}",
+        )
+        return None
+
+
+# --------------------------------------------------------------------------
+# FROST sm120 SDPA (cudnn-frontend DSL kernels)
+# --------------------------------------------------------------------------
+_frost_notice = False
+
+
+if _FROST_OK:
+
+    class _FrostSdpa(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, q, k, v, scale):
+            out = _frost_fwd(q, k, v, scale_softmax=scale)
+            o = out["o_tensor"]
+            lse = out["lse_tensor"]
+            ctx.save_for_backward(q, k, v, o, lse)
+            ctx.scale = scale
+            return o
+
+        @staticmethod
+        def backward(ctx, do):
+            q, k, v, o, lse = ctx.saved_tensors
+            grads = _frost_bwd(
+                q, k, v, o, do.contiguous(), lse.unsqueeze(-1),
+                scale_softmax=ctx.scale,
+            )
+            return grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"], None
+
+
+def fused_sdpa(q, k, v, scale):
+    """sm120-native non-causal SDPA (FROST); None if unavailable.
+
+    q: (B,Hq,L,D), k/v: (B,Hk,L,D), Hq % Hk == 0 (engine GQA, verified
+    against torch enable_gqa), bf16/fp16 contiguous, D in {64,128}.
+    """
+    global _frost_notice
+    if not _FROST_OK:
+        return None
+    try:
+        out = _FrostSdpa.apply(q, k, v, scale)
+        if not _frost_notice:
+            _frost_notice = True
+            print(
+                "[krea2.kernels] cuDNN FROST sm120 SDPA active "
+                "(fwd+bwd DSL kernels; KREA2_FROST_SDPA=0 restores torch SDPA)"
+            )
+        return out
+    except Exception as e:
+        _reraise_if_stop_recompute(e)
+        _report_missing(
+            "frost_sdpa",
+            f"engine rejected q{tuple(q.shape)} k{tuple(k.shape)} {q.dtype}: "
             f"{type(e).__name__}: {e}",
         )
         return None
