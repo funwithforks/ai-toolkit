@@ -196,11 +196,12 @@ class ToolkitModuleMixin:
             with torch.no_grad():
                 runtime_scale.fill_(self.scale)
 
-    def _call_forward(self: Module, x, batch_scale=None):
+    def _call_forward(self: Module, x, batch_scale=None, return_rank=False):
         # module dropout
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
-                return 0.0  # added to original forward
+                out = 0.0  # added to original forward
+                return (out, False) if return_rank else out
 
         if hasattr(self, 'lora_mid') and self.lora_mid is not None:
             lx = self.lora_mid(self.lora_down(x))
@@ -243,6 +244,9 @@ class ToolkitModuleMixin:
                 scale = batch_scale * scale
             scale = scale.reshape(-1, 1, 1) if scale.dim() else scale
             lx = (lx * scale).to(self.lora_up.weight.dtype)
+            if return_rank:
+                # caller fuses lora_up into the org layer (convrot epilogue)
+                return (lx, True)
             return self.lora_up(lx)
 
         if hasattr(self, 'scalar'):
@@ -251,7 +255,8 @@ class ToolkitModuleMixin:
 
         lx = self.lora_up(lx)
 
-        return lx * scale
+        out = lx * scale
+        return (out, False) if return_rank else out
 
     def lorm_forward(self: Network, x, *args, **kwargs):
         network: Network = self.network_ref()
@@ -316,8 +321,7 @@ class ToolkitModuleMixin:
         if self.__class__.__name__ == "LokrModule":
             return self._call_forward(x)
 
-        org_forwarded = self.org_forward(x, *args, **kwargs)
-
+        x_for_org = x
         if isinstance(x, QTensor):
             x = x.dequantize()
         # always cast to float32
@@ -335,11 +339,47 @@ class ToolkitModuleMixin:
         # _call_forward folds the multiplier there before lora_up, so the
         # (out_features, batch) broadcast multiply below never runs.
         fold_batch = lora_input.dim() == 3 and not hasattr(self, 'scalar')
-        lora_output = self._call_forward(
-            lora_input, batch_scale=multiplier if fold_batch else None
+        # On convrot-int8 STE layers the up-projection itself folds into the
+        # dequant epilogue kernel: park the rank activation on the org module
+        # BEFORE its forward; it is consumed there (cleared) or left for the
+        # ordinary path below.
+        epilogue_target = (
+            fold_batch
+            and self.__class__.__name__ == "LoRAModule"
+            and self.lora_up.bias is None
+            and type(self.org_module[0]).__name__ == "OstrisLinear"
         )
+        res = self._call_forward(
+            lora_input,
+            batch_scale=multiplier if fold_batch else None,
+            return_rank=epilogue_target,
+        )
+        if epilogue_target:
+            lora_output, is_rank = res
+        else:
+            lora_output = res
 
-        if fold_batch and torch.is_tensor(lora_output):
+        org_forwarded = None
+        if epilogue_target and is_rank and torch.is_tensor(lora_output):
+            rank = lora_output.shape[-1]
+            if rank & (rank - 1) == 0 and rank <= 64:
+                om = self.org_module[0]
+                om._cr8_lora = (lora_output.reshape(-1, rank), self.lora_up.weight)
+                org_forwarded = self.org_forward(x_for_org, *args, **kwargs)
+                if om._cr8_lora is None:
+                    return org_forwarded
+                om._cr8_lora = None
+
+        if org_forwarded is None:
+            org_forwarded = self.org_forward(x_for_org, *args, **kwargs)
+
+        if not torch.is_tensor(lora_output):
+            return org_forwarded + lora_output
+
+        if epilogue_target and is_rank:
+            lora_output = self.lora_up(lora_output)
+
+        if fold_batch:
             scaled_lora_output = lora_output
         else:
             scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
