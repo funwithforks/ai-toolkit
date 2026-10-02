@@ -683,8 +683,17 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
 
         freqs = self.posemb(pos)
 
-        for block, blockkv in zip(self.blocks, blockcaches):
-            if self.gradient_checkpointing and torch.is_grad_enabled():
+        _ck_stride = int(os.environ.get("KREA2_CKPT_STRIDE", "1"))
+        for _bidx, (block, blockkv) in enumerate(zip(self.blocks, blockcaches)):
+            # hybrid schedule: every KREA2_CKPT_STRIDE-th block runs WITHOUT
+            # checkpointing (its activations stay resident, its forward GEMMs
+            # stop being recomputed in backward); VRAM is the budget knob.
+            _do_ckpt = (
+                self.gradient_checkpointing
+                and torch.is_grad_enabled()
+                and (_ck_stride <= 1 or _bidx % _ck_stride != _ck_stride - 1)
+            )
+            if _do_ckpt:
                 combined = checkpoint(
                     block,
                     combined,
