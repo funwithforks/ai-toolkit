@@ -518,14 +518,19 @@ class SingleStreamBlock(nn.Module):
             return x
 
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
-        x = x + pregate * self.attn(
-            _mod_norm(self.prenorm, x, prescale, preshift),
-            freqs,
-            mask,
-            **attn_kwargs,
+        # addcmul (out-of-place): the gate*branch residual is one fused pass
+        # instead of mul-then-add, saving the 40 MB gate intermediate per
+        # block per stream. Out-of-place on purpose -- in-place would mutate
+        # the checkpointed block input and corrupt the recompute pass.
+        x = torch.addcmul(
+            x,
+            pregate,
+            self.attn(_mod_norm(self.prenorm, x, prescale, preshift), freqs, mask, **attn_kwargs),
         )
-        x = x + postgate * self.mlp(
-            _mod_norm(self.postnorm, x, postscale, postshift)
+        x = torch.addcmul(
+            x,
+            postgate,
+            self.mlp(_mod_norm(self.postnorm, x, postscale, postshift)),
         )
 
         return x
