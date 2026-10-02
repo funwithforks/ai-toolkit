@@ -45,6 +45,8 @@ Quantized state attached to each module:
 
 from typing import Optional
 
+import weakref
+
 import torch
 import torch.nn.functional as F
 
@@ -1021,17 +1023,42 @@ def quantize_int8_rows_fused(x: torch.Tensor, qmax: int = 127):
     return q[:rows], scales[:rows]
 
 
+_actq_share: dict = {}
+
+
 def _int8_act_quant_padded(x: torch.Tensor, qmax: int = 127):
-    """Act quant with rows padded to a multiple of 32 for torch._int_mm."""
+    """Act quant with rows padded to a multiple of 32 for torch._int_mm.
+
+    Shared across the sibling linears of a block: q/k/v/gate (and the SwiGLU
+    gate/up pair) quantize the IDENTICAL activation tensor, and the grid is
+    uniform across the block. A weakref+version cache collapses those calls
+    into one quantize kernel per input per forward (and per checkpoint
+    recompute pass); a hit requires the exact same live tensor object at the
+    same version, so a freed-and-recycled data_ptr or an in-place mutation
+    can never return stale rows. Entries hold only ~1 int8 activation each
+    and are capped. Skipped while compiling: the cache lives in python and
+    the custom-op body that calls it is opaque to inductor anyway.
+    """
+    share = x.is_cuda and not torch.compiler.is_compiling()
+    key = None
+    if share:
+        key = (x.data_ptr(), tuple(x.shape), qmax)
+        ent = _actq_share.get(key)
+        if ent is not None and ent[0]() is x and ent[1] == x._version:
+            return ent[2], ent[3]
     if _triton_available() and x.is_cuda:
         q, scales = _int8_act_quant_op(x, qmax)
-        return q, scales
-    q, scales = quantize_int8_rows(x, qmax)
-    rows = q.shape[0]
-    rows_pad = -(-rows // 32) * 32
-    if rows_pad != rows:
-        q = F.pad(q, (0, 0, 0, rows_pad - rows))
-        scales = F.pad(scales, (0, rows_pad - rows), value=1.0)
+    else:
+        q, scales = quantize_int8_rows(x, qmax)
+        rows = q.shape[0]
+        rows_pad = -(-rows // 32) * 32
+        if rows_pad != rows:
+            q = F.pad(q, (0, 0, 0, rows_pad - rows))
+            scales = F.pad(scales, (0, rows_pad - rows), value=1.0)
+    if share:
+        if len(_actq_share) > 6:
+            _actq_share.pop(next(iter(_actq_share)))
+        _actq_share[key] = (weakref.ref(x), x._version, q, scales)
     return q, scales
 
 
