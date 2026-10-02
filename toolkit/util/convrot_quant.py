@@ -1455,6 +1455,9 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
     per-output-channel symmetric int8 with torch._int_mm. One instance per qtype,
     shareable across modules."""
 
+    # the int8 STE GEMM is the one backend that consumes the lora-epilogue
+    # fold; OstrisLinear only forwards cr8_lora to backends that opt in
+    accepts_cr8_lora = True
     # activation quantization range (per-token symmetric [-act_qmax, act_qmax]);
     # the comfy w4a4 subclass narrows this to 7
     act_qmax = 127

@@ -40,6 +40,47 @@ class Qwen3VLTextEncoder(Qwen3VLForConditionalGeneration, OstrisTransformersMixi
     aitk_subfolder = "text_encoder"
     aitk_processor_subfolder = "processor"
 
+    # comfy repacks of this encoder, keyed by source repo: the krea2 file
+    # is a text-tower repack (fp8-scaled), the H3 file is the 32B nvfp4/awq
+    # one. A job only sees the candidates of the repo its name_or_path
+    # points at (or its model's comfy_repo default).
+    aitk_comfy_repo = "Comfy-Org/Krea-2"
+    aitk_comfy_weight_names = {
+        "Comfy-Org/Krea-2": [
+            "text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
+        ],
+        "Comfy-Org/MiniMax-H3": [
+            "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        ],
+    }
+
+    @classmethod
+    def convert_state_dict_on_load(cls, state_dict):
+        """Comfy repack of this encoder is a text-tower-only file: its keys
+        sit at ``model.layers.*`` (Qwen3VLTextModel layout) while this class
+        nests the decoder at ``model.language_model.layers.*``. Remap the
+        prefix so the single-file path can attach its quantized linears and
+        assign everything else. Hub-repo files already carry the nested
+        layout and pass through untouched."""
+        if not any(k.startswith("model.layers.") for k in state_dict):
+            return state_dict
+        converted = {}
+        for key, value in state_dict.items():
+            if key.startswith("model.visual."):
+                # the visual tower rides along in this repack; it is dropped
+                # after load (drop_vision_tower), its prefix already matches
+                converted[key] = value
+            elif key.startswith("model."):
+                key = "model.language_model." + key[len("model."):]
+            converted[key] = value
+        # this repack carries no lm_head: it is the tied-embedding case, so
+        # the head is the embedding table itself
+        if "model.language_model.embed_tokens.weight" in converted and not any(
+            k.startswith("lm_head.") for k in converted
+        ):
+            converted["lm_head.weight"] = converted["model.language_model.embed_tokens.weight"]
+        return converted
+
     @classmethod
     def get_transformer_block_names(cls):
         return ["model.language_model.layers"]

@@ -1,3 +1,4 @@
+import os
 from toolkit.basic import flush
 
 
@@ -30,6 +31,38 @@ class PhasedLoadMixin:
     """
 
     display_name = "model"
+
+    @staticmethod
+    def select_comfy_candidates(component, candidates, model_kwargs):
+        """Default candidate filter: none. Archs with variant families
+        (H3 partitions, krea2 checkpoints) override to return the filtered
+        list; returning None keeps the qtype ranking."""
+        return None
+
+    def _resolve_comfy_file(self, component: str, component_cls):
+        """Resolve a component file through the generic comfy-candidates
+        door. ``component_cls`` declares its candidates and comfy repo;
+        the holder contributes name_or_path (the source repo or local
+        dir), the per-component ``<component>_path`` override, its
+        model_kwargs to the candidate filter, and this method's caller
+        decides where the bytes go (the reader primitive materializes
+        them wherever the phase wants them)."""
+        path = component_cls.resolve_comfy_weights(
+            self.model_config.name_or_path,
+            subfolder="",
+            hf_token=os.getenv("HF_TOKEN"),
+            status_fn=self.print_and_status_update,
+            component=component,
+            model_kwargs=self.model_config.model_kwargs,
+            override_path=self.model_config.model_kwargs.get(f"{component}_path", None),
+            candidate_filter=self.select_comfy_candidates,
+        )
+        if path is None:
+            raise FileNotFoundError(
+                f"No comfy candidates registered for {component} on "
+                f"{component_cls.__name__}"
+            )
+        return path
 
     def load_transformer(self):
         """Load the denoiser, then quantize/offload/place per model_config.

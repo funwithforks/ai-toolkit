@@ -26,7 +26,13 @@ class OstrisQuantizer:
     registered as a buffer on the module inside quantize_ (so device moves and dtype
     casts through nn.Module._apply keep working), and read back off the module in the
     other methods. One backend instance may be shared by many modules.
+
+    accepts_cr8_lora: whether forward consumes the lora-epilogue fold. Default
+    False - a backend is loaded in its own quantized state and OstrisLinear
+    forwards cr8_lora only to backends that declared they use it.
     """
+
+    accepts_cr8_lora = False
 
     # the qtype string this instance was resolved from (stamped by
     # get_ostris_quantizer); quantized saves need it to restore the backend
@@ -122,7 +128,12 @@ class OstrisLinear(torch.nn.Linear):
                         f"means something left the model behind after a low_vram load."
                     )
                 self.to(x.device)
-        return self.ostris_quantizer.forward(self, x, cr8_lora=cr8_lora)
+        if getattr(self.ostris_quantizer, "accepts_cr8_lora", False):
+            # only backends that consume the lora-epilogue fold see it; every
+            # other backend keeps a plain (module, x) signature and can never
+            # crash on a kwarg that is meaningless to it
+            return self.ostris_quantizer.forward(self, x, cr8_lora=cr8_lora)
+        return self.ostris_quantizer.forward(self, x)
 
     @torch.no_grad()
     def requantize_(self, fp_weight: torch.Tensor) -> None:

@@ -437,6 +437,11 @@ class ViTDecoder3d(nn.Module):
 
 
 class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
+    aitk_comfy_repo = "Comfy-Org/MiniMax-H3"
+    aitk_comfy_weight_names = {
+        "Comfy-Org/MiniMax-H3": ["vae/minimax_h3_video_vae_fp16.safetensors"],
+    }
+
     @classmethod
     def load_to_device(cls, file_path: str, device) -> "MiniMaxH3VideoVAE":
         """Stream the checkpoint straight onto ``device``: safetensors
@@ -449,7 +454,8 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
         import time as _time
 
         from accelerate import init_empty_weights
-        from safetensors import safe_open
+
+        from toolkit.util.weight_source import WeightSource
 
         dev = torch.device(device)
         if dev.type == "cuda" and dev.index is None:
@@ -457,8 +463,7 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
         t0 = _time.perf_counter()
         with init_empty_weights(include_buffers=False):
             model = cls()
-        with safe_open(file_path, framework="pt", device=str(dev)) as f:
-            state = {k: f.get_tensor(k) for k in f.keys()}
+        state = WeightSource.open(file_path).materialize(dev)
         stats = {
             k: state.pop(k).float()
             for k in ("latents_mean", "latents_std")

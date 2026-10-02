@@ -256,33 +256,39 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
-    def _resolve_comfy_file(self, component: str) -> str:
-        """Find a weight file at its local location (model_kwargs override,
-        comfy layout under MODELS_PATH or a local name_or_path dir), or
-        download it there when (and only when) it is missing — see
-        toolkit/models/v2/resolver.py for the search order."""
-        name_or_path = self.model_config.name_or_path
-        extra_roots = (
-            [name_or_path] if name_or_path and os.path.isdir(name_or_path) else []
-        )
-        return resolve_comfy_file(
-            COMFY_FILES[component],
-            repo_id=repo_id_from_name_or_path(name_or_path, self.comfy_repo),
-            override_path=self.model_config.model_kwargs.get(f"{component}_path", None),
-            extra_roots=extra_roots,
-            status_fn=self.print_and_status_update,
-        )
-
-    def _dit_component(self) -> str:
-        partition = str(
-            self.model_config.model_kwargs.get("partition", "fl2va_pruned")
-        ).lower()
-        if partition not in ("fl2va", "fl2va_pruned", "ref2va", "ref2va_pruned"):
+    def select_comfy_candidates(self, component, candidates, model_kwargs):
+        """Generic-resolution hook: H3's DiT variants all live in one comfy
+        repo. The partition model_kwarg (or a FastH3 arch's dedicated file)
+        filters the transformer's candidate list; other components pass
+        through unfiltered (None = rank by qtype only)."""
+        if component != "transformer":
+            return None
+        partition = str(model_kwargs.get("partition", self._default_partition())).lower()
+        if partition not in self._partition_choices():
             raise ValueError(
-                "model_kwargs.partition must be fl2va, fl2va_pruned, ref2va, "
-                f"or ref2va_pruned, got {partition}"
+                f"model_kwargs.partition must be one of {self._partition_choices()}, "
+                f"got {partition!r}"
             )
-        return f"dit_{partition}"
+        if partition == "fasth3":
+            needle = "fastvideo_fasth3"
+        else:
+            needle = f"minimax_h3_{partition}"
+        filtered = [c for c in candidates if needle in os.path.basename(c)]
+        if not filtered:
+            raise ValueError(
+                f"No {component} candidate matches partition {partition!r} "
+                f"among {candidates}"
+            )
+        return filtered
+
+    def _default_partition(self) -> str:
+        return "fl2va_pruned"
+
+    def _partition_choices(self) -> tuple:
+        return ("fl2va", "fl2va_pruned", "ref2va", "ref2va_pruned")
+
+    def _default_partition(self) -> str:
+        return "fl2va_pruned"
 
     def load_training_adapter(self, transformer: MiniMaxH3Transformer):
         """Load an assistant LoRA (e.g. a de-distillation adapter) as a LIVE
@@ -387,12 +393,20 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         self.invert_assistant_lora = False
 
     def _load_transformer(self) -> MiniMaxH3Transformer:
-        dit_path = self._resolve_comfy_file(self._dit_component())
+        # the transformer variant is picked by the partition filter inside
+        # the generic candidates resolution (select_comfy_candidates)
+        dit_path = self._resolve_comfy_file("transformer")
         self.print_and_status_update(f"Loading transformer from {dit_path}")
         # the mixin single-file path: config sniffed from the checkpoint
         # (adaln_t_table), pre-quantized ConvRot linears attached, everything
-        # else at its stored precision (the bf16/fp16/fp32 mix is deliberate)
-        return MiniMaxH3Transformer.load_model(dit_path, dtype=self.torch_dtype)
+        # else at its stored precision (the bf16/fp16/fp32 mix is deliberate).
+        # As-shipped mode streams the file straight onto the gpu; low_vram
+        # keeps the legacy cpu parking for the phased placement.
+        return MiniMaxH3Transformer.load_model(
+            dit_path,
+            dtype=self.torch_dtype,
+            aitk_device=None if self.model_config.low_vram else self.device_torch,
+        )
 
     def _load_text_encoder(self):
         from accelerate import init_empty_weights
@@ -451,56 +465,54 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                 return prefix
 
             if not self.model_config.quantize_te:
-                # as-shipped mode: stream the file straight onto the gpu,
-                # one tensor at a time. No whole-file cpu copy (the file is
-                # larger than this machine's usable ram), no final mass
-                # transfer; quantized modules are attached per layer from
-                # small marker groups.
-                from safetensors import safe_open
+                # as-shipped mode: stream the file straight onto the gpu
+                # through the weight source (no whole-file cpu copy; the 32B
+                # file is larger than this machine's usable ram), then attach
+                # quantized modules per layer from small marker groups.
+                from toolkit.util.weight_source import WeightSource
 
                 num_quantized = 0
                 unexpected_keys: list = []
                 te_dev = torch.device(self.te_device_torch)
                 if te_dev.type == "cuda" and te_dev.index is None:
                     te_dev = torch.device("cuda", torch.cuda.current_device())
-                with safe_open(te_file, framework="pt", device=str(te_dev)) as f:
-                    all_keys = list(f.keys())
-                    marker_prefixes = [
-                        k[: -len(".comfy_quant")]
+                state = WeightSource.open(te_file).materialize(te_dev)
+                all_keys = list(state.keys())
+                marker_prefixes = [
+                    k[: -len(".comfy_quant")]
+                    for k in all_keys
+                    if k.endswith(".comfy_quant")
+                ]
+                leftover = {}
+                for prefix in marker_prefixes:
+                    group = {
+                        k: state.pop(k)
                         for k in all_keys
-                        if k.endswith(".comfy_quant")
-                    ]
-                    leftover = {}
-                    for prefix in marker_prefixes:
-                        group = {
-                            k: f.get_tensor(k)
-                            for k in all_keys
-                            if k == f"{prefix}.comfy_quant"
-                            or k.startswith(f"{prefix}.")
-                        }
-                        rest, n = import_comfy_quantized_layers(
-                            text_encoder,
-                            group,
-                            orig_dtype=self.te_torch_dtype,
-                            key_map=key_map,
-                        )
-                        num_quantized += n
-                        leftover.update(rest)
-                    for name, tensor in leftover.items():
-                        res = text_encoder.load_state_dict(
-                            {key_map(name): tensor}, assign=True, strict=False
-                        )
-                        unexpected_keys += list(res.unexpected_keys)
-                    for k in all_keys:
-                        if k.endswith(".comfy_quant") or any(
-                            k.startswith(f"{p}.") for p in marker_prefixes
-                        ):
-                            continue
-                        tensor = f.get_tensor(k)
-                        res = text_encoder.load_state_dict(
-                            {key_map(k): tensor}, assign=True, strict=False
-                        )
-                        unexpected_keys += list(res.unexpected_keys)
+                        if k == f"{prefix}.comfy_quant"
+                        or k.startswith(f"{prefix}.")
+                    }
+                    rest, n = import_comfy_quantized_layers(
+                        text_encoder,
+                        group,
+                        orig_dtype=self.te_torch_dtype,
+                        key_map=key_map,
+                    )
+                    num_quantized += n
+                    leftover.update(rest)
+                for name, tensor in leftover.items():
+                    res = text_encoder.load_state_dict(
+                        {key_map(name): tensor}, assign=True, strict=False
+                    )
+                    unexpected_keys += list(res.unexpected_keys)
+                for k in all_keys:
+                    if k not in state:
+                        continue
+                    tensor = state.pop(k)
+                    res = text_encoder.load_state_dict(
+                        {key_map(k): tensor}, assign=True, strict=False
+                    )
+                    unexpected_keys += list(res.unexpected_keys)
+                del state
                 self.print_and_status_update(
                     f" - attached {num_quantized} pre-quantized nvfp4/int8 layers"
                 )
@@ -1347,16 +1359,11 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
                 self.model_config.model_kwargs.get("dopsd_bleed_strength", 1.0)
             )
 
-    def _dit_component(self) -> str:
-        partition = str(
-            self.model_config.model_kwargs.get("partition", "ref2va_pruned")
-        ).lower()
-        if partition not in ("ref2va", "ref2va_pruned"):
-            raise ValueError(
-                f"model_kwargs.partition must be ref2va or ref2va_pruned for "
-                f"{self.arch}, got {partition}"
-            )
-        return f"dit_{partition}"
+    def _default_partition(self) -> str:
+        return "ref2va_pruned"
+
+    def _partition_choices(self) -> tuple:
+        return ("ref2va", "ref2va_pruned")
 
     def get_base_model_version(self):
         return "minimax_h3_ref2va"
@@ -1776,8 +1783,11 @@ class MinimaxH3FastModel(MinimaxH3Model):
         if bool(kw.get("vsa", True)):
             self.vsa_sparsity = float(kw.get("vsa_sparsity", 0.8))
 
-    def _dit_component(self) -> str:
-        return "dit_fasth3"
+    def _default_partition(self) -> str:
+        return "fasth3"
+
+    def _partition_choices(self) -> tuple:
+        return ("fasth3",)
 
     def _load_transformer(self) -> MiniMaxH3Transformer:
         transformer = super()._load_transformer()

@@ -390,6 +390,20 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
     # comfy checkpoints carry a deliberate bf16/fp16/fp32 mix
     aitk_cast_on_load = False
 
+    # every H3 DiT variant ships in the Comfy-Org repack; which one a job
+    # uses is chosen by the model's partition filter (see
+    # MinimaxH3Model.select_comfy_candidates), not a separate lookup
+    aitk_comfy_repo = "Comfy-Org/MiniMax-H3"
+    aitk_comfy_weight_names = {
+        "Comfy-Org/MiniMax-H3": [
+            "diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors",
+            "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors",
+            "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "diffusion_models/fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors",
+        ],
+    }
+
     @classmethod
     def aitk_config_from_state_dict(cls, state_dict):
         params = MiniMaxH3TransformerParams()

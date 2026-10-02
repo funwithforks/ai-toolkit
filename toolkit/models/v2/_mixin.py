@@ -29,6 +29,7 @@ from typing import Dict, List, Optional
 import torch
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
+from toolkit.util.weight_source import load_file_to_device
 from tqdm import tqdm
 
 from diffusers.configuration_utils import ConfigMixin
@@ -36,6 +37,38 @@ from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from diffusers.models.modeling_utils import ModelMixin
 
 from toolkit.basic import flush
+
+
+def _pretrained_to_device(loader, path, subfolder, dtype, device, kwargs):
+    """from_pretrained straight onto a device: accelerate streams the
+    checkpoint shards to the target instead of materializing the full model
+    on cpu first. Dispatch hooks are stripped immediately - every later
+    mechanism (aitk_post_load placement, text_encoder_to, MemoryManager)
+    expects a plain hookless module, and a stale hook's execution device
+    would fight them. Non-persistent buffers (rope tables etc.) are not in
+    checkpoints, so they stay wherever init made them: relocate them."""
+    from accelerate import remove_hook_from_module
+
+    model = OstrisModelMixin._local_first(  # noqa: SLF001 - same module family
+        loader,
+        path,
+        subfolder=subfolder,
+        torch_dtype=dtype,
+        device_map={"": torch.device(device)},
+        **kwargs,
+    )
+    remove_hook_from_module(model, recurse=True)
+    if hasattr(model, "hf_device_map"):
+        del model.hf_device_map
+    dev = torch.device(device)
+    stray = {
+        n: b.device
+        for n, b in model.named_buffers()
+        if b is not None and b.device != dev
+    }
+    if stray:
+        model.to(dev)
+    return model
 
 
 class BasicModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
@@ -138,9 +171,18 @@ class OstrisModelMixin:
     # models (text encoders) override these three to use PreTrainedModel/AutoConfig.
 
     @classmethod
-    def aitk_from_pretrained(cls, path, subfolder=None, dtype=None, **kwargs):
+    def aitk_from_pretrained(cls, path, subfolder=None, dtype=None, aitk_device=None, **kwargs):
+        if aitk_device is not None and torch.device(aitk_device).type != "cpu":
+            return _pretrained_to_device(
+                cls.from_pretrained,
+                path,
+                subfolder=subfolder or "",
+                dtype=dtype,
+                device=aitk_device,
+                kwargs=kwargs,
+            )
         return cls._local_first(
-            cls.from_pretrained, path, subfolder=subfolder, torch_dtype=dtype, **kwargs
+            cls.from_pretrained, path, subfolder=subfolder or "", torch_dtype=dtype, **kwargs
         )
 
     @classmethod
@@ -435,6 +477,7 @@ class OstrisModelMixin:
         subfolder: Optional[str] = None,
         use_comfy_weights: bool = True,
         quantize_on_load: bool = True,
+        aitk_device: Optional[torch.device] = None,
         **kwargs,
     ):
         """Load a model universally from a given name or path.
@@ -506,6 +549,7 @@ class OstrisModelMixin:
                 config_path=config_path,
                 config=config,
                 subfolder=subfolder,
+                aitk_device=aitk_device if qtype is None else None,
                 **kwargs,
             )
         else:
@@ -517,7 +561,14 @@ class OstrisModelMixin:
                 ):
                     subfolder = None
             model = cls.aitk_from_pretrained(
-                name_or_path, subfolder=subfolder, dtype=dtype, **kwargs
+                name_or_path,
+                subfolder=subfolder,
+                dtype=dtype,
+                # opt-in straight-to-device streaming: only for as-shipped
+                # loads (qtype None); a requantize pass wants the weights
+                # where its own block-wise device moves put them
+                aitk_device=aitk_device if qtype is None else None,
+                **kwargs,
             )
 
         # quantize_on_load=False: qtype was only a comfy-candidate ranking
@@ -591,14 +642,24 @@ class OstrisModelMixin:
         config_path: Optional[str] = None,
         config=None,
         subfolder: Optional[str] = None,
+        aitk_device: Optional[torch.device] = None,
         **kwargs,
     ):
-        cls._readahead(file_path)
         import time as _time
 
         _t0 = _time.perf_counter()
-        state_dict = load_file(file_path)
-        print(f"[load-timing] {os.path.basename(file_path)}: disk read {(_time.perf_counter() - _t0):.1f}s")
+        if aitk_device is not None:
+            # as-shipped straight-to-device: safetensors materializes every
+            # tensor on the target device as it is read - the process never
+            # holds a cpu copy of the weights (page cache is kernel memory,
+            # not rss). the meta-shell model built downstream assigns these
+            # tensors directly, so the old cpu->gpu pass disappears.
+            state_dict = load_file_to_device(file_path, aitk_device)
+            print(f"[load-timing] {os.path.basename(file_path)}: streamed to {torch.device(aitk_device)} {(_time.perf_counter() - _t0):.1f}s")
+        else:
+            cls._readahead(file_path)
+            state_dict = load_file(file_path)
+            print(f"[load-timing] {os.path.basename(file_path)}: disk read {(_time.perf_counter() - _t0):.1f}s")
         _t0 = _time.perf_counter()
         model = cls.load_from_state_dict(
             state_dict,
@@ -685,6 +746,17 @@ class OstrisModelMixin:
             # stored-precision load (the checkpoint's dtype mix is deliberate)
             model.load_state_dict(state_dict, assign=True)
         del state_dict
+        # non-persistent buffers (rope tables etc.) are never in a
+        # checkpoint: after a streamed load the parameters sit on the target
+        # device while these stayed at their init device. Relocate them to
+        # wherever the parameters landed (a no-op for cpu loads).
+        param_dev = next(
+            (p.device for p in model.parameters() if p.device.type != "meta"), None
+        )
+        if param_dev is not None and any(
+            b is not None and b.device != param_dev for b in model.buffers()
+        ):
+            model.to(param_dev)
         flush()
         return model
 
@@ -728,6 +800,16 @@ class OstrisModelMixin:
     # comfy weight sources
     # ------------------------------------------------------------------
 
+    # per-class: may a holder filter/reorder the candidate list for a
+    # component before resolution (e.g. H3's partition picking one DiT
+    # variant)? Default None: rank by requested qtype, list order as
+    # tiebreak, no filtering.
+    @classmethod
+    def select_comfy_candidates(
+        cls, component: str, candidates: List[str], model_kwargs: dict
+    ) -> Optional[List[str]]:
+        return None
+
     @classmethod
     def resolve_comfy_weights(
         cls,
@@ -737,16 +819,31 @@ class OstrisModelMixin:
         hf_token: Optional[str] = None,
         status_fn: Optional[callable] = None,
         qtype: Optional[str] = None,
+        override_path: Optional[str] = None,
+        component: Optional[str] = None,
+        model_kwargs: Optional[dict] = None,
+        candidate_filter=None,
     ) -> Optional[str]:
         """The comfy-format weight file replacing a standard ``name_or_path``,
         or None when this class has none registered for it. Best-ranked local
         candidate wins; otherwise the top-preference candidate is downloaded
         to the comfy layout under MODELS_PATH (unless local_only).
 
+        ``override_path``: an explicit file that short-circuits the search
+        (the generic form of the per-component ``<component>_path``
+        model_kwargs convention). Must exist when given.
+
         Candidate keys may be plain repo ids or ``(repo_id, subfolder)``
         tuples for checkpoints holding several of this component (e.g.
         wan2.2's transformer / transformer_2)."""
-        from toolkit.models.v2.resolver import resolve_comfy_candidates
+        from toolkit.models.v2.resolver import resolve_comfy_candidates, resolve_comfy_file, comfy_local_rel
+
+        if override_path is not None:
+            if not os.path.exists(override_path):
+                raise FileNotFoundError(
+                    f"Override path for {cls.__name__} does not exist: {override_path}"
+                )
+            return override_path
 
         candidates = None
         if subfolder is not None:
@@ -760,6 +857,12 @@ class OstrisModelMixin:
             candidates = candidates.get("files")
         if not candidates or repo_id is None:
             return None
+        if candidate_filter is not None:
+            # the holder (model) owns component-variant selection: its
+            # subclass hooks know which variant a partition/arch means
+            selected = candidate_filter(component or "", list(candidates), model_kwargs or {})
+            if selected is not None:
+                candidates = selected
         return resolve_comfy_candidates(
             candidates,
             repo_id=repo_id,
@@ -949,9 +1052,18 @@ class OstrisTransformersMixin(OstrisModelMixin):
     for text-encoder and vision-encoder modules."""
 
     @classmethod
-    def aitk_from_pretrained(cls, path, subfolder=None, dtype=None, **kwargs):
+    def aitk_from_pretrained(cls, path, subfolder=None, dtype=None, aitk_device=None, **kwargs):
+        if aitk_device is not None and torch.device(aitk_device).type != "cpu":
+            return _pretrained_to_device(
+                cls.from_pretrained,
+                path,
+                subfolder=subfolder or "",
+                dtype=dtype,
+                device=aitk_device,
+                kwargs=kwargs,
+            )
         return cls._local_first(
-            cls.from_pretrained, path, subfolder=subfolder or "", torch_dtype=dtype, **kwargs
+            cls.from_pretrained, path, subfolder=subfolder, torch_dtype=dtype, **kwargs
         )
 
     @classmethod
