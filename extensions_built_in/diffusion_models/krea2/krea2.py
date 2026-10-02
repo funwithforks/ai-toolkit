@@ -308,15 +308,18 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
 
     def _load_vae(self):
         # the Qwen-Image vae is a diffusers-layout repo folder: it loads
-        # through the hub cache (or a local vae_path override). The comfy
-        # single-file repacks of this vae are wan-layout and are not
-        # loadable by this class; keep the two cleanly separated.
+        # through the hub cache (or a local vae_path override), streamed
+        # shard-by-shard onto the gpu via accelerate (no cpu staging, no
+        # model-sized ram). The comfy single-file repacks of this vae are
+        # wan-layout and are not loadable by this class; keep the two
+        # cleanly separated.
         vae_path = self.model_config.model_kwargs.get("vae_path", QWEN_IMAGE_VAE_PATH)
         self.print_and_status_update(f"Loading Qwen-Image VAE from {vae_path}")
         vae = QwenImageVAE.load_model(
             vae_path,
             dtype=self.vae_torch_dtype,
             token=HF_TOKEN,
+            aitk_device=None if self.model_config.low_vram else self.vae_device_torch,
         )
         vae.eval()
         vae.requires_grad_(False)

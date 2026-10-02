@@ -40,13 +40,17 @@ from toolkit.basic import flush
 
 
 def _pretrained_to_device(loader, path, subfolder, dtype, device, kwargs):
-    """from_pretrained straight onto a device: accelerate streams the
-    checkpoint shards to the target instead of materializing the full model
-    on cpu first. Dispatch hooks are stripped immediately - every later
-    mechanism (aitk_post_load placement, text_encoder_to, MemoryManager)
-    expects a plain hookless module, and a stale hook's execution device
-    would fight them. Non-persistent buffers (rope tables etc.) are not in
-    checkpoints, so they stay wherever init made them: relocate them."""
+    """from_pretrained straight onto a device - the stock
+    ``from_pretrained(..., device_map="cuda", low_cpu_mem_usage=True)``
+    behavior: accelerate streams the checkpoint shards to the target
+    instead of materializing the full model on cpu first, so peak process
+    ram is shard-sized regardless of model size. This wrapper adds the
+    hygiene a phased-loading toolkit needs: dispatch hooks are stripped
+    immediately (every later mechanism - aitk_post_load placement,
+    text_encoder_to, MemoryManager - expects a plain hookless module, and
+    a stale hook's execution device would fight them), and non-persistent
+    buffers (rope tables etc.), which no checkpoint carries, are relocated
+    to wherever the parameters landed."""
     from accelerate import remove_hook_from_module
 
     model = OstrisModelMixin._local_first(  # noqa: SLF001 - same module family
