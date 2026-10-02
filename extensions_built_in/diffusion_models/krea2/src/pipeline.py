@@ -153,7 +153,6 @@ def predict_velocity(
     ref_latents: Optional[List[List[torch.Tensor]]] = None,  # per-sample (C, h, w) refs
     isolate_refs: bool = False,
     ref_kv_cache: Optional[dict] = None,
-    mask_host: Optional[torch.Tensor] = None,  # (B, Lt) CPU copy of text_mask
 ) -> torch.Tensor:
     """Run the MMDiT on the packed [text | image | refs] sequence.
 
@@ -208,21 +207,12 @@ def predict_velocity(
     if ref_kv_cache is not None and not reuse_ref_kv and reflen > 0:
         capture = []
 
-    mask_host_full = None
-    if mask_host is not None and ref_mask is None and not isolate_refs:
-        # (text | image) host layout; forward mirrors the alignment pad.
-        # refs/isolation layouts keep the device-proven path.
-        mask_host_full = torch.cat(
-            (mask_host, torch.ones_like(mask_host[:, : img_tokens.shape[1]])),
-            dim=1,
-        )
     out = model(
         img=img_tokens,
         context=context,
         t=t,
         pos=pos,
         mask=mask,
-        mask_host=mask_host_full,
         reflen=reflen,
         isolate_refs=isolate_refs,
         ref_kv_capture=capture,
