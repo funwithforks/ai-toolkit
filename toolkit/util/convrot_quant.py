@@ -763,7 +763,13 @@ class ConvRotQuantizer(OstrisQuantizer):
         module.cr_scales_blocked = to_blocked(scales).view(torch.uint8)
         module.cr_pts = pts.detach().clone().reshape(1).view(torch.uint8)
 
-    def forward(self, module, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, module, x: torch.Tensor, cr8_lora: tuple | None = None
+    ) -> torch.Tensor:
+        # cr8_lora is inert here: the epilogue fold is an int8-STE-kernel
+        # feature. The network mixin's predicate (cr8_qdata present) never
+        # offers a fold to this backend; receiving-and-ignoring keeps the
+        # shared OstrisLinear dispatch signature uniform.
         rot = module.cr_rot_size
         in_f, out_f = module.in_features, module.out_features
         m = x.numel() // in_f
@@ -1499,23 +1505,31 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
     def _scales(self, module) -> torch.Tensor:
         return self._scales_u8(module).view(torch.float32)
 
-    def _linear_ste(self, module, x2d: torch.Tensor, out_dtype: str) -> torch.Tensor:
+    def _linear_ste(
+        self,
+        module,
+        x2d: torch.Tensor,
+        out_dtype: str,
+        cr8_lora: tuple | None = None,
+    ) -> torch.Tensor:
         """Hardware STE linear for the training path. For int8 the saved qdata is
         the resident buffer itself, so autograd holds only a free reference."""
-        # a LoRA attached through the network mixin parks its (rank activation,
-        # up weight) here so the up-projection folds into the epilogue kernel;
-        # cleared ONLY when actually consumed (the wrapper adds the LoRA the
-        # ordinary way if the stash survives the org forward)
-        lora = getattr(module, "_cr8_lora", None)
-        if (
-            lora is not None
-            and getattr(module, "cr8_qdata", None) is not None
-            and lora[0].shape[1] & (lora[0].shape[1] - 1) == 0
-            and lora[0].shape[1] <= 64
-        ):
-            module._cr8_lora = None
-        else:
-            lora = None
+        # cr8_lora (rank activation, up weight) passed EXPLICITLY by the network
+        # mixin folds the up-projection into the epilogue kernel. The mixin's
+        # fold predicate and this one must agree; a disagreement would silently
+        # drop the LoRA term, so it is a hard error, never a silent fallback.
+        lora = cr8_lora
+        if lora is not None:
+            if (
+                getattr(module, "cr8_qdata", None) is None
+                or lora[0].shape[1] & (lora[0].shape[1] - 1) != 0
+                or lora[0].shape[1] > 64
+            ):
+                raise RuntimeError(
+                    "convrot int8 STE: cr8_lora passed for a module that cannot "
+                    "fold it (qdata/rank predicate); the caller must not offer a "
+                    "fold here"
+                )
         return _int8_linear_ste_op(
             x2d,
             self._qdata(module),
@@ -1574,7 +1588,9 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
         if this backend's storage isn't supported by it."""
         return module.cr8_qdata, None, 8
 
-    def forward(self, module, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, module, x: torch.Tensor, cr8_lora: tuple | None = None
+    ) -> torch.Tensor:
         rot = self._rot(module)
         in_f, out_f = module.in_features, module.out_features
         m = x.numel() // in_f
@@ -1593,6 +1609,7 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
                     module,
                     rotate(x, rot).reshape(-1, in_f),
                     str(x.dtype).split(".")[-1],
+                    cr8_lora=cr8_lora,
                 )
                 return out.reshape(*x.shape[:-1], out_f)
             # no int8 hardware: straight-through fake-quant + bf16 matmul

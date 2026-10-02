@@ -101,7 +101,9 @@ class OstrisLinear(torch.nn.Linear):
         w._is_ostris_weight = True
         return w
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, cr8_lora: tuple | None = None
+    ) -> torch.Tensor:
         if x.is_cuda and not hasattr(self, "_layer_memory_manager"):
             # a module left behind on the wrong device (usually cpu after a
             # low_vram load) would run its dequant/matmul on cpu threads and
@@ -120,7 +122,7 @@ class OstrisLinear(torch.nn.Linear):
                         f"means something left the model behind after a low_vram load."
                     )
                 self.to(x.device)
-        return self.ostris_quantizer.forward(self, x)
+        return self.ostris_quantizer.forward(self, x, cr8_lora=cr8_lora)
 
     @torch.no_grad()
     def requantize_(self, fp_weight: torch.Tensor) -> None:
