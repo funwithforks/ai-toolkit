@@ -25,6 +25,7 @@ from safetensors.torch import load_file, save_file
 
 import huggingface_hub
 from huggingface_hub.errors import EntryNotFoundError
+from toolkit.paths import MODELS_PATH
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
@@ -96,50 +97,41 @@ scheduler_config = {
     "time_shift_type": "exponential",
 }
 
-# Defaults; both overridable via model.model_kwargs.
+# Defaults; both overridable via model.model_kwargs. The TE's comfy
+# single-file repack (fp8-scaled) is declared as candidates on
+# Qwen3VLTextEncoder; the VAE's on QwenImageVAE. The raw repos remain
+# available via the corresponding *_path model_kwargs.
 QWEN3_VL_PATH = "Qwen/Qwen3-VL-4B-Instruct"
 QWEN_IMAGE_VAE_PATH = "Qwen/Qwen-Image"
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 
-def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str]) -> dict:
-    """Load the MMDiT weights from a local safetensors file/dir or the HF hub.
+def _load_mmdit_state_dict(name_or_path: str, device=None) -> dict:
+    """Read the MMDiT weights from an already-resolved file (generic
+    candidates door) or pick the lone safetensors out of a local dir.
 
-    ``name_or_path`` may be: a ``.safetensors`` file, a directory containing one
-    (``filename`` or the lone ``.safetensors`` in it), or a hub repo id (the
-    file ``filename`` is downloaded, defaulting to ``model.safetensors``).
+    ``device``: when given, tensors stream straight onto it via the weight
+    source (no cpu staging); None keeps the legacy cpu read. Hub fetching
+    does not live here -- resolution is the candidates door's job.
     """
-    if name_or_path.endswith(".safetensors") and os.path.isfile(name_or_path):
-        return load_file(name_or_path)
+    from toolkit.util.weight_source import WeightSource
 
     if os.path.isdir(name_or_path):
-        if filename is not None:
-            return load_file(os.path.join(name_or_path, filename))
         candidates = [f for f in os.listdir(name_or_path) if f.endswith(".safetensors")]
-        if len(candidates) == 1:
-            return load_file(os.path.join(name_or_path, candidates[0]))
-        raise FileNotFoundError(
-            f"Could not pick an MMDiT checkpoint in {name_or_path}: found "
-            f"{candidates}. Set model.model_kwargs.checkpoint_filename."
-        )
+        if len(candidates) != 1:
+            raise FileNotFoundError(
+                f"Could not pick an MMDiT checkpoint in {name_or_path}: found "
+                f"{candidates}. Set model.model_kwargs.transformer_path."
+            )
+        name_or_path = os.path.join(name_or_path, candidates[0])
 
-    # Treat as a hub repo id. When no filename is given, derive it from the repo
-    # name's trailing segment (e.g. "krea/Krea-2-Raw" -> "raw.safetensors",
-    # "krea/Krea-2-Turbo" -> "turbo.safetensors").
-    fname = filename or (
-        name_or_path.split("/")[-1].split("-")[-1].lower() + ".safetensors"
-    )
-    try:
-        path = huggingface_hub.hf_hub_download(
-            repo_id=name_or_path, filename=fname, token=HF_TOKEN
-        )
-    except EntryNotFoundError as e:
-        raise FileNotFoundError(
-            f"Could not find {fname!r} in hub repo {name_or_path!r}. Set "
-            "model.model_kwargs.checkpoint_filename to the weight file name."
-        ) from e
-    return load_file(path)
+    def _read() -> dict:
+        if device is None:
+            return load_file(name_or_path)
+        return WeightSource.open(name_or_path).materialize(device)
+
+    return _read()
 
 
 class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
@@ -221,10 +213,21 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
         config = SingleMMDiTConfig(**mmdit_kwargs)
 
         self.print_and_status_update("  - fetching transformer weights")
-        state_dict = _load_mmdit_state_dict(
-            self.model_config.name_or_path,
-            self.model_config.model_kwargs.get("checkpoint_filename", None),
-        )
+        # generic comfy-candidates door: the convrot repack is the registered
+        # candidate for Comfy-Org/Krea-2. Legacy checkpoint_filename still
+        # works as a direct file override (mapped onto transformer_path).
+        model_kwargs = self.model_config.model_kwargs
+        if model_kwargs.get("checkpoint_filename") and not model_kwargs.get("transformer_path"):
+            fname = model_kwargs["checkpoint_filename"]
+            model_kwargs["transformer_path"] = (
+                fname if os.path.isabs(fname) or os.path.exists(fname)
+                else os.path.join(MODELS_PATH, fname)
+            )
+        # as-shipped mode streams straight onto the gpu (no cpu staging);
+        # low_vram keeps the legacy cpu parking for the phased placement
+        mmdit_device = None if self.model_config.low_vram else self.device_torch
+        dit_path = self._resolve_comfy_file("transformer", SingleStreamDiT)
+        state_dict = _load_mmdit_state_dict(dit_path, device=mmdit_device)
         self.print_and_status_update("  - loading transformer state dict")
         transformer = SingleStreamDiT.load_from_state_dict(
             state_dict, dtype, config=config
@@ -260,7 +263,13 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
 
     def _load_text_encoder(self):
         dtype = self.torch_dtype
-        te_path = self.model_config.model_kwargs.get("text_encoder_path", QWEN3_VL_PATH)
+        # generic comfy-candidates door: the fp8-scaled repack is the
+        # registered candidate for Comfy-Org/Krea-2, resolved like every
+        # other component (override -> settings path -> download)
+        te_path = self.model_config.model_kwargs.get(
+            "text_encoder_path",
+            self._resolve_comfy_file("text_encoder", Qwen3VLTextEncoder),
+        )
         self.print_and_status_update(f"Loading Qwen3-VL text encoder from {te_path}")
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -270,7 +279,16 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
             te_path, max_length=self.max_text_length, token=HF_TOKEN
         )
         text_encoder = Qwen3VLTextEncoder.load_model(
-            te_path, dtype=dtype, subfolder="", token=HF_TOKEN
+            te_path,
+            dtype=dtype,
+            subfolder="",
+            token=HF_TOKEN,
+            # the hub repo supplies the model config for the single-file
+            # comfy checkpoint (its own file carries no config json)
+            config_path=QWEN3_VL_PATH,
+            # stream the shards straight onto the gpu (no cpu staging) in
+            # as-shipped mode; low_vram parks the encoder on cpu the old way
+            aitk_device=None if self.model_config.low_vram else self.te_device_torch,
         )
         vl_processor = None
         if self.is_edit:
@@ -292,7 +310,13 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
         vae_path = self.model_config.model_kwargs.get("vae_path", QWEN_IMAGE_VAE_PATH)
         self.print_and_status_update(f"Loading Qwen-Image VAE from {vae_path}")
         vae = QwenImageVAE.load_model(
-            vae_path, dtype=self.vae_torch_dtype, token=HF_TOKEN
+            vae_path,
+            dtype=self.vae_torch_dtype,
+            token=HF_TOKEN,
+            # comfy single-file candidates resolve to the settings models
+            # path; as-shipped mode streams it straight onto the vae device
+            # (low_vram keeps the legacy cpu parking)
+            aitk_device=None if self.model_config.low_vram else self.vae_device_torch,
         )
         vae.eval()
         vae.requires_grad_(False)

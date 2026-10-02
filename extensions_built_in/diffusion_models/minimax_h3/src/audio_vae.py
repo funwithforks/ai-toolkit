@@ -423,6 +423,11 @@ class BigVGANDecoder(nn.Module):
 
 
 class MiniMaxH3AudioVAE(nn.Module, OstrisModelMixin):
+    aitk_comfy_repo = "Comfy-Org/MiniMax-H3"
+    aitk_comfy_weight_names = {
+        "Comfy-Org/MiniMax-H3": ["vae/minimax_h3_audio_vae_fp32.safetensors"],
+    }
+
     @classmethod
     def load_to_device(cls, file_path: str, device) -> "MiniMaxH3AudioVAE":
         """Stream the checkpoint straight onto ``device`` (no CPU weight
@@ -432,7 +437,8 @@ class MiniMaxH3AudioVAE(nn.Module, OstrisModelMixin):
         import time as _time
 
         from accelerate import init_empty_weights
-        from safetensors import safe_open
+
+        from toolkit.util.weight_source import WeightSource
 
         dev = torch.device(device)
         if dev.type == "cuda" and dev.index is None:
@@ -440,8 +446,7 @@ class MiniMaxH3AudioVAE(nn.Module, OstrisModelMixin):
         t0 = _time.perf_counter()
         with init_empty_weights(include_buffers=False):
             model = cls()
-        with safe_open(file_path, framework="pt", device=str(dev)) as f:
-            state = {k: f.get_tensor(k) for k in f.keys()}
+        state = WeightSource.open(file_path).materialize(dev)
         if any(k.endswith("weight_g") for k in state):
             state = fold_audio_vae_weight_norm(state)
         stats = {

@@ -548,6 +548,15 @@ class SingleStreamBlock(nn.Module):
 
 
 class SingleStreamDiT(nn.Module, OstrisModelMixin):
+    # krea2 checkpoint variants ship as single comfy repack files; which one
+    # a job uses is picked by the model's candidate filter (raw/turbo etc.)
+    aitk_comfy_repo = "Comfy-Org/Krea-2"
+    aitk_comfy_weight_names = {
+        "Comfy-Org/Krea-2": [
+            "diffusion_models/krea2_raw_int8_convrot.safetensors",
+        ],
+    }
+
     def get_offload_ignore_modules(self):
         # modulation modules hold tiny live state the offloader must not page
         return [
