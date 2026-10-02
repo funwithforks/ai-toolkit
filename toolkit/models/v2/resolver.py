@@ -100,6 +100,10 @@ def resolve_comfy_candidates(
     path = huggingface_hub.hf_hub_download(
         repo_id=repo_id, filename=best, token=hf_token, local_dir=MODELS_PATH
     )
+    if status_fn is not None:
+        # explicit sequence marker: the download is fully on disk before any
+        # loader touches the file (the load step is a later, separate call)
+        status_fn(f"Download complete: {local_rel} - safe to load")
     target = os.path.join(MODELS_PATH, local_rel)
     if os.path.abspath(path) != os.path.abspath(target):
         # move out of the packaging prefix into the shared comfy layout

@@ -651,6 +651,9 @@ class OstrisModelMixin:
     ):
         import time as _time
 
+        # sequencing guarantee: resolution (including any download) has fully
+        # completed before this read starts - the file is on disk, nothing
+        # downloads concurrently with a load
         _t0 = _time.perf_counter()
         if aitk_device is not None:
             # as-shipped straight-to-device: safetensors materializes every

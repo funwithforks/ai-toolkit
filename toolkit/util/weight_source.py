@@ -95,10 +95,21 @@ class WeightSource:
 
     def materialize(self, device) -> dict:
         """Read the whole file with every tensor on ``device``. 'cpu' is
-        exactly the old load_file() behavior."""
+        exactly the old load_file() behavior. For a gpu target: the rust
+        reader's own device path stages every tensor through host ram
+        (safetensors 0.9.x), piling up model-sized peak rss - so read to
+        cpu one tensor at a time and move immediately instead: peak ram is
+        the largest single tensor, never the model (the same guarantee
+        low_cpu_mem_usage gives from_pretrained)."""
         dev = self._canon(device)
-        with self._reader(dev) as f:
-            return {k: f.get_tensor(k) for k in f.keys()}
+        if dev.type == "cpu":
+            with self._reader(dev) as f:
+                return {k: f.get_tensor(k) for k in f.keys()}
+        out = {}
+        with self._reader("cpu") as f:
+            for k in f.keys():
+                out[k] = f.get_tensor(k).to(dev)
+        return out
 
     # -- internals ------------------------------------------------------
 
