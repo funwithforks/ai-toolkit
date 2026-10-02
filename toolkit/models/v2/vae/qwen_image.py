@@ -6,20 +6,17 @@ from .._mixin import OstrisModelMixin
 
 class QwenImageVAE(AutoencoderKLQwenImage, OstrisModelMixin):
     """The Qwen-Image (wan-style video) VAE, shared by the qwen_image family,
-    nucleus_image and krea2."""
+    nucleus_image and krea2.
+
+    Loading: diffusers-format sources only (the Qwen/Qwen-Image repo folder
+    or a local folder of the same layout). The comfy single-file repacks of
+    this vae ship in the wan-native module layout, which the diffusers
+    module tree cannot accept; models whose vae must come from a comfy file
+    declare the wan-layout-aware class instead (see AutoencoderKLQwenImage21
+    in the qwen_image_2 extension for the 2.1-shape one).
+    """
 
     aitk_subfolder = "vae"
-
-    # comfy repack is the preferred source: one bf16 file under the settings
-    # models path, streamed to device by the single-file loader. The raw
-    # diffusers repo remains available via the vae_path model_kwarg.
-    aitk_comfy_repo = "Comfy-Org/Qwen-Image-2.1"
-    _COMFY_FILES = ["vae/qwen_image_2.1_vae_bf16.safetensors"]
-    aitk_comfy_weight_names = {
-        ("Qwen/Qwen-Image", "vae"): _COMFY_FILES,
-        ("Comfy-Org/Qwen-Image-2.1", "vae"): _COMFY_FILES,
-        ("Qwen/Qwen-Image-2.1", "vae"): _COMFY_FILES,
-    }
 
 
 class QwenImageVAEHolderMixin:

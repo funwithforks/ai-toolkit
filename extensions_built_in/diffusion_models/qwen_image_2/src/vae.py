@@ -1113,58 +1113,6 @@ def _unpatchify(x, patch_size):
     return x
 
 
-# Comfy `<block>.residual.<n>` / `shortcut` -> the diffusers resnet submodule.
-_COMFY_RESNET_PARTS = {
-    "residual.0": "norm1",
-    "residual.2": "conv1",
-    "residual.3": "norm2",
-    "residual.6": "conv2",
-    "shortcut": "conv_shortcut",
-}
-# Comfy's `middle` Sequential is resnet, attention, resnet.
-_COMFY_MID_PARTS = {"0": "resnets.0", "1": "attentions.0", "2": "resnets.1"}
-
-
-def _comfy_resnet_suffix(inner: list) -> list:
-    """`residual.<n>.*` / `shortcut.*` -> the diffusers resnet submodule path."""
-    consumed = 2 if inner[0] == "residual" else 1
-    return [_COMFY_RESNET_PARTS[".".join(inner[:consumed])]] + inner[consumed:]
-
-
-def _comfy_vae_key(key: str) -> str:
-    """One ComfyUI VAE parameter name -> its diffusers name."""
-    parts = key.split(".")
-    # the quant convs sit at the checkpoint root
-    if parts[0] == "conv1":
-        return ".".join(["quant_conv"] + parts[1:])
-    if parts[0] == "conv2":
-        return ".".join(["post_quant_conv"] + parts[1:])
-
-    side, rest = parts[0], parts[1:]
-    if rest[0] == "conv1":
-        return ".".join([side, "conv_in"] + rest[1:])
-    if rest[0] == "head":
-        # head.0 is the output norm and head.2 the output conv (head.1 is SiLU)
-        tail = "norm_out" if rest[1] == "0" else "conv_out"
-        return ".".join([side, tail] + rest[2:])
-    if rest[0] == "middle":
-        part, inner = _COMFY_MID_PARTS[rest[1]], rest[2:]
-        if part.startswith("resnets"):
-            inner = _comfy_resnet_suffix(inner)
-        return ".".join([side, "mid_block", part] + inner)
-
-    # encoder.downsamples.<i>.downsamples.<j>.* / decoder.upsamples.<i>.upsamples.<j>.*
-    block = "down_blocks" if side == "encoder" else "up_blocks"
-    sampler = "downsampler" if side == "encoder" else "upsampler"
-    stage, inner_index, inner = rest[1], rest[3], rest[4:]
-    if inner[0] in ("resample", "time_conv"):
-        # the stage's last entry is the resampler, not a resnet
-        return ".".join([side, block, stage, sampler] + inner)
-    return ".".join(
-        [side, block, stage, "resnets", inner_index] + _comfy_resnet_suffix(inner)
-    )
-
-
 class AutoencoderKLQwenImage21(
     ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalModelMixin, OstrisModelMixin
 ):
@@ -1196,6 +1144,8 @@ class AutoencoderKLQwenImage21(
     aitk_comfy_weight_names = {
         "Comfy-Org/Qwen-Image-2.1": _COMFY_FILES,
         "Qwen/Qwen-Image-2.1": _COMFY_FILES,
+        # krea2 repacks the same VAE file in its own repo
+        "Comfy-Org/Krea-2": _COMFY_FILES,
     }
 
     @classmethod
@@ -1205,14 +1155,13 @@ class AutoencoderKLQwenImage21(
         Comfy runs this VAE through its Wan 2.2 stack with a temporal kernel of
         1, so every conv weight carries a size-1 depth axis the 2D modules here
         do not have; names differ throughout as well. Already-diffusers state
-        dicts pass through untouched.
-        """
-        if "encoder.conv1.weight" not in state_dict:
-            return state_dict
-        return {
-            _comfy_vae_key(key): (value.squeeze(2) if value.ndim == 5 else value)
-            for key, value in state_dict.items()
-        }
+        dicts pass through untouched. The mapping lives in the toolkit's vae
+        package (shared with every wan-layout comfy repack)."""
+        from toolkit.models.v2.vae.comfy_wan_layout import (
+            convert_comfy_wan_vae_state_dict,
+        )
+
+        return convert_comfy_wan_vae_state_dict(state_dict)
 
     @register_to_config
     def __init__(
