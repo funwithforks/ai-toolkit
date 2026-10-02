@@ -340,9 +340,12 @@ class ToolkitModuleMixin:
         # (out_features, batch) broadcast multiply below never runs.
         fold_batch = lora_input.dim() == 3 and not hasattr(self, 'scalar')
         # On convrot-int8 STE layers the up-projection itself folds into the
-        # dequant epilogue kernel: park the rank activation on the org module
-        # BEFORE its forward; it is consumed there (cleared) or left for the
-        # ordinary path below.
+        # dequant epilogue kernel: the rank activation and up weight are passed
+        # INTO the org forward (cr8_lora=) so the compiled/checked call has no
+        # attribute side channel. The predicate below must equal the wrapper's
+        # own fold gate (int8 GEMM branch of OstrisQuantizer.forward +
+        # _linear_ste's qdata/rank checks); disagreement raises there, it can
+        # never silently drop the LoRA term.
         epilogue_target = (
             fold_batch
             and self.__class__.__name__ == "LoRAModule"
@@ -360,18 +363,26 @@ class ToolkitModuleMixin:
             lora_output = res
 
         org_forwarded = None
+        cr8_fold = False
         if epilogue_target and is_rank and torch.is_tensor(lora_output):
             rank = lora_output.shape[-1]
+            om = self.org_module[0]
             if rank & (rank - 1) == 0 and rank <= 64:
-                om = self.org_module[0]
-                om._cr8_lora = (lora_output.reshape(-1, rank), self.lora_up.weight)
-                org_forwarded = self.org_forward(x_for_org, *args, **kwargs)
-                if om._cr8_lora is None:
-                    return org_forwarded
-                om._cr8_lora = None
+                from toolkit.util.convrot_quant import _int8_gemm_supported
+                cr8_fold = (
+                    getattr(om, "cr8_qdata", None) is not None
+                    and x_for_org.requires_grad
+                    and _int8_gemm_supported(x_for_org.device)
+                )
+        if cr8_fold:
+            return self.org_forward(
+                x_for_org,
+                *args,
+                cr8_lora=(lora_output.reshape(-1, rank), self.lora_up.weight),
+                **kwargs,
+            )
 
-        if org_forwarded is None:
-            org_forwarded = self.org_forward(x_for_org, *args, **kwargs)
+        org_forwarded = self.org_forward(x_for_org, *args, **kwargs)
 
         if not torch.is_tensor(lora_output):
             return org_forwarded + lora_output

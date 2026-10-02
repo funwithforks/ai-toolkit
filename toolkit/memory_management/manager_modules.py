@@ -788,14 +788,20 @@ class OstrisLinearLayerMemoryManager(BaseLayerMemoryManager):
             self._original_forward = getattr(self.module, "forward")
 
         def _mm_forward(x, *args, **kwargs):
-            # ensure we only use expected signature (Linear: x)
-            if args or kwargs:
+            # ensure we only use expected signature (Linear: x). cr8_lora is
+            # the network mixin's explicit epilogue-fold payload and IS part
+            # of the expected signature -- routing it past the staging fast
+            # path would silently fall back to the dequant matmul.
+            if (args or kwargs) and set(kwargs) - {"cr8_lora"}:
                 return self._original_forward(x, *args, **kwargs)
+            cr8_lora = kwargs.get("cr8_lora", None)
+            if args:
+                return self._original_forward(x, *args, cr8_lora=cr8_lora)
 
             module = self.module
             device = self.manager.process_device
             if device.type != "cuda":
-                return self._original_forward(x)
+                return self._original_forward(x, cr8_lora=cr8_lora)
 
             cpu_bufs = {
                 n: b
@@ -810,7 +816,7 @@ class OstrisLinearLayerMemoryManager(BaseLayerMemoryManager):
             )
             if not cpu_bufs and bias_cpu is None:
                 # already resident on device
-                return self._original_forward(x)
+                return self._original_forward(x, cr8_lora=cr8_lora)
 
             if x.device != device:
                 # cpu activations from a fully-offloaded pipeline: see
@@ -861,7 +867,7 @@ class OstrisLinearLayerMemoryManager(BaseLayerMemoryManager):
                 if gpu_bias is not None:
                     bias.data = gpu_bias
                 try:
-                    out = self._original_forward(x)
+                    out = self._original_forward(x, cr8_lora=cr8_lora)
                 finally:
                     for n, t in cpu_bufs.items():
                         module._buffers[n] = t
