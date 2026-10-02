@@ -43,22 +43,10 @@ from .kernels import fused_sdpa as _fused_sdpa
 # the bf16 stack (was a slight loss on the old fp32 path). ON by default;
 # set KREA2_LIGER_FUSIONS=0 to restore the eager chains (e.g. to compare
 # a checkpoint's samples side by side).
-_LIGER_OK = os.environ.get("KREA2_LIGER_FUSIONS", "1") != "0"
-_liger_rms_norm = _liger_swiglu = _LigerModNorm = None
-if _LIGER_OK:
-    try:
-        from liger_kernel.functional import rms_norm as _liger_rms_norm
-        from liger_kernel.functional import swiglu as _liger_swiglu
-        from liger_kernel.ops.modulated_rms_norm import (
-            LigerModulatedRMSNormFunction as _LigerModNorm,
-        )
-    except Exception as _e:
-        print(
-            f"[krea2] liger fusions enabled but bindings failed ({_e}); "
-            f"falling back to eager elementwise chains"
-        )
-        _liger_rms_norm = _liger_swiglu = _LigerModNorm = None
-
+from toolkit.util.liger_fusions import LIGER_OK as _LIGER_OK
+from toolkit.util.liger_fusions import LigerModNorm as _LigerModNorm
+from toolkit.util.liger_fusions import liger_rms_norm as _liger_rms_norm
+from toolkit.util.liger_fusions import liger_swiglu as _liger_swiglu
 
 def _mod_norm(norm: "RMSNorm", x: Tensor, scale: Tensor, shift: Tensor) -> Tensor:
     """(1 + scale) * norm(x) + shift -- fused when liger is available."""
