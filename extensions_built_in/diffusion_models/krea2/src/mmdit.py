@@ -780,7 +780,15 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
 
         freqs = self.posemb(pos)
 
-        _ck_stride = int(os.environ.get("KREA2_CKPT_STRIDE", "4"))
+        if getattr(self, "_ck_stride", None) is None:
+            # resolved once: model_kwargs ckpt_stride (set by the loader)
+            # wins over the env; keeps the stride a graph constant under
+            # block compile
+            _v = getattr(self, "ckpt_stride", None)
+            self._ck_stride = int(
+                _v if _v is not None else os.environ.get("KREA2_CKPT_STRIDE", "4")
+            )
+        _ck_stride = self._ck_stride
         for _bidx, (block, blockkv) in enumerate(zip(self.blocks, blockcaches)):
             # hybrid schedule: 1 block in every KREA2_CKPT_STRIDE runs
             # WITHOUT checkpointing (its activations stay resident, its
