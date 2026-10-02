@@ -235,6 +235,14 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
         # stack; ~3x faster upstream-gradient GEMMs that run on int8
         # tensor cores instead of dequantizing to bf16). Disable with
         # model_kwargs {int8_bwd: false}.
+        # VRAM budget knob for the hybrid checkpoint schedule: 1 block in
+        # every ckpt_stride stays resident (no recompute). Higher-res runs
+        # have bigger block activations and want a smaller stride; lower the
+        # number (or 0 = checkpoint nothing) if the step OOMs at the
+        # resident block. Default 4 (KREA2_CKPT_STRIDE env still honoured).
+        _st = self.model_config.model_kwargs.get("ckpt_stride", None)
+        if _st is not None:
+            transformer.ckpt_stride = int(_st)
         if self.model_config.model_kwargs.get("int8_bwd", True):
             n = 0
             for m in transformer.modules():
