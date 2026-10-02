@@ -108,6 +108,9 @@ def attention(
     mask: Tensor | None = None,
     scale: float | None = None,
     gqa: bool = False,
+    q_lens: Tensor | None = None,
+    kv_lens: Tensor | None = None,
+    lens_host: list | None = None,
 ) -> Tensor:
     # cuDNN attention is NVIDIA-only, so hardcoding SDPBackend.CUDNN_ATTENTION
     # raises "No available kernel" on non-NVIDIA backends (AMD ROCm, Intel XPU,
@@ -118,8 +121,17 @@ def attention(
     if mask is None:
         # sm120-native FROST fwd+bwd (torch's bwd is an sm80 WMMA kernel on
         # consumer Blackwell); falls back to the backend list below when the
-        # frontend/engine is unavailable or rejects the shape.
-        x = _fused_sdpa(q, k, v, scale if scale is not None else q.shape[-1] ** -0.5)
+        # frontend/engine is unavailable or rejects the shape. q_lens/kv_lens
+        # carry the packed ragged layout (see SingleStreamDiT.forward).
+        x = _fused_sdpa(
+            q,
+            k,
+            v,
+            scale if scale is not None else q.shape[-1] ** -0.5,
+            q_lens=q_lens,
+            kv_lens=kv_lens,
+            lens_cpu=lens_host,
+        )
         if x is not None:
             return rearrange(x, "B H L D -> B L (H D)")
     with sdpa_kernel(
@@ -312,6 +324,9 @@ class Attention(torch.nn.Module):
         ref_span: tuple[int, int] | None = None,
         kv_capture: list | None = None,
         kv_cache: tuple[Tensor, Tensor] | None = None,
+        q_lens: Tensor | None = None,
+        kv_lens: Tensor | None = None,
+        lens_host: list | None = None,
     ) -> Tensor:
         q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
 
@@ -338,7 +353,19 @@ class Attention(torch.nn.Module):
             # Cached ref K/V are already RoPE'd at their original positions.
             k = torch.cat((k, kv_cache[0]), dim=2)
             v = torch.cat((v, kv_cache[1]), dim=2)
-        out = self.wo(attention(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate))
+        out = self.wo(
+            attention(
+                q,
+                k,
+                v,
+                mask=mask,
+                gqa=self.gqa,
+                q_lens=q_lens,
+                kv_lens=kv_lens,
+                lens_host=lens_host,
+            )
+            * F.sigmoid(gate)
+        )
 
         return out
 
@@ -449,8 +476,18 @@ class SingleStreamBlock(nn.Module):
         ref_span: tuple[int, int] | None = None,
         kv_capture: list | None = None,
         kv_cache: tuple[Tensor, Tensor] | None = None,
+        q_lens: Tensor | None = None,
+        kv_lens: Tensor | None = None,
+        lens_host: list | None = None,
     ) -> Tensor:
-        attn_kwargs = dict(ref_span=ref_span, kv_capture=kv_capture, kv_cache=kv_cache)
+        attn_kwargs = dict(
+            ref_span=ref_span,
+            kv_capture=kv_capture,
+            kv_cache=kv_cache,
+            q_lens=q_lens,
+            kv_lens=kv_lens,
+            lens_host=lens_host,
+        )
         # ``vec`` is the (B, 1, 6*features) modulation input, or a tuple
         # ``(vec, refvec, split)`` for reference-image conditioning: tokens
         # ``[:split]`` (text + noisy image) are modulated with ``vec`` while
@@ -624,6 +661,61 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             mask = F.pad(mask, (0, _padlen), value=False)
             pos = F.pad(pos, (0, 0, 0, _padlen))
 
+        # Packed ragged layout for the stream blocks. A key-padding mask with
+        # invalid slots in the MIDDLE of the sequence (caption padding) forces
+        # masked attention -- torch's masked backward is an sm80 WMMA kernel on
+        # consumer Blackwell and FROST (sm120 fwd+bwd) refuses any mask. When
+        # the holes are exactly "text-tail padding" (valid text prefix, full
+        # image span, alignment pad at the end) we can stably reorder every
+        # sample valid-first: the invalid slots become a suffix and the layout
+        # is expressible as per-sample sequence lengths, which FROST supports
+        # natively. The reorder is exact attention math (masked keys were never
+        # attended; excluded query rows are padding slots sliced off the loss).
+        # Both checks stay provable-on-GPU: anything else keeps the mask path.
+        packed = False
+        perm = seq_lens = seq_lens_host = None
+        if (
+            mask is not None
+            and not trivial_mask
+            and os.environ.get("KREA2_PACKED_ATTN", "1") == "1"
+            and reflen == 0
+            and not isolate_refs
+            and ref_kv_capture is None
+            and ref_kv_cache is None
+        ):
+            _txt = mask[:, :txtlen]
+            _valid_after_hole = (((~_txt).cumsum(1) > 0) & _txt).any()
+            _img_full = mask[:, txtlen : txtlen + imglen].all()
+            if not bool(_valid_after_hole) and bool(_img_full):
+                perm = (~mask).to(torch.uint8).argsort(dim=1, stable=True)
+                combined = torch.gather(
+                    combined, 1, perm.unsqueeze(-1).expand(-1, -1, combined.shape[-1])
+                )
+                pos = torch.gather(
+                    pos, 1, perm.unsqueeze(-1).expand(-1, -1, pos.shape[-1])
+                )
+                seq_lens = mask.sum(1).to(torch.int32)
+                # one host sync at the top of forward; the attention kernels
+                # must never .cpu() per call (pipeline drain per block)
+                seq_lens_host = seq_lens.detach().cpu().tolist()
+                # keep excluded rows finite (bias-level) for any downstream
+                # row-local math; attention never reads them
+                _pv = torch.gather(
+                    mask.unsqueeze(-1),
+                    1,
+                    perm.unsqueeze(-1).expand(-1, -1, 1),
+                )
+                combined = combined * _pv
+                mask = None
+                packed = True
+                if not getattr(self, "_pack_notice", False):
+                    self._pack_notice = True
+                    print(
+                        "[mmdit] packed ragged attention active: caption-pad "
+                        "slots reordered past the live span, FROST seq_lens "
+                        "keep them out of softmax (KREA2_PACKED_ATTN=0 disables)"
+                    )
+
         blockvec = tvec
         if reflen > 0:
             # The last ``reflen`` image tokens are clean reference tokens: they
@@ -642,7 +734,7 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             blockvec = (tvec, self.tproj(t0), txtlen + imglen - reflen)
 
         padmask = mask  # (B, L) key-padding mask, incl. the 256-alignment pad
-        if trivial_mask and _padlen == 0:
+        if packed or (trivial_mask and _padlen == 0):
             mask = None
         else:
             mask = _mask(mask)
@@ -683,7 +775,7 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
 
         freqs = self.posemb(pos)
 
-        _ck_stride = int(os.environ.get("KREA2_CKPT_STRIDE", "1"))
+        _ck_stride = int(os.environ.get("KREA2_CKPT_STRIDE", "4"))
         for _bidx, (block, blockkv) in enumerate(zip(self.blocks, blockcaches)):
             # hybrid schedule: every KREA2_CKPT_STRIDE-th block runs WITHOUT
             # checkpointing (its activations stay resident, its forward GEMMs
@@ -691,6 +783,7 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             _do_ckpt = (
                 self.gradient_checkpointing
                 and torch.is_grad_enabled()
+                and _ck_stride != 0
                 and (_ck_stride <= 1 or _bidx % _ck_stride != _ck_stride - 1)
             )
             if _do_ckpt:
@@ -701,6 +794,9 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
                     freqs,
                     mask,
                     use_reentrant=False,
+                    q_lens=seq_lens,
+                    kv_lens=seq_lens,
+                    lens_host=seq_lens_host,
                 )
             else:
                 combined = block(
@@ -711,7 +807,21 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
                     ref_span=ref_span,
                     kv_capture=ref_kv_capture,
                     kv_cache=blockkv,
+                    q_lens=seq_lens,
+                    kv_lens=seq_lens,
+                    lens_host=seq_lens_host,
                 )
+
+        if packed:
+            _inv = torch.empty_like(perm)
+            _inv.scatter_(
+                1,
+                perm,
+                torch.arange(perm.shape[1], device=perm.device).expand(perm.shape),
+            )
+            combined = torch.gather(
+                combined, 1, _inv.unsqueeze(-1).expand(-1, -1, combined.shape[-1])
+            )
 
         final = self.last(combined, t)
         output = final[:, txtlen : txtlen + imglen - reflen, :]
