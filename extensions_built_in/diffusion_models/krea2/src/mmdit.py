@@ -134,6 +134,14 @@ def attention(
         )
         if x is not None:
             return rearrange(x, "B H L D -> B L (H D)")
+        if q_lens is not None or kv_lens is not None:
+            # the callers of the ragged path DROPPED the mask on the promise
+            # FROST excludes the tail; the SDPA fallback below attends to it.
+            raise RuntimeError(
+                "ragged (packed) attention requested but FROST sdpa is "
+                "unavailable for this shape/backend; run with "
+                "KREA2_PACKED_ATTN=0 and KREA2_FROST_SDPA=0 (fully masked path)"
+            )
     with sdpa_kernel(
         [
             SDPBackend.CUDNN_ATTENTION,
@@ -399,8 +407,17 @@ class TextFusionBlock(torch.nn.Module):
         self.attn = Attention(dim=features, heads=heads, bias=bias, kvheads=kvheads)
         self.mlp = SwiGLU(features, multiplier, bias)
 
-    def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
-        x = x + self.attn(self.prenorm(x), mask=mask)
+    def forward(
+        self,
+        x: Tensor,
+        mask: Tensor | None = None,
+        seq_lens: Tensor | None = None,
+        lens_host: list | None = None,
+    ) -> Tensor:
+        x = x + self.attn(
+            self.prenorm(x), mask=mask, q_lens=seq_lens, kv_lens=seq_lens,
+            lens_host=lens_host,
+        )
         x = x + self.mlp(self.postnorm(x))
 
         return x
@@ -433,7 +450,13 @@ class TextFusionTransformer(torch.nn.Module):
             ]
         )
 
-    def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        mask: Tensor | None = None,
+        seq_lens: Tensor | None = None,
+        lens_host: list | None = None,
+    ) -> Tensor:
         b, l, n, d = x.shape
         x = x.reshape(b * l, n, d)
         for block in self.layerwise_blocks:
@@ -446,7 +469,7 @@ class TextFusionTransformer(torch.nn.Module):
         x = x.reshape(b, l, d)
 
         for block in self.refiner_blocks:
-            x = block(x, mask=mask)
+            x = block(x, mask=mask, seq_lens=seq_lens, lens_host=lens_host)
 
         return x
 
@@ -650,9 +673,26 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             and bool(mask.all())
         )
 
-        txtmask = None if trivial_mask else _mask(mask[:, : context.shape[1]])
+        # Text-fusion attention: the text span mask is normally "valid
+        # prefix + tail padding" (right-padded captions). When that layout is
+        # provable, express it as per-sample lengths and run the SAME
+        # sm120-native FROST path the stream blocks use -- the broadcast
+        # (B,1,L,L) mask forces torch's masked backward, an sm80 WMMA kernel
+        # on consumer Blackwell. Any other layout keeps the exact mask path.
+        txtmask = None
+        txt_lens = txt_lens_host = None
+        if mask is not None and not trivial_mask:
+            _t = mask[:, : context.shape[1]]
+            _holes = (((~_t).cumsum(1) > 0) & _t).any()
+            if not bool(_holes):
+                txt_lens = _t.sum(1).to(torch.int32)
+                txt_lens_host = txt_lens.tolist()
+            else:
+                txtmask = _mask(_t)
 
-        context = self.txtfusion(context, mask=txtmask)
+        context = self.txtfusion(
+            context, mask=txtmask, seq_lens=txt_lens, lens_host=txt_lens_host
+        )
         context = self.txtmlp(context)
 
         txtlen, imglen = context.shape[1], img.shape[1]
