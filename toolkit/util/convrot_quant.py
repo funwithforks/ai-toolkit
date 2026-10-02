@@ -84,6 +84,11 @@ _skip_warned = set()
 
 
 def _cached(cache, key, build):
+    if torch.compiler.is_compiling():
+        # a build traced under fake mode would be cached AS A FAKE and mix
+        # modes on the next trace; inside a compiled region these are
+        # constants and inductor CSEs them across the graph anyway
+        return build()
     if key not in cache:
         cache[key] = build()
     return cache[key]
@@ -1123,13 +1128,13 @@ def _int8_linear_ste_backward(ctx, grad):
             gq, g_s = _int8_act_quant_padded(grad * w_scales, ctx.act_qmax)
             i32 = torch._int_mm(gq, qdata)
             m = grad.shape[0]
-            key = (qdata.shape[1], grad.device)
-            ones = _int8_bwd_ones.get(key)
-            if ones is None:
-                ones = torch.ones(
+            ones = _cached(
+                _int8_bwd_ones,
+                (qdata.shape[1], grad.device),
+                lambda: torch.ones(
                     qdata.shape[1], device=grad.device, dtype=torch.float32
-                )
-                _int8_bwd_ones[key] = ones
+                ),
+            )
             dx = _int8_epilogue(i32[:m], g_s[:m], ones, None, grad.dtype)
             return dx, None, None, None, None, None, None, d_r, d_u
         global _int8_bwd_warned
