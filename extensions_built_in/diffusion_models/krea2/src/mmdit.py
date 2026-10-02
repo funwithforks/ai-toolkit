@@ -275,16 +275,6 @@ class RMSNorm(torch.nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        if _liger_rms_norm is not None and x.is_cuda:
-            return _liger_rms_norm(
-                x,
-                self.scale,
-                eps=self.eps,
-                offset=1.0,
-                casting_mode="llama",
-                in_place=False,
-                impl="nvidia-triton",
-            )
         t, dtype = x.float(), x.dtype
         t = F.rms_norm(
             t, (self.features,), eps=self.eps, weight=(self.scale.float() + 1.0)
@@ -638,7 +628,6 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
         isolate_refs: bool = False,
         ref_kv_capture: list | None = None,
         ref_kv_cache: tuple[list, Tensor] | None = None,
-        mask_host: Tensor | None = None,
     ) -> Tensor:
         img = self.first(img)
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
@@ -652,27 +641,13 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
         # The single .all() check costs one small reduction + sync per pass;
         # it MUST stay exact — a wrong hit here would let padded keys leak into
         # real tokens, so only provably all-valid layouts take the fast path.
-        # trivial / packed layout decisions. mask_host (host copy of `mask`,
-        # free at the training call site -- the mask is built from host
-        # caption lengths) lets the three provable-on-GPU checks run with NO
-        # host sync: on the device path each bool() drains the pipeline
-        # before the first block. mask_host must mirror `mask` exactly
-        # (text | image | alignment-pad layout); every consumer that uses it
-        # falls back to the device checks when it is absent (inference).
-        # the caller hands the UNPADDED (text | image) host mask; the shape
-        # is validated after the alignment-pad below mirrors it
-        _host_ok = mask_host is not None and mask is not None
         trivial_mask = (
             mask is not None
             and reflen == 0
             and not isolate_refs
             and ref_kv_capture is None
             and ref_kv_cache is None
-            and (
-                bool(mask_host.all())
-                if _host_ok
-                else bool(mask.all())
-            )
+            and bool(mask.all())
         )
 
         txtmask = None if trivial_mask else _mask(mask[:, : context.shape[1]])
@@ -690,15 +665,6 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             combined = F.pad(combined, (0, 0, 0, _padlen))
             mask = F.pad(mask, (0, _padlen), value=False)
             pos = F.pad(pos, (0, 0, 0, _padlen))
-        if _host_ok and mask_host.shape != mask.shape:
-            if (
-                mask_host.dim() == 2
-                and mask_host.shape[0] == mask.shape[0]
-                and mask_host.shape[1] <= mask.shape[1]
-            ):
-                mask_host = F.pad(mask_host, (0, mask.shape[1] - mask_host.shape[1]), value=0)
-            else:
-                _host_ok = False
 
         # Packed ragged layout for the stream blocks. A key-padding mask with
         # invalid slots in the MIDDLE of the sequence (caption padding) forces
@@ -722,81 +688,38 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             and ref_kv_capture is None
             and ref_kv_cache is None
         ):
-            _perm_h = None
-            _lens_h = None
-            if _host_ok and bool(mask_host.is_contiguous()):
-                if bool((mask_host < 0).any()):
-                    _host_ok = False
-            if _host_ok:
-                # host-side provability check (same predicate as the device
-                # path below, evaluated without any GPU round-trip)
-                _mh = mask_host
-                _txt_h = _mh[:, :txtlen]
-                _holes = (_txt_h <= 0).cumsum(1) > 0
-                if (
-                    ~bool((_holes & (_txt_h > 0)).any())
-                    and bool((_mh[:, txtlen:txtlen + imglen] > 0).all())
-                ):
-                    _lens_h = (_mh > 0).sum(1)
-                    _perm_h = torch.sort(
-                        (~(_mh > 0)).to(torch.uint8), dim=1, stable=True
-                    ).indices.to(torch.int64)
-            if _perm_h is not None:
-                perm = _perm_h.to(img.device, non_blocking=True)
-                seq_lens_host = _lens_h.to(torch.int32).tolist()
-                seq_lens = _lens_h.to(torch.int32).to(
-                    img.device, non_blocking=True
-                )
+            _txt = mask[:, :txtlen]
+            _valid_after_hole = (((~_txt).cumsum(1) > 0) & _txt).any()
+            _img_full = mask[:, txtlen : txtlen + imglen].all()
+            if not bool(_valid_after_hole) and bool(_img_full):
+                perm = (~mask).to(torch.uint8).argsort(dim=1, stable=True)
                 combined = torch.gather(
                     combined, 1, perm.unsqueeze(-1).expand(-1, -1, combined.shape[-1])
                 )
                 pos = torch.gather(
                     pos, 1, perm.unsqueeze(-1).expand(-1, -1, pos.shape[-1])
                 )
+                seq_lens = mask.sum(1).to(torch.int32)
+                # one host sync at the top of forward; the attention kernels
+                # must never .cpu() per call (pipeline drain per block)
+                seq_lens_host = seq_lens.detach().cpu().tolist()
                 # keep excluded rows finite (bias-level) for any downstream
                 # row-local math; attention never reads them
                 _pv = torch.gather(
-                    (_mh > 0).to(img.dtype).unsqueeze(-1),
+                    mask.unsqueeze(-1),
                     1,
-                    _perm_h.unsqueeze(-1).expand(-1, -1, 1),
-                ).to(img.device)
+                    perm.unsqueeze(-1).expand(-1, -1, 1),
+                )
                 combined = combined * _pv
                 mask = None
                 packed = True
-            else:
-                _txt = mask[:, :txtlen]
-                _valid_after_hole = (((~_txt).cumsum(1) > 0) & _txt).any()
-                _img_full = mask[:, txtlen : txtlen + imglen].all()
-                if not bool(_valid_after_hole) and bool(_img_full):
-                    perm = (~mask).to(torch.uint8).argsort(dim=1, stable=True)
-                    combined = torch.gather(
-                        combined, 1, perm.unsqueeze(-1).expand(-1, -1, combined.shape[-1])
+                if not getattr(self, "_pack_notice", False):
+                    self._pack_notice = True
+                    print(
+                        "[mmdit] packed ragged attention active: caption-pad "
+                        "slots reordered past the live span, FROST seq_lens "
+                        "keep them out of softmax (KREA2_PACKED_ATTN=0 disables)"
                     )
-                    pos = torch.gather(
-                        pos, 1, perm.unsqueeze(-1).expand(-1, -1, pos.shape[-1])
-                    )
-                    seq_lens = mask.sum(1).to(torch.int32)
-                    # one host sync at the top of forward; the attention
-                    # kernels must never .cpu() per call (pipeline drain per
-                    # block)
-                    seq_lens_host = seq_lens.detach().cpu().tolist()
-                    # keep excluded rows finite (bias-level) for any
-                    # downstream row-local math; attention never reads them
-                    _pv = torch.gather(
-                        mask.unsqueeze(-1),
-                        1,
-                        perm.unsqueeze(-1).expand(-1, -1, 1),
-                    )
-                    combined = combined * _pv
-                    mask = None
-                    packed = True
-            if packed and not getattr(self, "_pack_notice", False):
-                self._pack_notice = True
-                print(
-                    "[mmdit] packed ragged attention active: caption-pad "
-                    "slots reordered past the live span, FROST seq_lens "
-                    "keep them out of softmax (KREA2_PACKED_ATTN=0 disables)"
-                )
 
         blockvec = tvec
         if reflen > 0:
@@ -861,8 +784,8 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
         for _bidx, (block, blockkv) in enumerate(zip(self.blocks, blockcaches)):
             # hybrid schedule: 1 block in every KREA2_CKPT_STRIDE runs
             # WITHOUT checkpointing (its activations stay resident, its
-            # forward GEMMs stop being recomputed in backward); with stride 4
-            # that is 3 checkpointed + 1 resident per group. VRAM is the
+            # forward GEMMs stop being recomputed in backward); with stride
+            # 4 that is 3 checkpointed + 1 resident per group. VRAM is the
             # budget knob.
             _do_ckpt = (
                 self.gradient_checkpointing

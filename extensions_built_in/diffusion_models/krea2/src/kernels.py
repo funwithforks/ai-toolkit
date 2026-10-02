@@ -181,31 +181,17 @@ _frost_notice = False
 
 if _FROST_OK:
 
-    _mask_cache: dict = {}
-
-    def _beyond_mask(lens_cpu, n_rows, device):
-        # one broadcast mask replaces a per-sample fill loop: the python
-        # loop costs B launches per tensor (~450/step at bs=4 x 28 blocks
-        # x 4 tensors); this costs one compare + one masked fill
-        key = (tuple(lens_cpu), n_rows, str(device))
-        m = _mask_cache.get(key)
-        if m is None:
-            if len(_mask_cache) > 32:
-                _mask_cache.clear()
-            idx = torch.arange(n_rows, device=device)
-            m = idx.unsqueeze(0) >= torch.tensor(
-                list(lens_cpu), device=device
-            ).unsqueeze(1)
-            _mask_cache[key] = m
-        return m
-
     def _zero_rows_beyond(t, lens_cpu):
         # Ragged mode leaves rows at/beyond seq_len untouched (outputs are
         # torch.empty); a NaN bit pattern there poisons backward through
         # 0 * NaN. Zero the excluded rows of every tensor deterministically.
-        m = _beyond_mask(lens_cpu, t.shape[2], t.device)
-        if bool(m.any()):
-            t.masked_fill_(m.view(-1, 1, m.shape[1], 1), 0.0)
+        # (A single broadcast masked_fill over the whole tensor was tried:
+        # it trades ~B tail writes for a full-tensor pass x 112 tensors/step
+        # and measured slower. Keep the small per-sample fills.)
+        n_rows = t.shape[2]
+        for b, n in enumerate(lens_cpu):
+            if n < n_rows:
+                t[b, :, n:] = 0
 
     class _FrostSdpa(torch.autograd.Function):
         @staticmethod

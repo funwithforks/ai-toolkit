@@ -621,15 +621,6 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
         context, text_mask = pad_text_features(
             text_embeddings.text_embeds, self.device_torch, self.torch_dtype
         )
-        # host copy of the caption mask: it is built from per-sample host
-        # lengths, so mirroring it costs nothing and lets the mmdit layout
-        # decisions (trivial mask / packed ragged) skip three pipeline
-        # drains per forward on the training path
-        _lens = [f.shape[0] for f in text_embeddings.text_embeds]
-        _ml = max(_lens)
-        text_mask_host = torch.zeros(len(_lens), _ml, dtype=torch.long)
-        for _i, _ln in enumerate(_lens):
-            text_mask_host[_i, :_ln] = 1
 
         pred = predict_velocity(
             self.transformer,
@@ -639,7 +630,6 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
             text_mask,
             ref_latents=ref_latents,
             isolate_refs=self.kv_cache,
-            mask_host=text_mask_host,
         )
         return pred
 
