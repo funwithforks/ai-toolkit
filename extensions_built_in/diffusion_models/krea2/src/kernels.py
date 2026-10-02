@@ -7,13 +7,6 @@
   store in both paths, so the fused kernel is bitwise identical while
   deleting the up/downcast copies and the separate mul/add/neg launches
   on the step's biggest non-GEMM tensors.
-
-* gated_residual: ``x + m * y`` with m the block modulation gate
-  broadcast (B,1,F). Eager computes bf16 mul then bf16 add (two round-
-  ings, one temporary round-trip through DRAM); the fused kernel keeps
-  fp32 and rounds once at the store. NOT bitwise identical (<=1 bf16
-  ulp on the sum): default OFF behind KREA2_GATED_RESIDUAL_FUSION=1
-  pending a ComfyUI sample check.
 """
 
 from __future__ import annotations
@@ -96,87 +89,6 @@ if _HAS_TRITON:
             (freq,) = ctx.saved_tensors
             return _rope_launch(dy.contiguous(), freq, -1), None
 
-    @triton.jit
-    def _gated_residual_kernel(
-        x_ptr, y_ptr, m_ptr, o_ptr,
-        n, LF, F,
-        BLOCK: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < n
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        y = tl.load(y_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        b = offs // LF
-        fcol = offs % F
-        m = tl.load(m_ptr + b * F + fcol, mask=mask, other=0.0).to(tl.float32)
-        tl.store(o_ptr + offs, (x + m * y).to(o_ptr.dtype.element_ty), mask=mask)
-
-    @triton.jit
-    def _gated_residual_bwd_kernel(
-        g_ptr, y_ptr, m_ptr, dx_ptr, dy_ptr, dm_ptr,
-        n, LF, F, has_m,
-        BLOCK: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < n
-        g = tl.load(g_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        y = tl.load(y_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        b = offs // LF
-        fcol = offs % F
-        m = tl.load(m_ptr + b * F + fcol, mask=mask, other=0.0).to(tl.float32)
-        tl.store(dx_ptr + offs, g.to(dx_ptr.dtype.element_ty), mask=mask)
-        tl.store(dy_ptr + offs, (g * m).to(dy_ptr.dtype.element_ty), mask=mask)
-        if has_m:
-            tl.atomic_add(dm_ptr + b * F + fcol, g * y)
-
-    class _GatedResidual(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, x, y, m):
-            # x, y: (B, L, F) same-shape; m: (B, 1, F) broadcast gate
-            out = torch.empty_like(x)
-            bf, lf = m.shape[0] * m.shape[2], x.shape[-2] * x.shape[-1]
-            n = x.numel()
-            BLOCK = 512
-            grid = (triton.cdiv(n, BLOCK),)
-            _gated_residual_kernel[grid](
-                x, y, m, out, n, lf, x.shape[-1], BLOCK=BLOCK, num_warps=4,
-            )
-            ctx.save_for_backward(y, m)
-            ctx.x_requires = x.requires_grad
-            ctx.y_requires = y.requires_grad
-            ctx.m_requires = m.requires_grad
-            ctx.lf = lf
-            return out
-
-        @staticmethod
-        def backward(ctx, dout):
-            y, m = ctx.saved_tensors
-            dout = dout.contiguous()
-            dx = torch.empty_like(dout)
-            dy = torch.empty_like(dout) if ctx.y_requires else None
-            dm = (
-                torch.zeros(m.shape, dtype=torch.float32, device=dout.device)
-                if ctx.m_requires else None
-            )
-            n = dout.numel()
-            BLOCK = 512
-            grid = (triton.cdiv(n, BLOCK),)
-            _gated_residual_bwd_kernel[grid](
-                dout, y, m, dx,
-                dy if ctx.y_requires else dout,
-                dm if ctx.m_requires else dout,
-                n, ctx.lf, dout.shape[-1], ctx.m_requires,
-                BLOCK=BLOCK, num_warps=4,
-            )
-            return (
-                dx if ctx.x_requires else None,
-                dy,
-                dm.to(m.dtype) if ctx.m_requires else None,
-            )
-
-
 _TRITON_OK = _HAS_TRITON and torch.cuda.is_available()
 _ROPE_FUSE = _TRITON_OK
 
@@ -187,12 +99,18 @@ _ROPE_FUSE = _TRITON_OK
 # numerics are the standard cudnn bwd class (non-deterministic two-kernel
 # dQK route, bf16 grad rel noise <= ~1e-2 vs the sm80 path on real shapes).
 # Default ON when available; KREA2_FROST_SDPA=0 restores plain torch SDPA.
-os.environ.setdefault("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-from cudnn.sdpa.bwd import sdpa_bwd_wrapper_dsl_sm120 as _frost_bwd
-from cudnn.sdpa.fwd import sdpa_fwd_wrapper_dsl_sm120 as _frost_fwd
-
 _FROST_OK = os.environ.get("KREA2_FROST_SDPA", "1") != "0"
-_GATED_FUSE = _TRITON_OK and os.environ.get("KREA2_GATED_RESIDUAL_FUSION", "0") == "1"
+if _FROST_OK:
+    try:
+        os.environ.setdefault("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+        from cudnn.sdpa.bwd import sdpa_bwd_wrapper_dsl_sm120 as _frost_bwd
+        from cudnn.sdpa.fwd import sdpa_fwd_wrapper_dsl_sm120 as _frost_fwd
+    except Exception as _frost_e:
+        _FROST_OK = False
+        print(
+            f"[krea2] FROST sm120 attention package unavailable ({_frost_e}); "
+            f"falling back to torch SDPA"
+        )
 
 _warned: set = set()
 
@@ -255,42 +173,6 @@ def fused_ropeapply(xq, xk, freqs):
         return None
 
 
-def fused_gated_residual(x, y, m):
-    """Fused x + m*y ((B,1,F) gate); None if unavailable.
-
-    NOT wired into the model: enabled under gradient checkpointing it
-    OOMed at batch 4 (save_for_backward(y) retains each block's output
-    activation through the no-grad pass; the eager chain lets the
-    checkpoint machinery reclaim it). A checkpoint-aware rewrite (e.g.
-    recomputing m*y from cheaper saved tensors) must land before the
-    wiring is reinstated.
-    """
-    if not _GATED_FUSE or not x.is_cuda:
-        return None
-    if (
-        x.shape != y.shape or x.dtype != y.dtype
-        or not x.is_contiguous() or not y.is_contiguous()
-        or m.shape[0] != x.shape[0] or m.shape[-1] != x.shape[-1]
-        or x.shape[-1] % 8 != 0
-    ):
-        _report_missing(
-            "gated_residual_fusion",
-            f"unsupported layout: x {tuple(x.shape)} {x.dtype} contig={x.is_contiguous()}, "
-            f"y {tuple(y.shape)} {y.dtype}, m {tuple(m.shape)} {m.dtype}",
-        )
-        return None
-    try:
-        return _GatedResidual.apply(x, y, m)
-    except Exception as e:
-        _reraise_if_stop_recompute(e)
-        _report_missing(
-            "gated_residual_fusion",
-            f"launch failed for {tuple(x.shape)} {x.dtype} m{tuple(m.shape)}: "
-            f"{type(e).__name__}: {e}",
-        )
-        return None
-
-
 # --------------------------------------------------------------------------
 # FROST sm120 SDPA (cudnn-frontend DSL kernels)
 # --------------------------------------------------------------------------
@@ -299,14 +181,31 @@ _frost_notice = False
 
 if _FROST_OK:
 
+    _mask_cache: dict = {}
+
+    def _beyond_mask(lens_cpu, n_rows, device):
+        # one broadcast mask replaces a per-sample fill loop: the python
+        # loop costs B launches per tensor (~450/step at bs=4 x 28 blocks
+        # x 4 tensors); this costs one compare + one masked fill
+        key = (tuple(lens_cpu), n_rows, str(device))
+        m = _mask_cache.get(key)
+        if m is None:
+            if len(_mask_cache) > 32:
+                _mask_cache.clear()
+            idx = torch.arange(n_rows, device=device)
+            m = idx.unsqueeze(0) >= torch.tensor(
+                list(lens_cpu), device=device
+            ).unsqueeze(1)
+            _mask_cache[key] = m
+        return m
+
     def _zero_rows_beyond(t, lens_cpu):
         # Ragged mode leaves rows at/beyond seq_len untouched (outputs are
         # torch.empty); a NaN bit pattern there poisons backward through
         # 0 * NaN. Zero the excluded rows of every tensor deterministically.
-        n_rows = t.shape[2]
-        for b, n in enumerate(lens_cpu):
-            if n < n_rows:
-                t[b, :, n:] = 0
+        m = _beyond_mask(lens_cpu, t.shape[2], t.device)
+        if bool(m.any()):
+            t.masked_fill_(m.view(-1, 1, m.shape[1], 1), 0.0)
 
     class _FrostSdpa(torch.autograd.Function):
         @staticmethod
