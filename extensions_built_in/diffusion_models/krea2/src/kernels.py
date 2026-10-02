@@ -299,12 +299,46 @@ _frost_notice = False
 
 if _FROST_OK:
 
+    def _zero_rows_beyond(t, lens_cpu):
+        # Ragged mode leaves rows at/beyond seq_len untouched (outputs are
+        # torch.empty); a NaN bit pattern there poisons backward through
+        # 0 * NaN. Zero the excluded rows of every tensor deterministically.
+        n_rows = t.shape[2]
+        for b, n in enumerate(lens_cpu):
+            if n < n_rows:
+                t[b, :, n:] = 0
+
     class _FrostSdpa(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, q, k, v, scale):
-            out = _frost_fwd(q, k, v, scale_softmax=scale)
+        def forward(ctx, q, k, v, scale, q_lens=None, kv_lens=None, lens_cpu=None):
+            if q_lens is None:
+                out = _frost_fwd(q, k, v, scale_softmax=scale)
+            else:
+                # the ragged kernels read base pointers/strides directly;
+                # mmdit hands them transpose views
+                q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+                out = _frost_fwd(
+                    q,
+                    k,
+                    v,
+                    scale_softmax=scale,
+                    seq_q_lens=q_lens,
+                    seq_kv_lens=kv_lens,
+                )
             o = out["o_tensor"]
             lse = out["lse_tensor"]
+            if q_lens is not None:
+                if lens_cpu is None:
+                    lens_cpu = q_lens.detach().cpu().tolist()
+                ctx.lens = (tuple(lens_cpu), tuple(lens_cpu))
+                ctx.q_lens = q_lens
+                ctx.kv_lens = kv_lens
+                _zero_rows_beyond(o, lens_cpu)
+                # NOTE: lse past the per-sample length must keep the engine's
+                # -inf skip sentinel; zeroing it makes bprop recompute
+                # exp(score - 0) for skipped rows (overflow -> NaN at scale).
+            else:
+                ctx.lens = None
             ctx.save_for_backward(q, k, v, o, lse)
             ctx.scale = scale
             return o
@@ -312,24 +346,43 @@ if _FROST_OK:
         @staticmethod
         def backward(ctx, do):
             q, k, v, o, lse = ctx.saved_tensors
-            grads = _frost_bwd(
-                q, k, v, o, do.contiguous(), lse.unsqueeze(-1),
-                scale_softmax=ctx.scale,
-            )
-            return grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"], None
+            if ctx.lens is None:
+                grads = _frost_bwd(
+                    q, k, v, o, do.contiguous(), lse.unsqueeze(-1),
+                    scale_softmax=ctx.scale,
+                )
+            else:
+                grads = _frost_bwd(
+                    q, k, v, o, do.contiguous(), lse.unsqueeze(-1),
+                    scale_softmax=ctx.scale,
+                    seq_q_lens=ctx.q_lens,
+                    seq_kv_lens=ctx.kv_lens,
+                )
+            dq = grads["dq_tensor"]
+            dk = grads["dk_tensor"]
+            dv = grads["dv_tensor"]
+            if ctx.lens is not None:
+                lens_cpu, kv_cpu = ctx.lens
+                _zero_rows_beyond(dq, lens_cpu)
+                _zero_rows_beyond(dk, kv_cpu)
+                _zero_rows_beyond(dv, kv_cpu)
+            return dq, dk, dv, None, None, None, None
 
 
-def fused_sdpa(q, k, v, scale):
+def fused_sdpa(q, k, v, scale, q_lens=None, kv_lens=None, lens_cpu=None):
     """sm120-native non-causal SDPA (FROST); None if unavailable.
 
     q: (B,Hq,L,D), k/v: (B,Hk,L,D), Hq % Hk == 0 (engine GQA, verified
     against torch enable_gqa), bf16/fp16 contiguous, D in {64,128}.
+    q_lens/kv_lens: optional (B,) int32 per-sample lengths for the packed
+    ragged layout (rows at/beyond the length are excluded from attention
+    and returned zeroed).
     """
     global _frost_notice
     if not _FROST_OK:
         return None
     try:
-        out = _FrostSdpa.apply(q, k, v, scale)
+        out = _FrostSdpa.apply(q, k, v, scale, q_lens, kv_lens, lens_cpu)
         if not _frost_notice:
             _frost_notice = True
             print(
