@@ -106,9 +106,24 @@ class WeightSource:
             with self._reader(dev) as f:
                 return {k: f.get_tensor(k) for k in f.keys()}
         out = {}
+        total = None
         with self._reader("cpu") as f:
-            for k in f.keys():
+            keys = f.keys()
+            total = len(keys)
+            for i, k in enumerate(keys):
                 out[k] = f.get_tensor(k).to(dev)
+                if i % 200 == 0:
+                    # live ram probe: identifies which code ran if an oom
+                    # kills the load mid-stream (per-tensor path caps at
+                    # largest-tensor ram; the old device-read ramped to
+                    # model size - the rss trajectory names the culprit)
+                    for line in open("/proc/self/status"):
+                        if line.startswith("VmRSS"):
+                            print(
+                                f"[load-timing] {os.path.basename(self.file_path)}: "
+                                f"streamed {i}/{total}, rss {int(line.split()[1]) / 1024:.0f}MB"
+                            )
+                            break
         return out
 
     # -- internals ------------------------------------------------------
