@@ -2595,12 +2595,24 @@ class SDTrainer(BaseSDTrainProcess):
             self._kt_n += 1
             start = int(_os.environ.get('AITK_PROF_START', '60'))
             active = int(_os.environ.get('AITK_PROF_ACTIVE', '3'))
+            if _os.environ.get('AITK_PROF_STACK'):
+                # HAZARD (measured on this host): per-event python stacks
+                # for a full H3 step (~25k aten events) OOM-kills a 32GB
+                # box even over a 2-step window; it does not degrade like a
+                # torch CUDA OOM, it takes the machine. One step only.
+                active = 1
             if self._kt_prof == 'done':
                 pass
             elif self._kt_n == start and self._kt_prof is None:
+                stack_kwargs = {}
+                if _os.environ.get('AITK_PROF_STACK'):
+                    # python call sites in the trace (window clamped to
+                    # one step at the active/ parse above)
+                    stack_kwargs['with_stack'] = True
                 self._kt_prof = torch.profiler.profile(
                     activities=[torch.profiler.ProfilerActivity.CPU,
-                                torch.profiler.ProfilerActivity.CUDA], record_shapes=True)
+                                torch.profiler.ProfilerActivity.CUDA],
+                    record_shapes=True, **stack_kwargs)
                 self._kt_prof.__enter__()
             elif isinstance(self._kt_prof, torch.profiler.profile) and self._kt_n > start + active:
                 p = self._kt_prof
@@ -2612,6 +2624,10 @@ class SDTrainer(BaseSDTrainProcess):
                 with open(out + '/kavgs_shapes.txt', 'w') as f:
                     f.write(p.key_averages(group_by_input_shape=True).table(
                         sort_by='self_cuda_time_total', row_limit=120))
+                if _os.environ.get('AITK_PROF_STACK'):
+                    with open(out + '/kavgs_stacks.txt', 'w') as f:
+                        f.write(p.key_averages(group_by_stack_n=8).table(
+                            sort_by='self_cpu_time_total', row_limit=120))
                 self._kt_prof = 'done'
         if isinstance(batch, list):
             batch_list = batch
