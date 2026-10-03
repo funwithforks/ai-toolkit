@@ -407,14 +407,14 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             dtype=self.torch_dtype,
             aitk_device=None if self.model_config.low_vram else self.device_torch,
         )
-        # Same switch as krea2 (krea2.py:249), but default OFF here: on the
-        # profiled H3 step it measured 0.789 vs 0.857 it/s (-8%) because the
-        # step is launch-bound (~22k aten calls/step, GPU ~20-25% utilized)
-        # and the int8 dx path adds quant/epilogue kernels per linear, while
-        # krea2's win came from a GEMM-bound step. The bf16 backward dx GEMMs
-        # (~0.4s GPU/step) only pay to remove once the op count is down;
-        # model_kwargs int8_bwd=true re-enables for retesting.
-        if self.model_config.model_kwargs.get("int8_bwd", False):
+        # Same switch as krea2 (krea2.py:249). Default ON: paired 300-step
+        # runs on the owner config measured 1.120 vs 1.027 it/s (+9.1%), and
+        # the produced adapter passed the owner's ComfyUI review (in
+        # character, voice clearer than the eager-backward control). An
+        # earlier -8% reading came from a contaminated early-session control
+        # and is void. model_kwargs int8_bwd=false restores the eager
+        # backward for isolation runs.
+        if self.model_config.model_kwargs.get("int8_bwd", True):
             n = 0
             for m in transformer.modules():
                 if getattr(m, "cr8_qdata", None) is not None:
