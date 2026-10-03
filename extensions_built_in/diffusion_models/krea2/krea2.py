@@ -272,11 +272,17 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
         )
         self.print_and_status_update(f"Loading Qwen3-VL text encoder from {te_path}")
 
+        # the comfy door hands back a single .safetensors file: it carries
+        # weights only. transformers treats a file name_or_path as a model
+        # dir and parses the file itself as config json - multi-GB ram per
+        # attempt - so tokenizer/processor load from the repo side unless
+        # the override is a real directory
+        tokenizer_src = te_path if os.path.isdir(te_path) else QWEN3_VL_PATH
         tokenizer = AutoTokenizer.from_pretrained(
-            te_path, max_length=self.max_text_length, token=HF_TOKEN
+            tokenizer_src, max_length=self.max_text_length, token=HF_TOKEN
         )
         processor = Qwen2TokenizerFast.from_pretrained(
-            te_path, max_length=self.max_text_length, token=HF_TOKEN
+            tokenizer_src, max_length=self.max_text_length, token=HF_TOKEN
         )
         text_encoder = Qwen3VLTextEncoder.load_model(
             te_path,
@@ -295,7 +301,7 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
             # Edit mode: reference images are encoded into the text embeddings,
             # so the vision tower stays. Swap its Conv3d patch_embed for an
             # equivalent GEMM (bf16 Conv3d has no fast cuDNN kernel).
-            vl_processor = AutoProcessor.from_pretrained(te_path, token=HF_TOKEN)
+            vl_processor = AutoProcessor.from_pretrained(tokenizer_src, token=HF_TOKEN)
             patch_qwen_vl_patch_embed(text_encoder)
         else:
             # We only ever encode text, so the vision tower is dead weight -- drop it to
