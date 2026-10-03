@@ -66,7 +66,7 @@ from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, Netw
     DecoratorConfig
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
-from toolkit.accelerator import get_accelerator, unwrap_model
+from toolkit.accelerator import get_accelerator, unwrap_model, drop_fp32_outcome_wrapper
 from toolkit.print import print_acc
 from accelerate import Accelerator
 import transformers
@@ -808,6 +808,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # todo adapters may not be a module. need to check
             self.adapter = self.accelerator.prepare(self.adapter)
             self.modules_being_trained.append(self.adapter)
+
+        # native-dtype training policy: undo accelerate's
+        # autocast+convert_outputs_to_fp32 forward binding so models train
+        # in their own dtypes (see toolkit.accelerator).
+        for model in [
+            self.sd.vae, self.sd.unet, self.sd.refiner_unet,
+            self.sd.network, self.adapter,
+        ] + (
+            self.sd.text_encoder if isinstance(self.sd.text_encoder, list)
+            else [self.sd.text_encoder]
+        ):
+            if model is not None:
+                drop_fp32_outcome_wrapper(model)
         
         # prepare other things
         self.optimizer = self.accelerator.prepare(self.optimizer)

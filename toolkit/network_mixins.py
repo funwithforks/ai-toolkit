@@ -366,14 +366,26 @@ class ToolkitModuleMixin:
         cr8_fold = False
         if epilogue_target and is_rank and torch.is_tensor(lora_output):
             rank = lora_output.shape[-1]
-            om = self.org_module[0]
             if rank & (rank - 1) == 0 and rank <= 64:
-                from toolkit.util.convrot_quant import _int8_gemm_supported
-                cr8_fold = (
-                    getattr(om, "cr8_qdata", None) is not None
-                    and x_for_org.requires_grad
-                    and _int8_gemm_supported(x_for_org.device)
-                )
+                # the fold may be offered only when the NEXT LINK IN THE CALL
+                # CHAIN consumes it: org_forward is the bound method apply_to
+                # captured (lora_special.py:133), and a stacked wrapper's link
+                # is that same methodref shared with its own org_forward, so
+                # re-passing cr8_lora down it raises duplicate-kwarg at
+                # OstrisLinear.forward (assistant + training lora on one
+                # convrot linear). __self__ is the true recipient; when it is
+                # the OstrisLinear itself this is exactly the old predicate.
+                next_link = getattr(self.org_forward, "__self__", None)
+                if (
+                    getattr(next_link, "is_ostris_quantized", False)
+                    and getattr(next_link.ostris_quantizer, "accepts_cr8_lora", False)
+                ):
+                    from toolkit.util.convrot_quant import _int8_gemm_supported
+                    cr8_fold = (
+                        getattr(next_link, "cr8_qdata", None) is not None
+                        and x_for_org.requires_grad
+                        and _int8_gemm_supported(x_for_org.device)
+                    )
         if cr8_fold:
             return self.org_forward(
                 x_for_org,

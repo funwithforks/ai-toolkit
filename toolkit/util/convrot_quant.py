@@ -1133,9 +1133,24 @@ _int8_bwd_ones: dict = {}
 def _int8_linear_ste_backward(ctx, grad):
     qdata, w_scales_u8, lora_r, lora_u = ctx.saved_tensors
     # LoRA gradients (when the up-projection was folded into the epilogue):
-    # exactly the values autograd would have produced through lora_up.
-    d_r = grad @ lora_u if lora_r is not None else None
-    d_u = grad.t() @ lora_r if lora_u is not None else None
+    # exactly the values autograd would have produced through lora_up. The
+    # folded r@u runs in the epilogue's fp32 math, so the incoming grad can
+    # legally arrive in a dtype the saved lora tensors are not in; autograd's
+    # contract for a dtype-cast autograd.Function is to cast the grad to the
+    # saved parameter dtype, which is what happens here (a no-op when the
+    # dtypes agree). The plain (unfolded) route through lora_up applies the
+    # same rule; refusing to cast here would make the fold depend on who
+    # happens to be upstream of the layer.
+    if lora_r is not None:
+        grad_r = grad.to(lora_u.dtype)
+        d_r = grad_r @ lora_u
+    else:
+        d_r = None
+    if lora_u is not None:
+        grad_u = grad.to(lora_r.dtype)
+        d_u = grad_u.t() @ lora_r
+    else:
+        d_u = None
     if getattr(ctx, "bwd_mode", "eager") == "int8":
         # Opt-in (module.cr8_bwd_mode): run the input-gradient GEMM on the int8
         # tensor cores too. dx = (grad * w_scales) @ qdata with grad quantized
