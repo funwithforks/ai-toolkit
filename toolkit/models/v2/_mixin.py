@@ -51,7 +51,12 @@ def _pretrained_to_device(loader, path, subfolder, dtype, device, kwargs):
     a stale hook's execution device would fight them), and non-persistent
     buffers (rope tables etc.), which no checkpoint carries, are relocated
     to wherever the parameters landed."""
-    from accelerate import remove_hook_from_module
+    # accelerate.hooks is the function's canonical home; the top-level
+    # re-export was dropped in accelerate 1.15, so importing from
+    # `accelerate` breaks there. A device_map load leaves an
+    # AlignDevicesHook on the module; the state every consumer of this
+    # loader needs back is a plain, hookless module on `device`.
+    from accelerate.hooks import remove_hook_from_module
 
     model = OstrisModelMixin._local_first(  # noqa: SLF001 - same module family
         loader,
