@@ -402,11 +402,31 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         # else at its stored precision (the bf16/fp16/fp32 mix is deliberate).
         # As-shipped mode streams the file straight onto the gpu; low_vram
         # keeps the legacy cpu parking for the phased placement.
-        return MiniMaxH3Transformer.load_model(
+        transformer = MiniMaxH3Transformer.load_model(
             dit_path,
             dtype=self.torch_dtype,
             aitk_device=None if self.model_config.low_vram else self.device_torch,
         )
+        # Same switch as krea2 (krea2.py:249), but default OFF here: on the
+        # profiled H3 step it measured 0.789 vs 0.857 it/s (-8%) because the
+        # step is launch-bound (~22k aten calls/step, GPU ~20-25% utilized)
+        # and the int8 dx path adds quant/epilogue kernels per linear, while
+        # krea2's win came from a GEMM-bound step. The bf16 backward dx GEMMs
+        # (~0.4s GPU/step) only pay to remove once the op count is down;
+        # model_kwargs int8_bwd=true re-enables for retesting.
+        if self.model_config.model_kwargs.get("int8_bwd", False):
+            n = 0
+            for m in transformer.modules():
+                if getattr(m, "cr8_qdata", None) is not None:
+                    m.cr8_bwd_mode = "int8"
+                    n += 1
+            if n:
+                self.print_and_status_update(
+                    f"  - int8 STE input-gradient backward enabled on {n} "
+                    f"quantized linears (upstream grads quantized to int8; "
+                    f"set model_kwargs int8_bwd=false for the eager backward)"
+                )
+        return transformer
 
     def _load_text_encoder(self):
         from accelerate import init_empty_weights
