@@ -37,6 +37,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from .kernels import fused_norm as _fused_norm, swiglu_mul as _fused_swiglu_mul
+
 MODALITY_NUM = 3  # 0 = video, 1 = text, 2 = audio; -1 marks padding rows
 
 
@@ -182,8 +184,8 @@ class MiniMaxH3Attention(nn.Module):
         k = k.view(b, s, self.heads, self.head_dim)
         v = v.view(b, s, self.heads, self.head_dim)
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        q = _fused_norm(q, self.q_norm)
+        k = _fused_norm(k, self.k_norm)
         if rotary_emb is not None:
             q = apply_rotary_emb(q, *rotary_emb)
             k = apply_rotary_emb(k, *rotary_emb)
@@ -213,7 +215,7 @@ class MiniMaxH3Mlp(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.fc1(x).chunk(2, dim=-1)
-        return self.fc2(F.silu(gate) * up)
+        return self.fc2(_fused_swiglu_mul(gate, up))
 
 
 class MiniMaxH3AdalnProj(nn.Module):
@@ -271,8 +273,8 @@ class MiniMaxH3RefinerBlock(nn.Module):
         self.mlp = MiniMaxH3Mlp(p.hidden_size, p.ffn_hidden_size)
 
     def forward(self, x: torch.Tensor, attn_mask=None) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.attn(_fused_norm(x, self.norm1), attn_mask=attn_mask)
+        x = x + self.mlp(_fused_norm(x, self.norm2))
         return x
 
 
@@ -291,7 +293,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
                 x = checkpoint(block, x, attn_mask, use_reentrant=False)
             else:
                 x = block(x, attn_mask)
-        return self.final_norm(x)
+        return _fused_norm(x, self.final_norm)
 
 
 class MiniMaxH3Block(nn.Module):
@@ -333,14 +335,14 @@ class MiniMaxH3Block(nn.Module):
         )
         dt = x.dtype  # pruned checkpoints store the adaln projections fp16
 
-        h = self.norm1(x) * (1.0 + scale_msa[adaln_indices].to(dt)) + shift_msa[
+        h = _fused_norm(x, self.norm1) * (1.0 + scale_msa[adaln_indices].to(dt)) + shift_msa[
             adaln_indices
         ].to(dt)
         x = x + gate_msa[adaln_indices].to(dt) * self.attn(
             h, rotary_emb, attn_mask, vsa
         )
 
-        h = self.norm2(x) * (1.0 + scale_mlp[adaln_indices].to(dt)) + shift_mlp[
+        h = _fused_norm(x, self.norm2) * (1.0 + scale_mlp[adaln_indices].to(dt)) + shift_mlp[
             adaln_indices
         ].to(dt)
         x = x + gate_mlp[adaln_indices].to(dt) * self.mlp(h)

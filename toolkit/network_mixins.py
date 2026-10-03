@@ -324,7 +324,9 @@ class ToolkitModuleMixin:
         x_for_org = x
         if isinstance(x, QTensor):
             x = x.dequantize()
-        # always cast to float32
+        # compute at the parameter dtype: with train-dtype params (bf16 on
+        # Blackwell) this is a no-op and every LoRA GEMM runs bf16 tensor
+        # cores; an fp32-param network keeps fp32 compute as before.
         lora_input = x.to(self.lora_down.weight.dtype)
         multiplier = self.network_ref().torch_multiplier
 
