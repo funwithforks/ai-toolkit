@@ -867,13 +867,34 @@ class ToolkitNetworkMixin:
         for key in to_delete:
             del load_sd[key]
 
-        print(f"Missing keys: {to_delete}")
+        if to_delete:
+            # checkpoint keys the network has no tensor for; they are dropped.
+            # (They are not the failure-signal they look like: the tensors
+            # that go unfed are counted after the load below.)
+            print(f"Ignored checkpoint keys: {to_delete}")
         if len(to_delete) > 0 and self.is_v1 and not force_weight_mapping and not (
                 len(to_delete) == 1 and 'emb_params' in to_delete):
             print(" Attempting to load with forced keymap")
             return self.load_weights(file, force_weight_mapping=True)
 
         info = self.load_state_dict(load_sd, False)
+        # strict=False hides the other half: network tensors the file did not
+        # cover keep their init values (up-projections are zero-initialised,
+        # so those modules contribute exactly nothing, silently). Report
+        # coverage by name. Keys routed through extra_dict (emb_params,
+        # slider tables) are filled by the caller and are not a gap.
+        param_names = {n for n, _ in self.named_parameters()}
+        gap = [k for k in info.missing_keys if k in param_names and k not in extra_dict]
+        label = os.path.basename(file) if isinstance(file, str) else "state dict"
+        print(
+            f"LoRA weights loaded from {label}: "
+            f"{len(param_names) - len(gap)}/{len(param_names)} weight tensors"
+        )
+        if gap:
+            print(
+                f"WARNING: {len(gap)} weight tensors received no data from {label} "
+                f"and keep their init values: {gap[:8]}"
+            )
         if len(extra_dict.keys()) == 0:
             extra_dict = None
         return extra_dict

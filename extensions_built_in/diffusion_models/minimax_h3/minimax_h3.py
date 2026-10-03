@@ -344,6 +344,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             if k.endswith("lora_A.weight") or k.endswith("lora_down.weight")
         )
         dim = int(lora_state_dict[dim_key].shape[0])
+        print(f"Assistant LoRA: {lora_path} (rank {dim})")
         lora_state_dict = self.convert_lora_weights_before_load(lora_state_dict)
 
         network_config = NetworkConfig(
