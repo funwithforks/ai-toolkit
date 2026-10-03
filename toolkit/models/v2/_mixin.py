@@ -830,6 +830,7 @@ class OstrisModelMixin:
         component: Optional[str] = None,
         model_kwargs: Optional[dict] = None,
         candidate_filter=None,
+        extra_roots=None,
     ) -> Optional[str]:
         """The comfy-format weight file replacing a standard ``name_or_path``,
         or None when this class has none registered for it. Best-ranked local
@@ -839,6 +840,9 @@ class OstrisModelMixin:
         ``override_path``: an explicit file that short-circuits the search
         (the generic form of the per-component ``<component>_path``
         model_kwargs convention). Must exist when given.
+
+        ``extra_roots``: local dirs searched alongside MODELS_PATH (e.g. a
+        local checkpoint dir holding the component file).
 
         Candidate keys may be plain repo ids or ``(repo_id, subfolder)``
         tuples for checkpoints holding several of this component (e.g.
@@ -877,6 +881,7 @@ class OstrisModelMixin:
             status_fn=status_fn,
             local_only=local_only,
             qtype=qtype,
+            extra_roots=extra_roots,
         )
 
     # ------------------------------------------------------------------

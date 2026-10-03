@@ -71,12 +71,15 @@ def resolve_comfy_candidates(
     status_fn: Optional[Callable[[str], None]] = None,
     local_only: bool = False,
     qtype: Optional[str] = None,
+    extra_roots: Optional[Iterable[str]] = None,
 ) -> Optional[str]:
     """Pick the best comfy weight file among precision variants of one
     component (repo-relative paths, ranked by comfy_precision_rank for the
     requested qtype, then list order). The best-ranked LOCAL candidate wins;
     only when no candidate is local is the best-ranked one downloaded to its
-    comfy-layout location under MODELS_PATH."""
+    comfy-layout location under MODELS_PATH. ``extra_roots`` are searched
+    locally alongside MODELS_PATH (a local checkpoint dir holding the
+    component); downloads always land in the MODELS_PATH layout regardless."""
     candidates = list(candidates)
     ordered = sorted(
         candidates,
@@ -84,7 +87,7 @@ def resolve_comfy_candidates(
     )
     for repo_rel in ordered:
         found = resolve_comfy_file(
-            comfy_local_rel(repo_rel), repo_id, local_only=True
+            comfy_local_rel(repo_rel), repo_id, local_only=True, extra_roots=extra_roots
         )
         if found is not None:
             return found

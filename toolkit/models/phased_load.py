@@ -56,6 +56,13 @@ class PhasedLoadMixin:
             model_kwargs=self.model_config.model_kwargs,
             override_path=self.model_config.model_kwargs.get(f"{component}_path", None),
             candidate_filter=self.select_comfy_candidates,
+            # a local checkpoint dir is a search root for component files
+            extra_roots=(
+                [self.model_config.name_or_path]
+                if self.model_config.name_or_path
+                and os.path.isdir(self.model_config.name_or_path)
+                else None
+            ),
         )
         if path is None:
             raise FileNotFoundError(

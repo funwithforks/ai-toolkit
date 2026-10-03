@@ -395,7 +395,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
     def _load_transformer(self) -> MiniMaxH3Transformer:
         # the transformer variant is picked by the partition filter inside
         # the generic candidates resolution (select_comfy_candidates)
-        dit_path = self._resolve_comfy_file("transformer")
+        dit_path = self._resolve_comfy_file("transformer", MiniMaxH3Transformer)
         self.print_and_status_update(f"Loading transformer from {dit_path}")
         # the mixin single-file path: config sniffed from the checkpoint
         # (adaln_t_table), pre-quantized ConvRot linears attached, everything
@@ -439,7 +439,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             if te_path is not None:
                 te_file = te_path
             else:
-                te_file = self._resolve_comfy_file("text_encoder")
+                te_file = self._resolve_comfy_file("text_encoder", Qwen3VLTextEncoder)
             self.print_and_status_update(
                 f"Loading Qwen3-VL text encoder from {te_file}"
             )
@@ -596,11 +596,11 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
     def _load_vaes(self) -> MiniMaxH3VaeBundle:
         self.print_and_status_update("Loading video VAE")
         video_vae = MiniMaxH3VideoVAE.load_to_device(
-            self._resolve_comfy_file("video_vae"), self.vae_device_torch
+            self._resolve_comfy_file("video_vae", MiniMaxH3VideoVAE), self.vae_device_torch
         )
         self.print_and_status_update("Loading audio VAE")
         audio_vae = MiniMaxH3AudioVAE.load_to_device(
-            self._resolve_comfy_file("audio_vae"), self.vae_device_torch
+            self._resolve_comfy_file("audio_vae", MiniMaxH3AudioVAE), self.vae_device_torch
         )
         flush()
         return MiniMaxH3VaeBundle(video_vae, audio_vae)
@@ -1190,7 +1190,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         if own_video:
             self.print_and_status_update("Loading video VAE")
             video_vae = MiniMaxH3VideoVAE.load_to_device(
-                self._resolve_comfy_file("video_vae"), self.vae_device_torch
+                self._resolve_comfy_file("video_vae", MiniMaxH3VideoVAE), self.vae_device_torch
             )
             self.vae = MiniMaxH3VaeBundle(video_vae=video_vae)
         frames = []
@@ -1211,7 +1211,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             if own_audio:
                 self.print_and_status_update("Loading audio VAE")
                 audio_vae = MiniMaxH3AudioVAE.load_to_device(
-                    self._resolve_comfy_file("audio_vae"), self.vae_device_torch
+                    self._resolve_comfy_file("audio_vae", MiniMaxH3AudioVAE), self.vae_device_torch
                 )
                 self.vae = MiniMaxH3VaeBundle(audio_vae=audio_vae)
             for j, (_gc, _i, payload) in enumerate(staged_samples):
