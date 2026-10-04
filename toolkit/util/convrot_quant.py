@@ -1150,6 +1150,82 @@ def _int8_act_quant_padded(x: torch.Tensor, qmax: int = 127):
 # d y / d x_rot ~= dequant(W'), registered as a custom-op autograd so it works
 # under torch.compile. the backward re-dequantizes the weight from int8 instead of
 # saving a bf16 copy, and x is not saved at all — less memory than F.linear.
+_cutlass_state: dict = {}
+
+
+def _get_cutlass_int8():
+    """Lazy accessor for comfy_kitchen's fused CUTLASS int8 GEMM
+    (D = acc * x_scale[m] * w_scale[n] + bias, our exact epilogue minus the
+    lora fold). Returns (call, wrap) or None with the reason in
+    _cutlass_state['why']; import failure disables, never crashes."""
+    if "fn" in _cutlass_state:
+        return _cutlass_state["fn"]
+    try:
+        import comfy_kitchen.backends.cuda as _ck
+        from comfy_kitchen.backends.cuda import _wrap_for_dlpack
+
+        fn = _ck._C.cutlass_int8_dequant
+        _cutlass_state["fn"] = (fn, _wrap_for_dlpack)
+    except Exception as e:  # noqa: BLE001 - absence simply keeps the _int_mm path
+        _cutlass_state["why"] = f"{type(e).__name__}: {str(e)[:120]}"
+        _cutlass_state["fn"] = None
+    return _cutlass_state["fn"]
+
+
+_CUTLASS_DTYPE = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
+_cutlass_notified = set()
+
+
+def _cutlass_notify(why):
+    if why not in _cutlass_notified:
+        _cutlass_notified.add(why)
+        print_acc(
+            f"ConvRot: cr8_cutlass_gemm requested but {why}; using the "
+            "_int_mm + triton epilogue path for these layers."
+        )
+
+
+def _cutlass_gemm_forward(
+    aq, a_s, qdata, w_scales, bias, out_dtype, m, lora
+):
+    """int8 act (already quantized) -> fused cutlass GEMM+dequant -> optional
+    lora addmm. Returns None (caller uses the _int_mm path) unless the shape,
+    dtype and library all support it."""
+    backend = _get_cutlass_int8()
+    if backend is None:
+        _cutlass_notify(f"comfy_kitchen is unavailable ({_cutlass_state.get('why')})")
+        return None
+    fn, wrap = backend
+    n, k = qdata.shape
+    if n % 16 or k % 16:
+        _cutlass_notify(f"shape needs N,K % 16, got N={n} K={k}")
+        return None
+    if out_dtype not in _CUTLASS_DTYPE:
+        _cutlass_notify(f"out dtype {out_dtype}")
+        return None
+    out = torch.empty(m, n, device=aq.device, dtype=out_dtype)
+    ok = fn(
+        wrap(aq[:m]),
+        wrap(qdata),
+        wrap(a_s[:m].reshape(m, 1)),
+        wrap(w_scales),
+        wrap(
+            bias.to(dtype=out_dtype).contiguous()
+            if bias is not None
+            else torch.empty(0, device=aq.device, dtype=out_dtype)
+        ),
+        wrap(out),
+        _CUTLASS_DTYPE[out_dtype],
+        torch.cuda.current_stream(aq.device).cuda_stream,
+    )
+    if not ok:
+        _cutlass_notify("the kernel declined this launch")
+        return None
+    if lora is not None:
+        out.addmm_(lora[0], lora[1].t())
+    return out
+
+
 @torch.library.custom_op("ostris::convrot_int8_linear_ste", mutates_args=())
 def _int8_linear_ste_op(
     x2d: torch.Tensor,
@@ -1162,9 +1238,23 @@ def _int8_linear_ste_op(
     lora_r: Optional[torch.Tensor] = None,
     lora_u: Optional[torch.Tensor] = None,
     epi_dot: bool = False,
+    cutlass_gemm: bool = False,
 ) -> torch.Tensor:
     m = x2d.shape[0]
     aq, a_s = _int8_act_quant_padded(x2d, act_qmax)
+    if cutlass_gemm:
+        out = _cutlass_gemm_forward(
+            aq,
+            a_s,
+            qdata,
+            w_scales_u8.view(torch.float32),
+            bias,
+            getattr(torch, out_dtype),
+            m,
+            (lora_r, lora_u) if lora_r is not None else None,
+        )
+        if out is not None:
+            return out
     i32 = torch._int_mm(aq, qdata.t())
     return _int8_epilogue(
         i32[:m],
@@ -1189,6 +1279,7 @@ def _int8_linear_ste_fake(
     lora_r=None,
     lora_u=None,
     epi_dot=False,
+    cutlass_gemm=False,
 ):
     return torch.empty(
         x2d.shape[0], qdata.shape[0], device=x2d.device, dtype=getattr(torch, out_dtype)
@@ -1207,6 +1298,7 @@ def _int8_linear_ste_setup(ctx, inputs, output):
         lora_r,
         lora_u,
         _epi_dot,
+        _cutlass_gemm,
     ) = inputs
     ctx.bwd_mode = str(bwd_mode)
     ctx.act_qmax = int(act_qmax)
@@ -1265,7 +1357,7 @@ def _int8_linear_ste_backward(ctx, grad):
                 ),
             )
             dx = _int8_epilogue(i32[:m], g_s[:m], ones, None, grad.dtype)
-            return (dx, None, None, None, None, None, None, d_r, d_u, None)
+            return (dx, None, None, None, None, None, None, d_r, d_u, None, None)
         global _int8_bwd_warned
         if big and not _int8_bwd_warned:
             _int8_bwd_warned = True
@@ -1276,7 +1368,7 @@ def _int8_linear_ste_backward(ctx, grad):
             )
     w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
     w = qdata.to(grad.dtype) * w_scales.unsqueeze(1)
-    return (grad @ w, None, None, None, None, None, None, d_r, d_u, None)
+    return (grad @ w, None, None, None, None, None, None, d_r, d_u, None, None)
 
 
 _int8_linear_ste_op.register_autograd(
@@ -1680,6 +1772,7 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
             lora[0] if lora is not None else None,
             lora[1] if lora is not None else None,
             bool(getattr(module, "cr8_epi_dot", False)),
+            bool(getattr(module, "cr8_cutlass_gemm", False)),
         )
 
     def fake_quant_rotated_weight(self, module, w_rot: torch.Tensor) -> torch.Tensor:

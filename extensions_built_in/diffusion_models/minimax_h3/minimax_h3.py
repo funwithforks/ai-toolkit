@@ -451,6 +451,39 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                     f"{n} quantized linears (set model_kwargs "
                     f"int8_epi_dot=false for the elementwise kernel)"
                 )
+        # fused CUTLASS int8 GEMM (comfy_kitchen) as the forward engine:
+        # GEMM+dequant+bias in one kernel; the lora fold then runs as a
+        # rank-32 addmm. Opt-in here; the toolkit path stays on
+        # _int_mm + triton for every other model.
+        # DEFAULT OFF: the win is forward-only. Their tile is NT-only
+        # (comfy-kitchen cutlass_gemm_int8.cu; cublas_gemm_int8.cu:121 hardcodes
+        # OP_T/OP_N), so dX (NN on q_w) and any dW cannot hit it; per the ship
+        # rule the pair does not ride on a forward-only gain. Opt in with
+        # model_kwargs int8_cutlass_gemm=true for experiments.
+        if self.model_config.model_kwargs.get("int8_cutlass_gemm", False):
+            from toolkit.util.convrot_quant import _get_cutlass_int8
+
+            if _get_cutlass_int8() is not None:
+                n = 0
+                for m in transformer.modules():
+                    if getattr(m, "cr8_qdata", None) is not None:
+                        m.cr8_cutlass_gemm = True
+                        n += 1
+                if n:
+                    self.print_and_status_update(
+                        f"  - int8 forward GEMM via fused CUTLASS "
+                        f"(comfy_kitchen) on {n} quantized linears "
+                        f"(set model_kwargs int8_cutlass_gemm=false for "
+                        f"torch._int_mm)"
+                    )
+            else:
+                from toolkit.util.convrot_quant import _cutlass_state
+
+                self.print_and_status_update(
+                    f"  - int8 CUTLASS forward requested but unavailable "
+                    f"({_cutlass_state.get('why', 'unknown')}); using "
+                    f"torch._int_mm"
+                )
         return transformer
 
     def _load_text_encoder(self):
