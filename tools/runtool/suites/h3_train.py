@@ -64,8 +64,19 @@ def _params():
         "seed": Param("int", default=42, min=0, max=2**31 - 1),
         "varlen": Param("bool", default=True, desc="H3_VARLEN_ATTN"),
         "rope": Param("bool", default=True, desc="H3_ROPE_FUSE"),
+        "adaln": Param("bool", default=True, desc="H3_ADALN_FUSE"),
         "liger": Param("bool", default=False, desc="H3_LIGER_FUSIONS"),
         "tag": Param("str", default="", desc="extra job-name tag"),
+        "prof_start": Param(
+            "int", default=None, min=5, max=5000,
+            desc="enable the torch-profiler window (no-stack) starting at "
+                 "this step; artifacts land in record/artifacts/prof/",
+        ),
+        "prof_active": Param(
+            "int", default=2, min=1, max=3,
+            desc="profiler window length in steps (hard cap 3; stack "
+                 "profiling is deliberately not exposed)",
+        ),
     }
 
 
@@ -103,6 +114,14 @@ def _build(params, paths: RunPaths):
         "H3_ROPE_FUSE": "1" if params["rope"] else "0",
         "H3_LIGER_FUSIONS": "1" if params["liger"] else "0",
     }
+    if params.get("prof_start") is not None:
+        # the SDTrainer profiler window (no-stack) exports a chrome trace +
+        # kernel-avg tables into the record; AITK_PROF_STACK is never set
+        prof_dir = os.path.join(paths.artifacts, "prof")
+        env["AITK_PROF_DIR"] = prof_dir
+        env["AITK_PROF_START"] = params["prof_start"]
+        env["AITK_PROF_ACTIVE"] = params["prof_active"]
+        os.makedirs(prof_dir, exist_ok=True)
     return argv, env
 
 
