@@ -403,6 +403,14 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         # else at its stored precision (the bf16/fp16/fp32 mix is deliberate).
         # As-shipped mode streams the file straight onto the gpu; low_vram
         # keeps the legacy cpu parking for the phased placement.
+        if self.model_config.model_kwargs.get("frost_sdpa", False):
+            from .src.transformer import set_frost_sdpa
+
+            set_frost_sdpa(True)
+            print(
+                "  - FROST sm120 SDPA enabled via model_kwargs frost_sdpa "
+                "(suited to uniform-shape datasets; default is torch SDPA)"
+            )
         transformer = MiniMaxH3Transformer.load_model(
             dit_path,
             dtype=self.torch_dtype,

@@ -111,6 +111,14 @@ class MiniMaxH3Rope(nn.Module):
         return freqs.cos(), freqs.sin()
 
 
+_FROST_SDPA = False
+
+
+def set_frost_sdpa(flag: bool) -> None:
+    global _FROST_SDPA
+    _FROST_SDPA = bool(flag)
+
+
 def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     """x (B, S, H, D); cos/sin (B, S, rot) rotate the leading ``rot`` channels."""
     # fused Triton path when available; returns None (and the env kill switch
@@ -207,11 +215,19 @@ class MiniMaxH3Attention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        # torch SDPA kept deliberately: the sm120 FROST path was measured
-        # rate-neutral at bs4 (2345 vs 2322 ms/it paired 300-step runs) and
-        # a steady -33% at bs1 (1027 vs 689 ms/it) where cudnn plan compiles
-        # fire on every new sequence length; krea2 keeps its wiring.
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        # torch SDPA is the default (see 74dbca1): on datasets with
+        # mixed resolutions cudnn plan compiles fire on every new sequence
+        # length.
+        # model_kwargs {frost_sdpa: true} opts the dense path into the
+        # sm120 kernels -- intended for jobs with uniform dataset shapes,
+        # where the plan set is finite.
+        out = None
+        if attn_mask is None and _FROST_SDPA:
+            from toolkit.attention.frost import fused_sdpa
+
+            out = fused_sdpa(q, k, v, self.head_dim**-0.5)
+        if out is None:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).reshape(b, s, -1)
         return self.out_proj(out)
 
