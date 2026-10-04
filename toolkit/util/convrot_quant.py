@@ -984,7 +984,11 @@ def _int8_epilogue_op(
         raise RuntimeError(
             f"int8 epilogue lora rank must be a power of two <= 64, got {rank}"
         )
-    block_n = 256 if has_lora else 1024
+    # 512/num_warps=4 measured ~9% faster than 256 on the lora path at the
+    # live shapes (1193 GB/s vs 1095 at [7104, 28672]; RTX 5090 roofline for
+    # int32-in + bf16-out is ~1.2 TB/s); the kernel is bandwidth-bound, so
+    # tile size only amortizes launch/scheduling, not traffic
+    block_n = 512 if has_lora else 1024
     grid = (m, -(-n // block_n))
     kernel[grid](
         i32,
