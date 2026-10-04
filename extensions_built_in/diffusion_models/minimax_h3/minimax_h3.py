@@ -435,6 +435,22 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                     f"quantized linears (upstream grads quantized to int8; "
                     f"set model_kwargs int8_bwd=false for the eager backward)"
                 )
+        # tensor-core lora-fold epilogue (rank term as tl.dot): measured
+        # ~1.5 TB/s vs ~1.15 for the elementwise form at the live shapes,
+        # differing by <=1 bf16 ulp in the lora term. H3 ships it on; other
+        # models keep the elementwise path (class default off).
+        if self.model_config.model_kwargs.get("int8_epi_dot", True):
+            n = 0
+            for m in transformer.modules():
+                if getattr(m, "cr8_qdata", None) is not None:
+                    m.cr8_epi_dot = True
+                    n += 1
+            if n:
+                self.print_and_status_update(
+                    f"  - int8 lora-fold epilogue using the tl.dot kernel on "
+                    f"{n} quantized linears (set model_kwargs "
+                    f"int8_epi_dot=false for the elementwise kernel)"
+                )
         return transformer
 
     def _load_text_encoder(self):
