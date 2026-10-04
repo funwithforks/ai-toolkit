@@ -79,10 +79,15 @@ class Automagic3(torch.optim.Optimizer):
     trainer's grad clipping / nan-skip (they run after backward) and is not
     compatible with multi-backward gradient accumulation.
 
-    With ``fused=False`` it behaves like a traditional optimizer: grads
-    accumulate across backward passes and the update happens in ``.step()``.
-    Low-precision (bf16/fp16) grads are accumulated with stochastic rounding so
-    small per-micro-batch grads aren't lost; fp32 grads accumulate normally.
+    With ``fused=False`` the updates are deferred to ``.step()`` and run
+    SHAPE-FAMILY BATCHED: same-shape, same-dtype params past state init are
+    stacked and updated as one tensor per family (per-element math identical
+    to the per-param path; stochastic-rounding draws differ in order). This
+    collapses thousands of per-param kernel launches into a handful per
+    family (same mechanism as Automagic2's 7079935, +5.3% on krea2).
+    Low-precision (bf16/fp16) grads are accumulated with stochastic rounding
+    so small per-micro-batch grads aren't lost; fp32 grads accumulate
+    normally.
 
     Second-moment EMA state is stored in ``p.dtype`` (math runs in fp32 when
     the state is lower precision). Updates to low-precision (e.g. bf16/fp16)
@@ -562,6 +567,126 @@ class Automagic3(torch.optim.Optimizer):
 
         p.grad = None
 
+    # ---------------------------------------------------------- family step
+
+    @torch.no_grad()
+    def _step_family(self, ps: list, group: dict) -> None:
+        # The per-param update run once for a whole same-shape family. The
+        # op sequence mirrors _update_param exactly (stack grads -> nan_to_num
+        # -> factored/full second moment -> RMS clip -> clamp -> sign vote
+        # -> weight decay -> lr apply -> stochastic writeback); only the
+        # tensor extent changes, so every element still sees identical math.
+        # Stochastic-rounding draws are consumed in family order, so results
+        # are distribution-level, not bitwise, equal to the per-param path.
+        dev = ps[0].device
+        dtype = ps[0].dtype
+        beta2 = group["beta2"]
+        eps = group["eps"]
+        clip = group["clip_threshold"]
+        F = len(ps)
+        numel = ps[0].numel()
+
+        G = torch.stack(
+            [p.grad if p.grad.dtype == torch.float32 else p.grad.to(torch.float32) for p in ps]
+        )
+        G.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+        sq = G * G
+
+        if ps[0].dim() >= 2:
+            row_state = torch.stack([self.state[p]["exp_avg_sq_row"] for p in ps])
+            col_state = torch.stack([self.state[p]["exp_avg_sq_col"] for p in ps])
+            if row_state.dtype == torch.float32:
+                row, col = row_state, col_state
+                row.mul_(beta2).add_(sq.mean(dim=-1).add_(eps), alpha=1.0 - beta2)
+                col.mul_(beta2).add_(sq.mean(dim=-2).add_(eps), alpha=1.0 - beta2)
+            else:
+                row = row_state.to(torch.float32)
+                col = col_state.to(torch.float32)
+                row.mul_(beta2).add_(sq.mean(dim=-1).add_(eps), alpha=1.0 - beta2)
+                col.mul_(beta2).add_(sq.mean(dim=-2).add_(eps), alpha=1.0 - beta2)
+                rb = row.to(row_state.dtype)
+                cb = col.to(col_state.dtype)
+                for i, p in enumerate(ps):
+                    self.state[p]["exp_avg_sq_row"].copy_(rb[i])
+                    self.state[p]["exp_avg_sq_col"].copy_(cb[i])
+            update = self._approx_sq_grad(row, col).mul_(G)
+        else:
+            v_state = torch.stack([self.state[p]["exp_avg_sq"] for p in ps])
+            if v_state.dtype == torch.float32:
+                v = v_state
+                v.mul_(beta2).add_(sq, alpha=1.0 - beta2)
+            else:
+                v = v_state.to(torch.float32)
+                v.mul_(beta2).add_(sq, alpha=1.0 - beta2)
+                vb = v.to(v_state.dtype)
+                for i, p in enumerate(ps):
+                    self.state[p]["exp_avg_sq"].copy_(vb[i])
+            update = v.add(eps).rsqrt().mul_(G)
+
+        bcast = [1] * (update.dim() - 1)
+        rms = update.flatten(1).norm(2, dim=1).div_(numel**0.5)
+        update.div_((rms / clip).clamp_(min=1.0).view(F, *bcast))
+        update.clamp_(-clip, clip)
+
+        cur_bits = update.gt(0.0)
+        st0 = self.state[ps[0]]
+        H = st0["sign_history"].shape[0]
+        idx = int(st0["hist_idx"])
+        fill = min(H, int(st0["hist_fill"]) + 1)
+
+        weights, shifts = self._pack_consts(dev)
+        flat = cur_bits.reshape(F, -1).to(torch.uint8)
+        pad = (-numel) % 8
+        if pad:
+            flat = torch.cat([flat, flat.new_zeros((F, pad))], dim=1)
+        new_planes = (flat.view(F, -1, 8) * weights).sum(-1, dtype=torch.uint8)
+
+        planes = torch.stack([self.state[p]["sign_history"] for p in ps])
+        planes[:, idx] = new_planes
+        if fill == H:
+            chron = torch.roll(planes, -idx, dims=1)
+            bits = ((chron.unsqueeze(-1) >> shifts).bitwise_and_(1)).view(F, H, -1)[
+                :, :, :numel
+            ]
+            s1 = bits.sum(1, dtype=torch.int16)
+            flips = (bits[:, 1:] ^ bits[:, :-1]).sum(1, dtype=torch.int16)
+            up = s1.eq(H).logical_or_(s1.eq(0))
+            down = flips.eq(H - 1)
+            w = update.abs().view(F, numel)
+            num = (w * up).sum(-1).sub_((w * down).sum(-1)).sum()
+            den = w.sum()
+            gi = self._param_group_index.get(ps[0])
+            if gi is not None:
+                if self._group_num[gi] is None:
+                    self._group_num[gi] = num
+                    self._group_den[gi] = den
+                else:
+                    self._group_num[gi].add_(num)
+                    self._group_den[gi].add_(den)
+            del bits, s1, flips, up, down, w
+
+        for i, p in enumerate(ps):
+            self.state[p]["sign_history"].copy_(planes[i])
+            self.state[p]["hist_idx"] = (idx + 1) % H
+            self.state[p]["hist_fill"] = fill
+            self.state[p]["step"] += 1
+
+        wd = group["weight_decay"]
+        lr_stack = torch.stack([self.state[p]["lr"] for p in ps]).view(F, *bcast)
+        P = torch.stack([p.detach() for p in ps]).to(torch.float32)
+        if wd != 0.0:
+            update.add_(P, alpha=wd)
+        newP = P.addcmul(update, lr_stack, value=-1.0)
+        if dtype == torch.bfloat16:
+            newP = self._sr_truncate(newP, 16)
+        elif dtype == torch.float16:
+            newP = self._sr_truncate(newP, 13)
+        elif dtype != torch.float32:
+            newP = self._stochastic_round(newP, dtype)
+        for i, p in enumerate(ps):
+            p.copy_(newP[i])
+            p.grad = None
+
     # ----------------------------------------------------------- optimizer API
 
     @torch.no_grad()
@@ -571,21 +696,47 @@ class Automagic3(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
         # Fused mode already updated every param in the backward hook; nothing
-        # left to do. Non-fused mode does the real work here.
+        # left to do. Non-fused mode does the real work here. Same-shape
+        # same-dtype params that are past state init run as ONE batched
+        # family (mirrors Automagic2's deferred step); anything else keeps
+        # the per-param path, which is also the reference the batched math
+        # was written against.
         if not self.fused:
-            for group in self.param_groups:
+            families = {}
+            for gi, group in enumerate(self.param_groups):
                 for p in group["params"]:
                     if not p.requires_grad:
                         continue
-                    # Low-precision grads were stochastically accumulated into
-                    # _accum_grad; hand it back as the grad to update from.
+                    # Low-precision grads were stochastically accumulated
+                    # into _accum_grad; hand it back as the grad to update
+                    # from.
                     accum = getattr(p, "_accum_grad", None)
                     if accum is not None:
                         p.grad = accum
                         del p._accum_grad
                     if p.grad is None:
                         continue
-                    self._update_param(p, group)
+                    st = self.state.get(p)
+                    if p.dim() < 1 or not st or "sign_history" not in st:
+                        self._update_param(p, group)
+                        continue
+                    families.setdefault((tuple(p.shape), p.dtype, p.device, gi), []).append(p)
+            nparams = sum(len(v) for v in families.values())
+            if families and not getattr(self, "_fam_printed", False):
+                self._fam_printed = True
+                print(
+                    f"Automagic3: shape-family batched step active "
+                    f"({len(families)} families, {nparams} params)"
+                )
+            for (shape, dtype, device, gi), ps in families.items():
+                group = self.param_groups[gi]
+                idxs = {int(self.state[p]["hist_idx"]) for p in ps}
+                fills = {int(self.state[p]["hist_fill"]) for p in ps}
+                if len(idxs) > 1 or len(fills) > 1:
+                    for p in ps:
+                        self._update_param(p, group)
+                    continue
+                self._step_family(ps, group)
         self._apply_group_votes()
         return loss
 
