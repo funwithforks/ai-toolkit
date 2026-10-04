@@ -207,17 +207,11 @@ class MiniMaxH3Attention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        out = None
-        if attn_mask is None:
-            # dense path: sm120-native FROST kernels replace torch SDPA's
-            # sm80 CUTLASS attention fwd+bwd (measured ~30% of step GPU time
-            # at bs4). Returns None on unsupported configs/shapes, where we
-            # fall back to SDPA below; the wrapper prints once on activate.
-            from toolkit.attention.frost import fused_sdpa
-
-            out = fused_sdpa(q, k, v, self.head_dim**-0.5)
-        if out is None:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        # torch SDPA kept deliberately: the sm120 FROST path was measured
+        # rate-neutral at bs4 (2345 vs 2322 ms/it paired 300-step runs) and
+        # a steady -33% at bs1 (1027 vs 689 ms/it) where cudnn plan compiles
+        # fire on every new sequence length; krea2 keeps its wiring.
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).reshape(b, s, -1)
         return self.out_proj(out)
 
