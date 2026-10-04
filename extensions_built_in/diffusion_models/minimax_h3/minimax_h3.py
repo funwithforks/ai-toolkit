@@ -457,9 +457,10 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         # _int_mm + triton for every other model.
         # DEFAULT OFF: the win is forward-only. Their tile is NT-only
         # (comfy-kitchen cutlass_gemm_int8.cu; cublas_gemm_int8.cu:121 hardcodes
-        # OP_T/OP_N), so dX (NN on q_w) and any dW cannot hit it; per the ship
-        # rule the pair does not ride on a forward-only gain. Opt in with
-        # model_kwargs int8_cutlass_gemm=true for experiments.
+        # OP_T/OP_N), so the backward orientations need cached K-major operand
+        # copies — served by model_kwargs int8_cutlass_bwd below, not by this
+        # switch. Opt in with model_kwargs int8_cutlass_gemm=true for
+        # experiments.
         if self.model_config.model_kwargs.get("int8_cutlass_gemm", False):
             from toolkit.util.convrot_quant import _get_cutlass_int8
 
@@ -484,6 +485,93 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                     f"({_cutlass_state.get('why', 'unknown')}); using "
                     f"torch._int_mm"
                 )
+        # backward CUTLASS arm (model_kwargs int8_cutlass_bwd): dX via the
+        # fused CUTLASS NT kernel, fed by a RESIDENT K-major copy of the
+        # frozen weight (built once per layer; bitwise-equal to the _int_mm
+        # int8 backward at op level — no quality gate needed IF it ever
+        # ships). EXPERIMENTAL / UNTIMED at step level: the per-step-
+        # transpose variant and the int8 d_r arm were built, benched at the
+        # live micro-batch m~1408, measured losers, and deleted. Resident
+        # copies cost ~5.8 GB across the fc2-class layers (100 resident
+        # copies OOMed the 32 GB card at bs4), so this is a 96 GB-card
+        # option; set the param only from a steady-state run reporting wall
+        # time + kernel counts against a control.
+        # Modes: off (default) | fc2 (in_features >= out_features layers) |
+        # full (also tags the fc1-class ones, whose dX measured SLOWER on
+        # the NT tile at live m — 771 vs 747 us per GEMM). Requires
+        # int8_bwd (the arm lives in that branch).
+        cb_mode = str(
+            self.model_config.model_kwargs.get("int8_cutlass_bwd", "off")
+        ).lower()
+        if cb_mode not in ("off", "", "fc2", "full"):
+            self.print_and_status_update(
+                f"  - unknown int8_cutlass_bwd mode '{cb_mode}' "
+                f"(expected off|fc2|full); feature OFF"
+            )
+            cb_mode = "off"
+        if cb_mode in ("fc2", "full"):
+            from toolkit.util.convrot_quant import _get_cutlass_int8
+
+            if _get_cutlass_int8() is None:
+                from toolkit.util.convrot_quant import _cutlass_state
+
+                self.print_and_status_update(
+                    f"  - int8_cutlass_bwd requested but comfy_kitchen is "
+                    f"unavailable ({_cutlass_state.get('why', 'unknown')}); "
+                    f"backward stays on torch._int_mm"
+                )
+            else:
+                n = 0
+                n_no_bwd = 0
+                n_skipped_class = 0
+                n_skipped_align = 0
+                n_skipped_small = 0
+                for m in transformer.modules():
+                    if getattr(m, "cr8_qdata", None) is None:
+                        continue
+                    if getattr(m, "cr8_bwd_mode", None) != "int8":
+                        n_no_bwd += 1
+                        continue
+                    in_f, out_f = m.in_features, m.out_features
+                    if in_f * out_f < 33_554_432:
+                        # the STE backward's measured amortization gate
+                        n_skipped_small += 1
+                        continue
+                    if cb_mode == "fc2" and in_f < out_f:
+                        n_skipped_class += 1
+                        continue
+                    if in_f % 16 or out_f % 16:
+                        n_skipped_align += 1
+                        continue
+                    m.cr8_cutlass_bwd = cb_mode
+                    n += 1
+                self.print_and_status_update(
+                    f"  - int8 backward CUTLASS arm (mode {cb_mode}) on {n} "
+                    f"quantized linears (dX via NT + resident K-major "
+                    f"operand copies; UNTIMED experimental path — see the "
+                    f"banner's sizing note in code)"
+                )
+                if n_skipped_class:
+                    self.print_and_status_update(
+                        f"    (fc1-class held on _int_mm by mode fc2: "
+                        f"{n_skipped_class} layers — full mode tags them "
+                        f"too but their dX measured slower on the NT tile "
+                        f"at live m)"
+                    )
+                if n_skipped_align:
+                    self.print_and_status_update(
+                        f"    (skipped, operand dims not %16: "
+                        f"{n_skipped_align})"
+                    )
+                if n_no_bwd:
+                    self.print_and_status_update(
+                        f"    (skipped, int8_bwd not active on them: {n_no_bwd})"
+                    )
+                if n == 0:
+                    self.print_and_status_update(
+                        "  - WARNING: int8_cutlass_bwd requested but no layer "
+                        "qualified — the feature is inert this run."
+                    )
         return transformer
 
     def _load_text_encoder(self):

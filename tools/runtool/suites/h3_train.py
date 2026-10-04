@@ -66,6 +66,13 @@ def _params():
         "rope": Param("bool", default=True, desc="H3_ROPE_FUSE"),
         "adaln": Param("bool", default=True, desc="H3_ADALN_FUSE"),
         "liger": Param("bool", default=False, desc="H3_LIGER_FUSIONS"),
+        "cutlass_bwd": Param(
+            "enum", default="off", choices=("off", "fc2", "full"),
+            desc="int8_cutlass_bwd model kwarg: CUTLASS NT dX arm on "
+                 "resident K-major operand copies (fc2 = fc2-class layers; "
+                 "full = also fc1-class, slower tile at live m). Untimed "
+                 "experimental path; needs copy headroom (96 GB card).",
+        ),
         "tag": Param("str", default="", desc="extra job-name tag"),
         "prof_start": Param(
             "int", default=None, min=5, max=5000,
@@ -153,6 +160,8 @@ def _derive_config(params, name, out_path):
     # toolkit sampling is never used for benchmarking (owner rule); the
     # sample block stays inert
     train["disable_sampling"] = True
+    mm = proc["model"].setdefault("model_kwargs", {})
+    mm["int8_cutlass_bwd"] = params["cutlass_bwd"]
     folders = _load_map(params["dataset"])
     ds = proc["datasets"]
     if len(folders) != len(ds):
