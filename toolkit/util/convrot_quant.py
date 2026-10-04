@@ -1226,6 +1226,87 @@ def _cutlass_gemm_forward(
     return out
 
 
+def _cutlass_bwd_notify(why):
+    if why not in _cutlass_notified:
+        _cutlass_notified.add(why)
+        print_acc(
+            f"ConvRot: cr8_cutlass_bwd requested but {why}; using the "
+            "_int_mm + triton epilogue path for these layers."
+        )
+
+
+def _cutlass_nt_bwd(aq, a_s, b_nt, w_scale_n, out_dtype, m):
+    """NT launch of comfy_kitchen's fused CUTLASS int8 GEMM for the backward
+    (D[m,n] = sum_k aq[m,k] b_nt[n,k] * a_s[m] * w_scale_n[n], no bias, no
+    lora). b_nt must be the K-major (contiguous [n, k]) operand: the row-major
+    qdata [out, in] buffer reduces over out and cannot alias this layout, so
+    callers pass a cached transpose. Returns None (caller keeps _int_mm) unless
+    library, shape and dtype all qualify."""
+    backend = _get_cutlass_int8()
+    if backend is None:
+        _cutlass_bwd_notify(
+            f"comfy_kitchen is unavailable ({_cutlass_state.get('why')})"
+        )
+        return None
+    fn, wrap = backend
+    n, k = b_nt.shape
+    if n % 16 or k % 16:
+        _cutlass_bwd_notify(f"shape needs N,K % 16, got N={n} K={k}")
+        return None
+    if out_dtype not in _CUTLASS_DTYPE:
+        _cutlass_bwd_notify(f"out dtype {out_dtype}")
+        return None
+    out = torch.empty(m, n, device=aq.device, dtype=out_dtype)
+    ok = fn(
+        wrap(aq[:m]),
+        wrap(b_nt),
+        wrap(a_s[:m].reshape(m, 1).contiguous()),
+        wrap(w_scale_n),
+        wrap(torch.empty(0, device=aq.device, dtype=out_dtype)),
+        wrap(out),
+        _CUTLASS_DTYPE[out_dtype],
+        torch.cuda.current_stream(aq.device).cuda_stream,
+    )
+    if not ok:
+        _cutlass_bwd_notify("the kernel declined this launch")
+        return None
+    return out
+
+
+def _cutlass_dx_bwd(gq, g_s, qdata, out_dtype, m):
+    """dx via the fused CUTLASS NT kernel, fed by a RESIDENT K-major copy of
+    the frozen weight (built once per layer, per-tensor attribute: identity-
+    correct, freed with the weight, rebuilt on in-place requantization — if a
+    future tracing path ever hands backward a fresh tensor object per step the
+    build banner prints every step, impossible to miss). The GEMM itself is
+    numerically identical to the _int_mm + epilogue int8 backward (same gq,
+    same per-row scales, ones on the free side; verified arm-vs-arm through
+    the real op, bitwise-equal at op level). NOT TIMED at step level yet:
+    the per-step-transpose variant lost at the live micro-batch m (the
+    154 MB-class transpose is size-fixed while the GEMM saving shrinks), so
+    this resident form ships nothing until a steady-state run reports wall
+    time against a control on a card with the copy headroom."""
+    n_out, k_in = qdata.shape
+    ent = getattr(qdata, "_cr8_dx_nt", None)
+    if ent is None or ent[0] != qdata._version:
+        b_nt = qdata.t().contiguous()
+        qdata._cr8_dx_nt = (qdata._version, b_nt)
+        print_acc(
+            f"ConvRot: built resident K-major dX operand for a convrot "
+            f"int8 layer [{n_out}, {k_in}] "
+            f"({b_nt.numel() / 1e6:.1f} MB); reused every step while the "
+            f"base weight stays frozen."
+        )
+    else:
+        b_nt = ent[1]
+    ones = _cached(
+        _int8_bwd_ones,
+        (k_in, qdata.device),
+        lambda: torch.ones(k_in, device=qdata.device, dtype=torch.float32),
+    )
+    return _cutlass_nt_bwd(gq, g_s, b_nt, ones, out_dtype, m)
+
+
 @torch.library.custom_op("ostris::convrot_int8_linear_ste", mutates_args=())
 def _int8_linear_ste_op(
     x2d: torch.Tensor,
@@ -1239,6 +1320,7 @@ def _int8_linear_ste_op(
     lora_u: Optional[torch.Tensor] = None,
     epi_dot: bool = False,
     cutlass_gemm: bool = False,
+    cutlass_bwd: str = "off",
 ) -> torch.Tensor:
     m = x2d.shape[0]
     aq, a_s = _int8_act_quant_padded(x2d, act_qmax)
@@ -1280,6 +1362,7 @@ def _int8_linear_ste_fake(
     lora_u=None,
     epi_dot=False,
     cutlass_gemm=False,
+    cutlass_bwd="off",
 ):
     return torch.empty(
         x2d.shape[0], qdata.shape[0], device=x2d.device, dtype=getattr(torch, out_dtype)
@@ -1299,37 +1382,21 @@ def _int8_linear_ste_setup(ctx, inputs, output):
         lora_u,
         _epi_dot,
         _cutlass_gemm,
+        _cutlass_bwd,
     ) = inputs
     ctx.bwd_mode = str(bwd_mode)
     ctx.act_qmax = int(act_qmax)
+    ctx.cutlass_bwd = str(_cutlass_bwd)
     ctx.save_for_backward(qdata, w_scales_u8, lora_r, lora_u)
 
 
 _int8_bwd_warned = False
+_int8_bwd_small_notified: set = set()
 _int8_bwd_ones: dict = {}
 
 
 def _int8_linear_ste_backward(ctx, grad):
     qdata, w_scales_u8, lora_r, lora_u = ctx.saved_tensors
-    # LoRA gradients (when the up-projection was folded into the epilogue):
-    # exactly the values autograd would have produced through lora_up. The
-    # folded r@u runs in the epilogue's fp32 math, so the incoming grad can
-    # legally arrive in a dtype the saved lora tensors are not in; autograd's
-    # contract for a dtype-cast autograd.Function is to cast the grad to the
-    # saved parameter dtype, which is what happens here (a no-op when the
-    # dtypes agree). The plain (unfolded) route through lora_up applies the
-    # same rule; refusing to cast here would make the fold depend on who
-    # happens to be upstream of the layer.
-    if lora_r is not None:
-        grad_r = grad.to(lora_u.dtype)
-        d_r = grad_r @ lora_u
-    else:
-        d_r = None
-    if lora_u is not None:
-        grad_u = grad.to(lora_r.dtype)
-        d_u = grad_u.t() @ lora_r
-    else:
-        d_u = None
     if getattr(ctx, "bwd_mode", "eager") == "int8":
         # Opt-in (module.cr8_bwd_mode): run the input-gradient GEMM on the int8
         # tensor cores too. dx = (grad * w_scales) @ qdata with grad quantized
@@ -1347,28 +1414,84 @@ def _int8_linear_ste_backward(ctx, grad):
         ):
             w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
             gq, g_s = _int8_act_quant_padded(grad * w_scales, ctx.act_qmax)
-            i32 = torch._int_mm(gq, qdata)
             m = grad.shape[0]
-            ones = _cached(
-                _int8_bwd_ones,
-                (qdata.shape[1], grad.device),
-                lambda: torch.ones(
-                    qdata.shape[1], device=grad.device, dtype=torch.float32
-                ),
+            dx = None
+            crbwd = str(getattr(ctx, "cutlass_bwd", "off"))
+            use_cutlass = crbwd != "off"
+            if use_cutlass:
+                # module.cr8_cutlass_bwd: dX rides the fused CUTLASS NT
+                # kernel on a resident K-major copy (modes fc2/full differ
+                # only in which layers the model tagged). Untimed at step
+                # level; see _cutlass_dx_bwd's docstring for the contract.
+                dx = _cutlass_dx_bwd(gq, g_s, qdata, grad.dtype, m)
+            if dx is None:
+                i32 = torch._int_mm(gq, qdata)
+                ones = _cached(
+                    _int8_bwd_ones,
+                    (qdata.shape[1], grad.device),
+                    lambda: torch.ones(
+                        qdata.shape[1], device=grad.device, dtype=torch.float32
+                    ),
+                )
+                dx = _int8_epilogue(i32[:m], g_s[:m], ones, None, grad.dtype)
+            # LoRA gradients. Contract for a dtype-cast autograd.Function:
+            # cast the incoming grad to the saved parameter dtype (a no-op
+            # when the dtypes agree) — applies to d_r and d_u. (An int8 d_r
+            # arm was built and deleted: at the live micro-batch m~1408 the
+            # bf16 mm is 50us and the CUTLASS arm + per-step operand build
+            # measured ~290us — a clear loss.)
+            d_r = grad.to(lora_u.dtype) @ lora_u if lora_r is not None else None
+            d_u = None
+            if lora_u is not None:
+                d_u = grad.to(lora_r.dtype).t() @ lora_r
+            return (
+                dx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                d_r,
+                d_u,
+                None,
+                None,
+                None,
             )
-            dx = _int8_epilogue(i32[:m], g_s[:m], ones, None, grad.dtype)
-            return (dx, None, None, None, None, None, None, d_r, d_u, None, None)
         global _int8_bwd_warned
-        if big and not _int8_bwd_warned:
+        if not big:
+            # The gate is an amortization rule, but the module still asked for
+            # the int8 backward. A silent degrade to eager here hides itself in
+            # benchmarks (the layer quietly runs a different path than the one
+            # under test), so it prints — once per distinct weight shape.
+            key = tuple(qdata.shape)
+            if key not in _int8_bwd_small_notified:
+                _int8_bwd_small_notified.add(key)
+                print_acc(
+                    f"ConvRot: cr8_bwd_mode='int8' requested on a small weight "
+                    f"{key} ({key[0] * key[1] / 1e6:.1f}M elements, below the "
+                    f"33.5M measured amortization threshold on sm_120); this "
+                    f"shape runs the eager backward instead"
+                    + (
+                        " — cr8_cutlass_bwd is inert here"
+                        if getattr(ctx, "cutlass_bwd", False)
+                        else ""
+                    )
+                    + "."
+                )
+        elif not _int8_bwd_warned:
             _int8_bwd_warned = True
             print_acc(
                 f"ConvRot: cr8_bwd_mode='int8' requested but grad layout is not "
                 f"supported (dtype={grad.dtype}, shape={tuple(grad.shape)}); "
                 f"falling back to the eager backward for every such layer."
             )
+    # LoRA gradients on the eager route (same cast contract as above).
+    d_r = grad.to(lora_u.dtype) @ lora_u if lora_r is not None else None
+    d_u = grad.to(lora_r.dtype).t() @ lora_r if lora_u is not None else None
     w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
     w = qdata.to(grad.dtype) * w_scales.unsqueeze(1)
-    return (grad @ w, None, None, None, None, None, None, d_r, d_u, None, None)
+    return (grad @ w, None, None, None, None, None, None, d_r, d_u, None, None, None)
 
 
 _int8_linear_ste_op.register_autograd(
@@ -1773,6 +1896,7 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
             lora[1] if lora is not None else None,
             bool(getattr(module, "cr8_epi_dot", False)),
             bool(getattr(module, "cr8_cutlass_gemm", False)),
+            str(getattr(module, "cr8_cutlass_bwd", "off")),
         )
 
     def fake_quant_rotated_weight(self, module, w_rot: torch.Tensor) -> torch.Tensor:
