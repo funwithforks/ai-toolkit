@@ -191,6 +191,7 @@ class MiniMaxH3Attention(nn.Module):
         x: torch.Tensor,  # (B, S, hidden)
         rotary_emb=None,  # (cos, sin) each (B, S, rot) or None
         attn_mask: Optional[torch.Tensor] = None,  # (B, 1, 1, S) bool, True = attend
+        varlen_ctx=None,  # (idx, cu, max_len) packed live rows, or None
         vsa=None,  # H3VSAContext or None (dense)
     ) -> torch.Tensor:
         b, s, _ = x.shape
@@ -211,6 +212,23 @@ class MiniMaxH3Attention(nn.Module):
             gate = self.to_gate_compress(x).view(b, s, self.heads, self.head_dim)
             out = vsa_attention(q, k, v, gate, vsa)
             return self.out_proj(out.reshape(b, s, -1))
+
+        if varlen_ctx is not None:
+            # packed live rows -> flash varlen; exact key-mask semantics on
+            # any pad layout (the (B,1,1,S) mask form forces torch onto the
+            # sm80 mem-efficient kernels at ~3x cost on these shapes). Pad
+            # outputs are left zero; the final heads select the live rows,
+            # so pad values are discarded everywhere downstream.
+            idx, cu, max_len = varlen_ctx
+            from .flash_varlen import flash_varlen_sdpa
+
+            qf = q.reshape(b * s, self.heads, self.head_dim)[idx]
+            kf = k.reshape(b * s, self.heads, self.head_dim)[idx]
+            vf = v.reshape(b * s, self.heads, self.head_dim)[idx]
+            of = flash_varlen_sdpa(qf, kf, vf, cu, max_len, self.head_dim**-0.5)
+            out = q.new_zeros(b * s, self.heads * self.head_dim)
+            out = out.index_copy(0, idx, of.reshape(-1, self.heads * self.head_dim))
+            return self.out_proj(out.view(b, s, -1))
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -355,6 +373,7 @@ class MiniMaxH3Block(nn.Module):
         adaln_indices: torch.Tensor,  # (B, S) long into the (M * 3) table
         rotary_emb,  # (cos, sin)
         attn_mask: Optional[torch.Tensor] = None,
+        varlen_ctx=None,  # (idx, cu, max_len) packed live rows, or None
         vsa=None,  # H3VSAContext or None (dense)
     ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -366,7 +385,7 @@ class MiniMaxH3Block(nn.Module):
             adaln_indices
         ].to(dt)
         x = x + gate_msa[adaln_indices].to(dt) * self.attn(
-            h, rotary_emb, attn_mask, vsa
+            h, rotary_emb, attn_mask, varlen_ctx, vsa
         )
 
         h = _fused_norm(x, self.norm2) * (1.0 + scale_mlp[adaln_indices].to(dt)) + shift_mlp[
@@ -568,11 +587,27 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         # (their outputs are discarded), which keeps SDPA rows finite
         attn_mask = None
         text_attn_mask = None
+        varlen_ctx = None
         is_pad = token_tags < 0
         if bool(is_pad.any()):
             live = ~is_pad
-            attn_mask = live[:, None, None, :]
             text_attn_mask = live[:, text_indices][:, None, None, :]
+            from .flash_varlen import varlen_ok
+
+            if varlen_ok():
+                # pack live rows (b-major) into a varlen stream; works for
+                # interleaved pads, which a length-based ragged expression
+                # cannot express. Sync is free here: is_pad.any() above
+                # already drained the pipeline once per model forward.
+                idx = live.reshape(-1).nonzero(as_tuple=True)[0]
+                n_live = live.sum(dim=1)
+                cu = torch.zeros(
+                    batch_size + 1, dtype=torch.int32, device=live.device
+                )
+                cu[1:] = n_live.cumsum(0).to(torch.int32)
+                varlen_ctx = (idx, cu, int(n_live.max()))
+            else:
+                attn_mask = live[:, None, None, :]
 
         text_embeds = self.token_refiner(text_embeds, text_attn_mask)
 
@@ -619,11 +654,20 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                     adaln_indices,
                     rotary_emb,
                     attn_mask,
+                    varlen_ctx,
                     vsa_ctx,
                     use_reentrant=False,
                 )
             else:
-                x = block(x, temb, adaln_indices, rotary_emb, attn_mask, vsa_ctx)
+                x = block(
+                    x,
+                    temb,
+                    adaln_indices,
+                    rotary_emb,
+                    attn_mask,
+                    varlen_ctx,
+                    vsa_ctx,
+                )
 
         video_all, audio_all = self.final_layer(x, temb, inverse)
         video_out = video_all.index_select(1, video_indices)
