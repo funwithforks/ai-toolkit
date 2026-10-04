@@ -926,8 +926,62 @@ def _get_int8_kernels():
             out += tl.sum(ut * rv[None, :], axis=1)
         tl.store(o_ptr + row * N + offs, out.to(o_ptr.dtype.element_ty), mask=mask)
 
-    _int8_kernels = (int8_act_quant_kernel, int8_epilogue_kernel)
+    _int8_kernels = (int8_act_quant_kernel, int8_epilogue_kernel,
+                     _make_int8_epilogue_dot_kernel(triton, tl))
     return _int8_kernels
+
+
+def _make_int8_epilogue_dot_kernel(triton, tl):
+    # tensor-core variant of the lora-fold epilogue: the rank term is
+    # rv @ u^T as tl.dot (bf16 operands, fp32 accumulator through shared
+    # memory) instead of the fp32 broadcast-and-sum. The elementwise form
+    # keeps the [BLOCK_N, rank] u-tile in registers and caps at ~1.1 TB/s
+    # on sm_120; the dot form reaches ~1.5 TB/s (measured at the live
+    # shapes, bench in loading_refactor). Values differ from the
+    # elementwise path by <=1 bf16 ulp in the lora term (tensor-core
+    # accumulation order); selected per module via cr8_epi_dot, default
+    # off so every other model stays bitwise unchanged.
+    @triton.jit
+    def int8_epilogue_dot_kernel(
+        i_ptr,
+        as_ptr,
+        ws_ptr,
+        b_ptr,
+        o_ptr,
+        r_ptr,
+        u_ptr,
+        N,
+        n_rows,
+        HAS_BIAS: tl.constexpr,
+        KL: tl.constexpr,
+        N_KL: tl.constexpr,
+        ROWS: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid_r = tl.program_id(0)
+        cb = tl.program_id(1)
+        rows = pid_r * ROWS + tl.arange(0, ROWS)
+        rmask = rows < n_rows
+        offs = cb * BLOCK_N + tl.arange(0, BLOCK_N)
+        cmask = offs < N
+        m = rmask[:, None] & cmask[None, :]
+        acc = tl.load(i_ptr + rows[:, None] * N + offs[None, :], mask=m,
+                      other=0).to(tl.float32)
+        a_s = tl.load(as_ptr + rows, mask=rmask, other=0.0)
+        w_s = tl.load(ws_ptr + offs, mask=cmask, other=0.0)
+        out = acc * (a_s[:, None] * w_s[None, :])
+        if HAS_BIAS:
+            out += tl.load(b_ptr + offs, mask=cmask, other=0.0).to(tl.float32)
+        rk = tl.arange(0, KL)
+        rv = tl.load(r_ptr + rows[:, None] * N_KL + rk[None, :],
+                     mask=rmask[:, None], other=0.0)
+        ut = tl.load(u_ptr + offs[None, :] * N_KL + rk[:, None],
+                     mask=cmask[None, :], other=0.0)
+        out += tl.dot(rv, ut)
+        tl.store(o_ptr + rows[:, None] * N + offs[None, :],
+                 out.to(o_ptr.dtype.element_ty), mask=m)
+
+    return int8_epilogue_dot_kernel
 
 
 # registered as custom ops so torch.compile treats the triton launches as opaque
@@ -943,7 +997,7 @@ def _int8_act_quant_op(x: torch.Tensor, qmax: int) -> list[torch.Tensor]:
     if rows_pad != rows:
         q[rows:].zero_()
         scales[rows:].fill_(1.0)
-    kernel, _ = _get_int8_kernels()
+    kernel, _, _ = _get_int8_kernels()
     # triton block shapes must be powers of 2; loads/stores are masked on offs < K
     block_k = min(2048, 1 << (K - 1).bit_length())
     kernel[(rows,)](x, q, scales, K, QMAX=qmax, BLOCK_K=block_k, num_warps=8)
@@ -969,10 +1023,11 @@ def _int8_epilogue_op(
     out_dtype: str,
     lora_r: Optional[torch.Tensor] = None,
     lora_u: Optional[torch.Tensor] = None,
+    epi_dot: bool = False,
 ) -> torch.Tensor:
     m, n = i32.shape
     out = torch.empty(m, n, device=i32.device, dtype=getattr(torch, out_dtype))
-    _, kernel = _get_int8_kernels()
+    _, kernel, kernel_dot = _get_int8_kernels()
     has_lora = lora_r is not None
     rank = lora_r.shape[1] if has_lora else 16
     kl = 1 << (rank - 1).bit_length()
@@ -984,10 +1039,33 @@ def _int8_epilogue_op(
         raise RuntimeError(
             f"int8 epilogue lora rank must be a power of two <= 64, got {rank}"
         )
-    # 512/num_warps=4 measured ~9% faster than 256 on the lora path at the
-    # live shapes (1193 GB/s vs 1095 at [7104, 28672]; RTX 5090 roofline for
-    # int32-in + bf16-out is ~1.2 TB/s); the kernel is bandwidth-bound, so
-    # tile size only amortizes launch/scheduling, not traffic
+    if has_lora and epi_dot and kl >= 16:
+        # tl.dot needs K >= 16; smaller ranks keep the elementwise kernel
+        block_r, block_n = 32, 128
+        grid = (-(-m // block_r), -(-n // block_n))
+        kernel_dot[grid](
+            i32,
+            a_scales,
+            w_scales,
+            bias if bias is not None else a_scales,
+            out,
+            lora_r,
+            lora_u,
+            n,
+            m,
+            HAS_BIAS=bias is not None,
+            KL=kl,
+            N_KL=rank,
+            ROWS=block_r,
+            BLOCK_N=block_n,
+            num_warps=8,
+        )
+        return out
+    if has_lora and epi_dot and kl < 16:
+        print_acc(
+            f"ConvRot: cr8_epi_dot requested at rank {rank} (<16); tl.dot "
+            "cannot run, using the elementwise epilogue for this layer."
+        )
     block_n = 512 if has_lora else 1024
     grid = (m, -(-n // block_n))
     kernel[grid](
@@ -1011,7 +1089,8 @@ def _int8_epilogue_op(
 
 @_int8_epilogue_op.register_fake
 def _int8_epilogue_fake(
-    i32, a_scales, w_scales, bias, out_dtype, lora_r=None, lora_u=None
+    i32, a_scales, w_scales, bias, out_dtype, lora_r=None, lora_u=None,
+    epi_dot=False,
 ):
     m, n = i32.shape
     return torch.empty(m, n, device=i32.device, dtype=getattr(torch, out_dtype))
@@ -1082,6 +1161,7 @@ def _int8_linear_ste_op(
     bwd_mode: str = "eager",
     lora_r: Optional[torch.Tensor] = None,
     lora_u: Optional[torch.Tensor] = None,
+    epi_dot: bool = False,
 ) -> torch.Tensor:
     m = x2d.shape[0]
     aq, a_s = _int8_act_quant_padded(x2d, act_qmax)
@@ -1093,6 +1173,7 @@ def _int8_linear_ste_op(
         bias,
         getattr(torch, out_dtype),
         lora=(lora_r, lora_u) if lora_r is not None else None,
+        epi_dot=epi_dot,
     )
 
 
@@ -1107,6 +1188,7 @@ def _int8_linear_ste_fake(
     bwd_mode="eager",
     lora_r=None,
     lora_u=None,
+    epi_dot=False,
 ):
     return torch.empty(
         x2d.shape[0], qdata.shape[0], device=x2d.device, dtype=getattr(torch, out_dtype)
@@ -1124,6 +1206,7 @@ def _int8_linear_ste_setup(ctx, inputs, output):
         bwd_mode,
         lora_r,
         lora_u,
+        _epi_dot,
     ) = inputs
     ctx.bwd_mode = str(bwd_mode)
     ctx.act_qmax = int(act_qmax)
@@ -1182,7 +1265,7 @@ def _int8_linear_ste_backward(ctx, grad):
                 ),
             )
             dx = _int8_epilogue(i32[:m], g_s[:m], ones, None, grad.dtype)
-            return dx, None, None, None, None, None, None, d_r, d_u
+            return (dx, None, None, None, None, None, None, d_r, d_u, None)
         global _int8_bwd_warned
         if big and not _int8_bwd_warned:
             _int8_bwd_warned = True
@@ -1193,7 +1276,7 @@ def _int8_linear_ste_backward(ctx, grad):
             )
     w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
     w = qdata.to(grad.dtype) * w_scales.unsqueeze(1)
-    return grad @ w, None, None, None, None, None, None, d_r, d_u
+    return (grad @ w, None, None, None, None, None, None, d_r, d_u, None)
 
 
 _int8_linear_ste_op.register_autograd(
@@ -1208,6 +1291,7 @@ def _int8_epilogue(
     bias,
     out_dtype: torch.dtype,
     lora=None,
+    epi_dot: bool = False,
 ) -> torch.Tensor:
     """out = i32 * a_scales[:, None] * w_scales[None, :] (+ bias) (+ rank @ u^T)."""
     r = lora[0] if lora is not None else None
@@ -1221,6 +1305,7 @@ def _int8_epilogue(
             str(out_dtype).split(".")[-1],
             r,
             u,
+            bool(epi_dot),
         )
     out = i32.float() * w_scales
     out = out * a_scales.unsqueeze(1)
@@ -1594,6 +1679,7 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
             str(getattr(module, "cr8_bwd_mode", "eager")),
             lora[0] if lora is not None else None,
             lora[1] if lora is not None else None,
+            bool(getattr(module, "cr8_epi_dot", False)),
         )
 
     def fake_quant_rotated_weight(self, module, w_rot: torch.Tensor) -> torch.Tensor:
