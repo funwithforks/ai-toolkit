@@ -113,6 +113,13 @@ class MiniMaxH3Rope(nn.Module):
 
 def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     """x (B, S, H, D); cos/sin (B, S, rot) rotate the leading ``rot`` channels."""
+    # fused Triton path when available; returns None (and the env kill switch
+    # lives in rope_fusion) to fall through to the torch ops below
+    from .rope_fusion import fused_rope
+
+    out = fused_rope(x, cos, sin)
+    if out is not None:
+        return out
     rot = cos.shape[-1]
     x_rot, x_pass = x[..., :rot], x[..., rot:]
     cos = cos.to(x.dtype).unsqueeze(2)
@@ -200,7 +207,17 @@ class MiniMaxH3Attention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = None
+        if attn_mask is None:
+            # dense path: sm120-native FROST kernels replace torch SDPA's
+            # sm80 CUTLASS attention fwd+bwd (measured ~30% of step GPU time
+            # at bs4). Returns None on unsupported configs/shapes, where we
+            # fall back to SDPA below; the wrapper prints once on activate.
+            from toolkit.attention.frost import fused_sdpa
+
+            out = fused_sdpa(q, k, v, self.head_dim**-0.5)
+        if out is None:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).reshape(b, s, -1)
         return self.out_proj(out)
 
