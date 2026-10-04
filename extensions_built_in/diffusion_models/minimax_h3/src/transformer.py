@@ -38,6 +38,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from .kernels import fused_norm as _fused_norm, swiglu_mul as _fused_swiglu_mul
+from .adaln_fusion import gated_residual, modulated_norm
 
 MODALITY_NUM = 3  # 0 = video, 1 = text, 2 = audio; -1 marks padding rows
 
@@ -379,19 +380,24 @@ class MiniMaxH3Block(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaln_proj(temb)
         )
-        dt = x.dtype  # pruned checkpoints store the adaln projections fp16
 
-        h = _fused_norm(x, self.norm1) * (1.0 + scale_msa[adaln_indices].to(dt)) + shift_msa[
-            adaln_indices
-        ].to(dt)
-        x = x + gate_msa[adaln_indices].to(dt) * self.attn(
-            h, rotary_emb, attn_mask, varlen_ctx, vsa
+        # one fused kernel per modulation point: the eager form gathered six
+        # (B, S, hidden) float32 table rows and cast them per block, which
+        # dominated the bs4 elementwise traffic (see adaln_fusion.py)
+        h = modulated_norm(
+            _fused_norm(x, self.norm1), scale_msa, shift_msa, adaln_indices
+        )
+        x = gated_residual(
+            x,
+            gate_msa,
+            self.attn(h, rotary_emb, attn_mask, varlen_ctx, vsa),
+            adaln_indices,
         )
 
-        h = _fused_norm(x, self.norm2) * (1.0 + scale_mlp[adaln_indices].to(dt)) + shift_mlp[
-            adaln_indices
-        ].to(dt)
-        x = x + gate_mlp[adaln_indices].to(dt) * self.mlp(h)
+        h = modulated_norm(
+            _fused_norm(x, self.norm2), scale_mlp, shift_mlp, adaln_indices
+        )
+        x = gated_residual(x, gate_mlp, self.mlp(h), adaln_indices)
         return x
 
 
