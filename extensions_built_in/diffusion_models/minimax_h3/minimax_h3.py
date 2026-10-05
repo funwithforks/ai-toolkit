@@ -486,19 +486,17 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                     f"torch._int_mm"
                 )
         # backward CUTLASS arm (model_kwargs int8_cutlass_bwd): dX via the
-        # fused CUTLASS NT kernel, fed by a RESIDENT K-major copy of the
-        # frozen weight (built once per layer; bitwise-equal to the _int_mm
-        # int8 backward at op level — no quality gate needed IF it ever
-        # ships). EXPERIMENTAL / UNTIMED at step level: the per-step-
-        # transpose variant and the int8 d_r arm were built, benched at the
-        # live micro-batch m~1408, measured losers, and deleted. Resident
-        # copies cost ~5.8 GB across the fc2-class layers (100 resident
-        # copies OOMed the 32 GB card at bs4), so this is a 96 GB-card
-        # option; set the param only from a steady-state run reporting wall
-        # time + kernel counts against a control.
+        # fused CUTLASS NT kernel, fed by a per-step tiled triton transpose
+        # of the frozen weight into the K-major operand (0.22 ms at the
+        # 154 MB class; bitwise-equal to the _int_mm int8 backward under
+        # live scales). Measured through the op: fc2-class dX gains ~2.0
+        # ms/layer at production m (15k rows) and washes at m~1408, so a
+        # run at that m will not show it. An earlier RESIDENT-copy design
+        # pinned 154 MB/layer (~15.4 GB over 100 layers), OOM-skipped every
+        # 32 GB step measurement, and was dropped for the transpose.
         # Modes: off (default) | fc2 (in_features >= out_features layers) |
-        # full (also tags the fc1-class ones, whose dX measured SLOWER on
-        # the NT tile at live m — 771 vs 747 us per GEMM). Requires
+        # full (also tags the fc1-class ones, whose dX loses at every m on
+        # this kernel — kept as an experiment switch, not a suggestion). Requires
         # int8_bwd (the arm lives in that branch).
         cb_mode = str(
             self.model_config.model_kwargs.get("int8_cutlass_bwd", "off")
@@ -547,9 +545,8 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                     n += 1
                 self.print_and_status_update(
                     f"  - int8 backward CUTLASS arm (mode {cb_mode}) on {n} "
-                    f"quantized linears (dX via NT + resident K-major "
-                    f"operand copies; UNTIMED experimental path — see the "
-                    f"banner's sizing note in code)"
+                    f"quantized linears (dX via NT + per-step tiled "
+                    f"transpose, nothing resident)"
                 )
                 if n_skipped_class:
                     self.print_and_status_update(
