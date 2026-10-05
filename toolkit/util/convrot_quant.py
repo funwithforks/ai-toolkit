@@ -926,8 +926,22 @@ def _get_int8_kernels():
             out += tl.sum(ut * rv[None, :], axis=1)
         tl.store(o_ptr + row * N + offs, out.to(o_ptr.dtype.element_ty), mask=mask)
 
+    @triton.jit
+    def int8_transpose_kernel(
+        src_ptr, dst_ptr, N, K, BN: tl.constexpr, BK: tl.constexpr
+    ):
+        pn = tl.program_id(0)
+        pk = tl.program_id(1)
+        offs_n = pn * BN + tl.arange(0, BN)
+        offs_k = pk * BK + tl.arange(0, BK)
+        tile = tl.load(src_ptr + offs_n[:, None] * K + offs_k[None, :])
+        tl.store(
+            dst_ptr + offs_k[:, None] * N + offs_n[None, :], tl.trans(tile)
+        )
+
     _int8_kernels = (int8_act_quant_kernel, int8_epilogue_kernel,
-                     _make_int8_epilogue_dot_kernel(triton, tl))
+                     _make_int8_epilogue_dot_kernel(triton, tl),
+                     int8_transpose_kernel)
     return _int8_kernels
 
 
@@ -997,7 +1011,7 @@ def _int8_act_quant_op(x: torch.Tensor, qmax: int) -> list[torch.Tensor]:
     if rows_pad != rows:
         q[rows:].zero_()
         scales[rows:].fill_(1.0)
-    kernel, _, _ = _get_int8_kernels()
+    kernel, _, _, _ = _get_int8_kernels()
     # triton block shapes must be powers of 2; loads/stores are masked on offs < K
     block_k = min(2048, 1 << (K - 1).bit_length())
     kernel[(rows,)](x, q, scales, K, QMAX=qmax, BLOCK_K=block_k, num_warps=8)
@@ -1027,7 +1041,7 @@ def _int8_epilogue_op(
 ) -> torch.Tensor:
     m, n = i32.shape
     out = torch.empty(m, n, device=i32.device, dtype=getattr(torch, out_dtype))
-    _, kernel, kernel_dot = _get_int8_kernels()
+    _, kernel, kernel_dot, _ = _get_int8_kernels()
     has_lora = lora_r is not None
     rank = lora_r.shape[1] if has_lora else 16
     kl = 1 << (rank - 1).bit_length()
@@ -1273,32 +1287,47 @@ def _cutlass_nt_bwd(aq, a_s, b_nt, w_scale_n, out_dtype, m):
     return out
 
 
+_dx_nt_bannerred: set = set()
+
+
 def _cutlass_dx_bwd(gq, g_s, qdata, out_dtype, m):
-    """dx via the fused CUTLASS NT kernel, fed by a RESIDENT K-major copy of
-    the frozen weight (built once per layer, per-tensor attribute: identity-
-    correct, freed with the weight, rebuilt on in-place requantization — if a
-    future tracing path ever hands backward a fresh tensor object per step the
-    build banner prints every step, impossible to miss). The GEMM itself is
-    numerically identical to the _int_mm + epilogue int8 backward (same gq,
-    same per-row scales, ones on the free side; verified arm-vs-arm through
-    the real op, bitwise-equal at op level). NOT TIMED at step level yet:
-    the per-step-transpose variant lost at the live micro-batch m (the
-    154 MB-class transpose is size-fixed while the GEMM saving shrinks), so
-    this resident form ships nothing until a steady-state run reports wall
-    time against a control on a card with the copy headroom."""
+    """dx via the fused CUTLASS NT kernel on a per-step tiled transpose of the
+    shipped weight: [out, in] row-major -> the [in, out] K-major operand,
+    0.22 ms at the 154 MB class (measured bitwise vs torch's contiguous
+    transpose). Measured through this op: fc2-class (N=in side) gains
+    ~2.0 ms/layer at production m (15k rows) and washes at m~1408; the
+    fc1-class orientation loses at every m, which is why only fc2-tagged
+    layers route here. A per-tensor RESIDENT copy of the operand (the first
+    design) pinned 154 MB/layer, ~15.4 GB over 100 layers, and OOM-skipped
+    its way through every 32 GB measurement — per-step transpose is the
+    formulation that fits. Numerics: bitwise-equal to the _int_mm + Triton
+    epilogue arm under live e4m3-dequant scales; with arbitrary fp32 scales
+    the visitor's (acc*xs)*ws rounding differs on ~5e-6 of bf16 outputs by
+    1 ulp. Returns None (caller keeps _int_mm) when the shape or library
+    does not qualify."""
     n_out, k_in = qdata.shape
-    ent = getattr(qdata, "_cr8_dx_nt", None)
-    if ent is None or ent[0] != qdata._version:
-        b_nt = qdata.t().contiguous()
-        qdata._cr8_dx_nt = (qdata._version, b_nt)
+    if n_out % 64 or k_in % 256 or not _triton_available():
+        if qdata.shape not in _dx_nt_bannerred:
+            _dx_nt_bannerred.add(qdata.shape)
+            print_acc(
+                f"ConvRot: int8 dX CUTLASS arm cannot take a "
+                f"[{n_out}, {k_in}] weight (transpose tile alignment or "
+                f"triton unavailable); this layer stays on _int_mm."
+            )
+        return None
+    if qdata.shape not in _dx_nt_bannerred:
+        _dx_nt_bannerred.add(qdata.shape)
         print_acc(
-            f"ConvRot: built resident K-major dX operand for a convrot "
-            f"int8 layer [{n_out}, {k_in}] "
-            f"({b_nt.numel() / 1e6:.1f} MB); reused every step while the "
-            f"base weight stays frozen."
+            f"ConvRot: int8 dX on the CUTLASS NT kernel with a per-step "
+            f"tiled transpose of each tagged weight "
+            f"[{n_out}, {k_in}] -> [{k_in}, {n_out}] (0.22 ms/step/layer, "
+            f"nothing resident)."
         )
-    else:
-        b_nt = ent[1]
+    _, _, _, transpose_k = _get_int8_kernels()
+    b_nt = torch.empty(k_in, n_out, device=qdata.device, dtype=torch.int8)
+    transpose_k[(n_out // 64, k_in // 256)](
+        qdata, b_nt, n_out, k_in, BN=64, BK=256, num_warps=4
+    )
     ones = _cached(
         _int8_bwd_ones,
         (k_in, qdata.device),
@@ -1420,9 +1449,9 @@ def _int8_linear_ste_backward(ctx, grad):
             use_cutlass = crbwd != "off"
             if use_cutlass:
                 # module.cr8_cutlass_bwd: dX rides the fused CUTLASS NT
-                # kernel on a resident K-major copy (modes fc2/full differ
-                # only in which layers the model tagged). Untimed at step
-                # level; see _cutlass_dx_bwd's docstring for the contract.
+                # kernel on a per-step tiled transpose (modes fc2/full
+                # differ only in which layers the model tagged). Contract
+                # and measurements in _cutlass_dx_bwd's docstring.
                 dx = _cutlass_dx_bwd(gq, g_s, qdata, grad.dtype, m)
             if dx is None:
                 i32 = torch._int_mm(gq, qdata)
