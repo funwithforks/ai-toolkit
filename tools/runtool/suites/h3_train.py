@@ -66,12 +66,23 @@ def _params():
         "rope": Param("bool", default=True, desc="H3_ROPE_FUSE"),
         "adaln": Param("bool", default=True, desc="H3_ADALN_FUSE"),
         "liger": Param("bool", default=False, desc="H3_LIGER_FUSIONS"),
+        "ckpt": Param(
+            "bool", default=True,
+            desc="train.gradient_checkpointing (transformer recompute; "
+                 "off saves the recompute but raises activation memory)",
+        ),
         "cutlass_bwd": Param(
             "enum", default="off", choices=("off", "fc2", "full"),
-            desc="int8_cutlass_bwd model kwarg: CUTLASS NT dX arm on "
-                 "resident K-major operand copies (fc2 = fc2-class layers; "
-                 "full = also fc1-class, slower tile at live m). Untimed "
-                 "experimental path; needs copy headroom (96 GB card).",
+            desc="int8_cutlass_bwd model kwarg: CUTLASS NT dX arm fed by a "
+                 "per-step tiled transpose (fc2 = fc2-class layers, where "
+                 "it gains ~2ms/layer at production m and washes at m~1.4k; "
+                 "full also tags fc1-class, which loses)",
+        ),
+        "cutlass_fwd": Param(
+            "bool", default=False,
+            desc="int8_cutlass_gemm model kwarg: CUTLASS fused-dequant int8 "
+                 "forward on quantized linears (no resident copies; the "
+                 "weight buffer is already the operand layout)",
         ),
         "tag": Param("str", default="", desc="extra job-name tag"),
         "prof_start": Param(
@@ -160,8 +171,10 @@ def _derive_config(params, name, out_path):
     # toolkit sampling is never used for benchmarking (owner rule); the
     # sample block stays inert
     train["disable_sampling"] = True
+    train["gradient_checkpointing"] = bool(params["ckpt"])
     mm = proc["model"].setdefault("model_kwargs", {})
     mm["int8_cutlass_bwd"] = params["cutlass_bwd"]
+    mm["int8_cutlass_gemm"] = bool(params["cutlass_fwd"])
     folders = _load_map(params["dataset"])
     ds = proc["datasets"]
     if len(folders) != len(ds):
