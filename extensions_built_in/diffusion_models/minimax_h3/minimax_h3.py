@@ -494,12 +494,15 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         # run at that m will not show it. An earlier RESIDENT-copy design
         # pinned 154 MB/layer (~15.4 GB over 100 layers), OOM-skipped every
         # 32 GB step measurement, and was dropped for the transpose.
-        # Modes: off (default) | fc2 (in_features >= out_features layers) |
-        # full (also tags the fc1-class ones, whose dX loses at every m on
-        # this kernel — kept as an experiment switch, not a suggestion). Requires
-        # int8_bwd (the arm lives in that branch).
+        # Modes: fc2 (default; in_features >= out_features layers, the only
+        # group that gains — ~2.0 ms/layer at production m, 15k rows, washes
+        # at m~1408) | off (escape hatch; torch._int_mm everywhere) | full
+        # (also tags the fc1-class ones, whose dX loses at every m on this
+        # kernel — an experiment switch, not a suggestion). Requires int8_bwd
+        # (the arm lives in that branch). When comfy_kitchen is unavailable
+        # this prints and stays on torch._int_mm.
         cb_mode = str(
-            self.model_config.model_kwargs.get("int8_cutlass_bwd", "off")
+            self.model_config.model_kwargs.get("int8_cutlass_bwd", "fc2")
         ).lower()
         if cb_mode not in ("off", "", "fc2", "full"):
             self.print_and_status_update(

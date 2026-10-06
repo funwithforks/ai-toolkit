@@ -43,9 +43,10 @@ def _params():
         "seed": Param("int", default=42, min=0, max=2**31 - 1),
         "ckpt_stride": Param("int", default=None, min=0, max=16),
         "cutlass_bwd": Param(
-            "enum", default="off", choices=("off", "fc2", "full"),
-            desc="model_kwargs int8_cutlass_bwd (keep default off unless "
-                 "the probe targets it)",
+            "enum", default="fc2", choices=("off", "fc2", "full"),
+            desc="model_kwargs int8_cutlass_bwd; defaults to the code "
+                 "default (fc2) so probes see the production call sites; "
+                 "pass off explicitly to probe the eager-dX path",
         ),
     }
 
