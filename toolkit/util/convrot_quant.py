@@ -866,7 +866,14 @@ def _get_int8_kernels():
 
     @triton.jit
     def int8_act_quant_kernel(
-        x_ptr, q_ptr, s_ptr, K, QMAX: tl.constexpr, BLOCK_K: tl.constexpr
+        x_ptr,
+        ws_ptr,
+        q_ptr,
+        s_ptr,
+        K,
+        QMAX: tl.constexpr,
+        HAS_WS: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         row = tl.program_id(0)
         base = row * K
@@ -874,6 +881,15 @@ def _get_int8_kernels():
         for k0 in range(0, K, BLOCK_K):
             offs = k0 + tl.arange(0, BLOCK_K)
             v = tl.load(x_ptr + base + offs, mask=offs < K, other=0.0).to(tl.float32)
+            if HAS_WS:
+                # backward dX path: the column pre-scale (grad * w_scales) is
+                # folded into this pass. torch computed that product as
+                # bf16 x bf16 -> fp32 opmath -> bf16 store, and the old flow
+                # quantized THAT tensor; replicate the intermediate rounding
+                # bit-for-bit. Order is scale, then amax, then quantize --
+                # scaling after the amax is a different function.
+                wsv = tl.load(ws_ptr + offs, mask=offs < K, other=0.0).to(tl.float32)
+                v = (v * wsv).to(tl.bfloat16).to(tl.float32)
             acc = tl.maximum(acc, tl.abs(v))
         amax = tl.max(acc, axis=0)
         scale = tl.where(amax > 0, amax / QMAX, 1.0)
@@ -881,6 +897,9 @@ def _get_int8_kernels():
             offs = k0 + tl.arange(0, BLOCK_K)
             mask = offs < K
             v = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            if HAS_WS:
+                wsv = tl.load(ws_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+                v = (v * wsv).to(tl.bfloat16).to(tl.float32)
             # rint = round-half-to-even, matching torch.round in the reference path
             q = libdevice.rint(v / scale)
             q = tl.minimum(tl.maximum(q, -1.0 * QMAX), 1.0 * QMAX)
@@ -1037,7 +1056,11 @@ def _make_int8_epilogue_dot_kernel(triton, tl):
 # nodes with known output shapes (see _nvfp4_act_quant_op). rows are padded to a
 # multiple of 32 inside the op for torch._int_mm; callers slice the mm output.
 @torch.library.custom_op("ostris::convrot_int8_act_quant", mutates_args=())
-def _int8_act_quant_op(x: torch.Tensor, qmax: int) -> list[torch.Tensor]:
+def _int8_act_quant_op(
+    x: torch.Tensor,
+    qmax: int,
+    w_scales: Optional[torch.Tensor] = None,
+) -> list[torch.Tensor]:
     rows, K = x.shape
     rows_pad = -(-rows // 32) * 32
     x = x.contiguous()
@@ -1049,12 +1072,22 @@ def _int8_act_quant_op(x: torch.Tensor, qmax: int) -> list[torch.Tensor]:
     kernel, _, _, _ = _get_int8_kernels()
     # triton block shapes must be powers of 2; loads/stores are masked on offs < K
     block_k = min(2048, 1 << (K - 1).bit_length())
-    kernel[(rows,)](x, q, scales, K, QMAX=qmax, BLOCK_K=block_k, num_warps=8)
+    kernel[(rows,)](
+        x,
+        w_scales.contiguous() if w_scales is not None else x,
+        q,
+        scales,
+        K,
+        QMAX=qmax,
+        HAS_WS=w_scales is not None,
+        BLOCK_K=block_k,
+        num_warps=8,
+    )
     return [q, scales]
 
 
 @_int8_act_quant_op.register_fake
-def _int8_act_quant_fake(x, qmax):
+def _int8_act_quant_fake(x, qmax, w_scales=None):
     rows, K = x.shape
     rows_pad = -(-rows // 32) * 32
     return [
@@ -1178,7 +1211,11 @@ def quantize_int8_rows_fused(x: torch.Tensor, qmax: int = 127):
 _actq_share: dict = {}
 
 
-def _int8_act_quant_padded(x: torch.Tensor, qmax: int = 127):
+def _int8_act_quant_padded(
+    x: torch.Tensor,
+    qmax: int = 127,
+    w_scales: Optional[torch.Tensor] = None,
+):
     """Act quant with rows padded to a multiple of 32 for torch._int_mm.
 
     Shared across the sibling linears of a block: q/k/v/gate (and the SwiGLU
@@ -1190,8 +1227,15 @@ def _int8_act_quant_padded(x: torch.Tensor, qmax: int = 127):
     can never return stale rows. Entries hold only ~1 int8 activation each
     and are capped. Skipped while compiling: the cache lives in python and
     the custom-op body that calls it is opaque to inductor anyway.
+
+    w_scales (backward dX only) folds the column pre-scale into the kernel:
+    the fused kernel scales each element exactly as the old `x * w_scales`
+    bf16 product rounded it, before the row amax. No sharing cache applies
+    (every backward grad is a fresh tensor anyway).
     """
-    share = x.is_cuda and not torch.compiler.is_compiling()
+    share = (
+        w_scales is None and x.is_cuda and not torch.compiler.is_compiling()
+    )
     key = None
     if share:
         key = (x.data_ptr(), tuple(x.shape), qmax)
@@ -1199,7 +1243,14 @@ def _int8_act_quant_padded(x: torch.Tensor, qmax: int = 127):
         if ent is not None and ent[0]() is x and ent[1] == x._version:
             return ent[2], ent[3]
     if _triton_available() and x.is_cuda:
-        q, scales = _int8_act_quant_op(x, qmax)
+        q, scales = _int8_act_quant_op(x, qmax, w_scales)
+    elif w_scales is not None:
+        q, scales = quantize_int8_rows(x * w_scales, qmax)
+        rows = q.shape[0]
+        rows_pad = -(-rows // 32) * 32
+        if rows_pad != rows:
+            q = F.pad(q, (0, 0, 0, rows_pad - rows))
+            scales = F.pad(scales, (0, rows_pad - rows), value=1.0)
     else:
         q, scales = quantize_int8_rows(x, qmax)
         rows = q.shape[0]
@@ -1530,7 +1581,10 @@ def _int8_linear_ste_backward(ctx, grad):
             and grad.ndim == 2
         ):
             w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
-            gq, g_s = _int8_act_quant_padded(grad * w_scales, ctx.act_qmax)
+            # the column pre-scale rides the quant kernel (scale, then amax,
+            # then quantize -- same order, same bf16 intermediate rounding as
+            # the old full-width `grad * w_scales` tensor it replaces)
+            gq, g_s = _int8_act_quant_padded(grad, ctx.act_qmax, w_scales=w_scales)
             m = grad.shape[0]
             dx = None
             crbwd = str(getattr(ctx, "cutlass_bwd", "off"))
