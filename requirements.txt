@@ -1,2 +1,8 @@
 -r requirements_base.txt
 scipy==1.12.0
+
+# runtime deps not covered by the base file (torch/torchvision/torchaudio/triton
+# are installed separately from the CUDA 13.2 wheel index)
+comfy-kitchen==0.2.37
+liger_kernel==0.8.4
+nvidia-cudnn-frontend==1.30.0
