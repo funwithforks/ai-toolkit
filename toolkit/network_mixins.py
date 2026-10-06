@@ -249,6 +249,22 @@ class ToolkitModuleMixin:
                 return (lx, True)
             return self.lora_up(lx)
 
+        if return_rank and lx.dim() == 2 and not hasattr(self, 'scalar'):
+            # Packed dim-2 stream (the H3 training shape): scale lands on the
+            # rank activation so the caller's epilogue fold sees the same
+            # bilinear function; the batch multiplier is only offered here
+            # when its broadcast is exact without shape games (scalar, or
+            # per-row on the same row count) -- any other shape stays on the
+            # output path. <=1 ulp, same as the dim-3 fold above.
+            if batch_scale is not None:
+                if batch_scale.numel() == 1:
+                    lx = lx * batch_scale.reshape(())
+                else:
+                    lx = lx * batch_scale.reshape(-1, 1)
+            lx = (lx * scale).to(self.lora_up.weight.dtype)
+            return (lx, True)
+
+
         if hasattr(self, 'scalar'):
             # trainable scaler (locon): keep the multiply on the output path
             scale = scale * self.scalar
@@ -341,6 +357,16 @@ class ToolkitModuleMixin:
         # _call_forward folds the multiplier there before lora_up, so the
         # (out_features, batch) broadcast multiply below never runs.
         fold_batch = lora_input.dim() == 3 and not hasattr(self, 'scalar')
+        # The packed dim-2 training stream (H3) folds the same way: the rank
+        # activation is handed to the convrot dequant epilogue, which deletes
+        # the full-width up-projection GEMM and the output-side multiply on
+        # every convrot linear. Offered only with an exact-broadcast
+        # multiplier (scalar or per-row, checked on host metadata).
+        fold_2d = (
+            lora_input.dim() == 2
+            and not hasattr(self, 'scalar')
+            and (multiplier.numel() == 1 or multiplier.size(0) == lora_batch_size)
+        )
         # On convrot-int8 STE layers the up-projection itself folds into the
         # dequant epilogue kernel: the rank activation and up weight are passed
         # INTO the org forward (cr8_lora=) so the compiled/checked call has no
@@ -349,14 +375,14 @@ class ToolkitModuleMixin:
         # _linear_ste's qdata/rank checks); disagreement raises there, it can
         # never silently drop the LoRA term.
         epilogue_target = (
-            fold_batch
+            (fold_batch or fold_2d)
             and self.__class__.__name__ == "LoRAModule"
             and self.lora_up.bias is None
             and type(self.org_module[0]).__name__ == "OstrisLinear"
         )
         res = self._call_forward(
             lora_input,
-            batch_scale=multiplier if fold_batch else None,
+            batch_scale=multiplier if (fold_batch or epilogue_target) else None,
             return_rank=epilogue_target,
         )
         if epilogue_target:
@@ -404,7 +430,10 @@ class ToolkitModuleMixin:
         if epilogue_target and is_rank:
             lora_output = self.lora_up(lora_output)
 
-        if fold_batch:
+        if fold_batch or (epilogue_target and is_rank):
+            # multiplier and scale already landed (on the rank activation in
+            # _call_forward) for every rank-return path; re-applying them
+            # here would double-count
             scaled_lora_output = lora_output
         else:
             scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
