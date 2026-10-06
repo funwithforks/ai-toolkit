@@ -114,6 +114,9 @@ def get_optimizer(
     elif lower_type == 'rose':
         from rose_opt import Rose
         optimizer = Rose(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type == 'rosev2':
+        from toolkit.optimizers.rose_v2 import RoseV2
+        optimizer = RoseV2(params, lr=float(learning_rate), **optimizer_params)
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     return optimizer
