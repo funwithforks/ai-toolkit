@@ -45,6 +45,7 @@ Quantized state attached to each module:
 
 from typing import Optional
 
+import os
 import weakref
 
 import torch
@@ -1272,14 +1273,57 @@ def _int8_act_quant_padded(
 # saving a bf16 copy, and x is not saved at all — less memory than F.linear.
 _cutlass_state: dict = {}
 
+_CUTLASS_LOCAL_SO = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    os.pardir, "kernels", "h3_cutlass", "_C.abi3.so",
+))
+
+
+def _dlpack_wrap(tensor):
+    """Export tensor via DLPack without cross-stream sync (stream=-1),
+    detaching first so Parameters export. Identical to the wheel's
+    _wrap_for_dlpack so both backends receive the same protocol."""
+    if tensor.requires_grad:
+        tensor = tensor.detach()
+    return tensor.__dlpack__(stream=-1)
+
 
 def _get_cutlass_int8():
-    """Lazy accessor for comfy_kitchen's fused CUTLASS int8 GEMM
+    """Lazy accessor for the fused CUTLASS int8 GEMM
     (D = acc * x_scale[m] * w_scale[n] + bias, our exact epilogue minus the
-    lora fold). Returns (call, wrap) or None with the reason in
-    _cutlass_state['why']; import failure disables, never crashes."""
+    lora fold). Prefers the vendored kernel at toolkit/kernels/h3_cutlass/
+    (a copy of comfy_kitchen v0.2.37's extension plus custom ops); falls
+    back to the comfy_kitchen wheel when the local .so is absent, and the
+    wheel import is left untouched in that case. Returns (call, wrap) or
+    None with the reason in _cutlass_state['why']; import failure
+    disables, never crashes."""
     if "fn" in _cutlass_state:
         return _cutlass_state["fn"]
+    if os.path.exists(_CUTLASS_LOCAL_SO):
+        try:
+            import importlib.util
+            # trailing name must be _C: it is what the extension's
+            # PyInit__C symbol is looked up from.
+            spec = importlib.util.spec_from_file_location(
+                "h3_cutlass._C", _CUTLASS_LOCAL_SO
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _cutlass_state["fn"] = (mod.cutlass_int8_dequant, _dlpack_wrap)
+            _cutlass_state["origin"] = _CUTLASS_LOCAL_SO
+            try:
+                import comfy_kitchen.backends.cuda as _ck
+                _ck._C = mod
+            except Exception:
+                pass
+            return _cutlass_state["fn"]
+        except Exception as e:  # noqa: BLE001 - local miss falls back, never crashes
+            _cutlass_state["local_why"] = f"{type(e).__name__}: {str(e)[:120]}"
+            print_acc(
+                f"ConvRot: vendored cutlass kernel failed to load "
+                f"({_cutlass_state['local_why']}); using the comfy_kitchen "
+                "wheel instead."
+            )
     try:
         import comfy_kitchen.backends.cuda as _ck
         from comfy_kitchen.backends.cuda import _wrap_for_dlpack
