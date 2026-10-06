@@ -896,11 +896,16 @@ def _get_int8_kernels():
         o_ptr,
         r_ptr,
         u_ptr,
+        r2_ptr,
+        u2_ptr,
         N,
         HAS_BIAS: tl.constexpr,
         HAS_LORA: tl.constexpr,
+        HAS_LORA2: tl.constexpr,
         KL: tl.constexpr,      # lora rank (power of two when HAS_LORA)
         N_KL: tl.constexpr,    # u row stride (= KL)
+        KL2: tl.constexpr,
+        N_KL2: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -924,6 +929,18 @@ def _get_int8_kernels():
                 other=0.0,
             ).to(tl.float32)
             out += tl.sum(ut * rv[None, :], axis=1)
+        if HAS_LORA2:
+            # second folded adapter (stacked LoRA): same elementwise form with
+            # its own rank; ranks here are the small adapters (4/8), so the
+            # term is rank independent scalar-column FMAs, no tensor cores.
+            rk2 = tl.arange(0, KL2)
+            rv2 = tl.load(r2_ptr + row * N_KL2 + rk2).to(tl.float32)
+            ut2 = tl.load(
+                u2_ptr + offs[:, None] * N_KL2 + rk2[None, :],
+                mask=mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            out += tl.sum(ut2 * rv2[None, :], axis=1)
         tl.store(o_ptr + row * N + offs, out.to(o_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
@@ -964,11 +981,16 @@ def _make_int8_epilogue_dot_kernel(triton, tl):
         o_ptr,
         r_ptr,
         u_ptr,
+        r2_ptr,
+        u2_ptr,
         N,
         n_rows,
         HAS_BIAS: tl.constexpr,
+        HAS_LORA2: tl.constexpr,
         KL: tl.constexpr,
         N_KL: tl.constexpr,
+        KL2: tl.constexpr,
+        N_KL2: tl.constexpr,
         ROWS: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
@@ -992,6 +1014,19 @@ def _make_int8_epilogue_dot_kernel(triton, tl):
         ut = tl.load(u_ptr + offs[None, :] * N_KL + rk[:, None],
                      mask=cmask[None, :], other=0.0)
         out += tl.dot(rv, ut)
+        if HAS_LORA2:
+            # stacked training adapter as a second, elementwise term: the dot
+            # slot is taken by the >=16 assistant rank, so this small rank
+            # (4/8) contributes rank FMAs, keeping the assistant on the dot
+            # path instead of padding both up to a common power of two.
+            rk2 = tl.arange(0, KL2)
+            rv2 = tl.load(r2_ptr + rows[:, None] * N_KL2 + rk2[None, :],
+                          mask=rmask[:, None], other=0.0).to(tl.float32)
+            ut2 = tl.load(
+                u2_ptr + offs[:, None] * N_KL2 + rk2[None, :],
+                mask=cmask[:, None], other=0.0,
+            ).to(tl.float32)
+            out += tl.sum(rv2[:, None, :] * ut2[None, :, :], axis=2)
         tl.store(o_ptr + rows[:, None] * N + offs[None, :],
                  out.to(o_ptr.dtype.element_ty), mask=m)
 
@@ -1038,11 +1073,14 @@ def _int8_epilogue_op(
     lora_r: Optional[torch.Tensor] = None,
     lora_u: Optional[torch.Tensor] = None,
     epi_dot: bool = False,
+    lora2_r: Optional[torch.Tensor] = None,
+    lora2_u: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m, n = i32.shape
     out = torch.empty(m, n, device=i32.device, dtype=getattr(torch, out_dtype))
     _, kernel, kernel_dot, _ = _get_int8_kernels()
     has_lora = lora_r is not None
+    has_lora2 = lora2_r is not None
     rank = lora_r.shape[1] if has_lora else 16
     kl = 1 << (rank - 1).bit_length()
     if has_lora and (rank != kl or rank > 64):
@@ -1052,6 +1090,13 @@ def _int8_epilogue_op(
         # -> handled by caller pre-padding)
         raise RuntimeError(
             f"int8 epilogue lora rank must be a power of two <= 64, got {rank}"
+        )
+    rank2 = lora2_r.shape[1] if has_lora2 else 16
+    kl2 = 1 << (rank2 - 1).bit_length()
+    if has_lora2 and (rank2 != kl2 or rank2 > 64):
+        raise RuntimeError(
+            f"int8 epilogue stacked lora rank must be a power of two <= 64, "
+            f"got {rank2}"
         )
     if has_lora and epi_dot and kl >= 16:
         # tl.dot needs K >= 16; smaller ranks keep the elementwise kernel
@@ -1065,11 +1110,16 @@ def _int8_epilogue_op(
             out,
             lora_r,
             lora_u,
+            lora2_r if has_lora2 else a_scales,
+            lora2_u if has_lora2 else a_scales,
             n,
             m,
             HAS_BIAS=bias is not None,
+            HAS_LORA2=has_lora2,
             KL=kl,
             N_KL=rank,
+            KL2=kl2,
+            N_KL2=rank2,
             ROWS=block_r,
             BLOCK_N=block_n,
             num_warps=8,
@@ -1080,7 +1130,7 @@ def _int8_epilogue_op(
             f"ConvRot: cr8_epi_dot requested at rank {rank} (<16); tl.dot "
             "cannot run, using the elementwise epilogue for this layer."
         )
-    block_n = 512 if has_lora else 1024
+    block_n = 512 if (has_lora or has_lora2) else 1024
     grid = (m, -(-n // block_n))
     kernel[grid](
         i32,
@@ -1090,11 +1140,16 @@ def _int8_epilogue_op(
         out,
         lora_r if has_lora else a_scales,
         lora_u if has_lora else a_scales,
+        lora2_r if has_lora2 else a_scales,
+        lora2_u if has_lora2 else a_scales,
         n,
         HAS_BIAS=bias is not None,
         HAS_LORA=has_lora,
+        HAS_LORA2=has_lora2,
         KL=kl,
         N_KL=rank,
+        KL2=kl2,
+        N_KL2=rank2,
         BLOCK_N=block_n,
         num_warps=4,
     )
@@ -1104,7 +1159,7 @@ def _int8_epilogue_op(
 @_int8_epilogue_op.register_fake
 def _int8_epilogue_fake(
     i32, a_scales, w_scales, bias, out_dtype, lora_r=None, lora_u=None,
-    epi_dot=False,
+    epi_dot=False, lora2_r=None, lora2_u=None,
 ):
     m, n = i32.shape
     return torch.empty(m, n, device=i32.device, dtype=getattr(torch, out_dtype))
@@ -1370,10 +1425,18 @@ def _int8_linear_ste_op(
     epi_dot: bool = False,
     cutlass_gemm: bool = False,
     cutlass_bwd: str = "off",
+    lora2_r: Optional[torch.Tensor] = None,
+    lora2_u: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x2d.shape[0]
     aq, a_s = _int8_act_quant_padded(x2d, act_qmax)
     if cutlass_gemm:
+        if lora2_r is not None:
+            raise RuntimeError(
+                "convrot int8: stacked (two-term) cr8 fold is not supported "
+                "on the CUTLASS forward visitor; disable cr8_cutlass_gemm or "
+                "the fold"
+            )
         out = _cutlass_gemm_forward(
             aq,
             a_s,
@@ -1395,6 +1458,7 @@ def _int8_linear_ste_op(
         getattr(torch, out_dtype),
         lora=(lora_r, lora_u) if lora_r is not None else None,
         epi_dot=epi_dot,
+        lora2=(lora2_r, lora2_u) if lora2_r is not None else None,
     )
 
 
@@ -1412,6 +1476,8 @@ def _int8_linear_ste_fake(
     epi_dot=False,
     cutlass_gemm=False,
     cutlass_bwd="off",
+    lora2_r=None,
+    lora2_u=None,
 ):
     return torch.empty(
         x2d.shape[0], qdata.shape[0], device=x2d.device, dtype=getattr(torch, out_dtype)
@@ -1432,11 +1498,13 @@ def _int8_linear_ste_setup(ctx, inputs, output):
         _epi_dot,
         _cutlass_gemm,
         _cutlass_bwd,
+        lora2_r,
+        lora2_u,
     ) = inputs
     ctx.bwd_mode = str(bwd_mode)
     ctx.act_qmax = int(act_qmax)
     ctx.cutlass_bwd = str(_cutlass_bwd)
-    ctx.save_for_backward(qdata, w_scales_u8, lora_r, lora_u)
+    ctx.save_for_backward(qdata, w_scales_u8, lora_r, lora_u, lora2_r, lora2_u)
 
 
 _int8_bwd_warned = False
@@ -1445,7 +1513,7 @@ _int8_bwd_ones: dict = {}
 
 
 def _int8_linear_ste_backward(ctx, grad):
-    qdata, w_scales_u8, lora_r, lora_u = ctx.saved_tensors
+    qdata, w_scales_u8, lora_r, lora_u, lora2_r, lora2_u = ctx.saved_tensors
     if getattr(ctx, "bwd_mode", "eager") == "int8":
         # Opt-in (module.cr8_bwd_mode): run the input-gradient GEMM on the int8
         # tensor cores too. dx = (grad * w_scales) @ qdata with grad quantized
@@ -1493,6 +1561,10 @@ def _int8_linear_ste_backward(ctx, grad):
             d_u = None
             if lora_u is not None:
                 d_u = grad.to(lora_r.dtype).t() @ lora_r
+            d_r2 = grad.to(lora2_u.dtype) @ lora2_u if lora2_r is not None else None
+            d_u2 = None
+            if lora2_u is not None:
+                d_u2 = grad.to(lora2_r.dtype).t() @ lora2_r
             return (
                 dx,
                 None,
@@ -1506,6 +1578,8 @@ def _int8_linear_ste_backward(ctx, grad):
                 None,
                 None,
                 None,
+                d_r2,
+                d_u2,
             )
         global _int8_bwd_warned
         if not big:
@@ -1538,9 +1612,26 @@ def _int8_linear_ste_backward(ctx, grad):
     # LoRA gradients on the eager route (same cast contract as above).
     d_r = grad.to(lora_u.dtype) @ lora_u if lora_r is not None else None
     d_u = grad.to(lora_r.dtype).t() @ lora_r if lora_u is not None else None
+    d_r2 = grad.to(lora2_u.dtype) @ lora2_u if lora2_r is not None else None
+    d_u2 = grad.to(lora2_r.dtype).t() @ lora2_r if lora2_u is not None else None
     w_scales = w_scales_u8.view(torch.float32).to(grad.dtype)
     w = qdata.to(grad.dtype) * w_scales.unsqueeze(1)
-    return (grad @ w, None, None, None, None, None, None, d_r, d_u, None, None, None)
+    return (
+        grad @ w,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        d_r,
+        d_u,
+        None,
+        None,
+        None,
+        d_r2,
+        d_u2,
+    )
 
 
 _int8_linear_ste_op.register_autograd(
@@ -1556,10 +1647,14 @@ def _int8_epilogue(
     out_dtype: torch.dtype,
     lora=None,
     epi_dot: bool = False,
+    lora2=None,
 ) -> torch.Tensor:
-    """out = i32 * a_scales[:, None] * w_scales[None, :] (+ bias) (+ rank @ u^T)."""
+    """out = i32 * a_scales[:, None] * w_scales[None, :] (+ bias)
+    (+ rank @ u^T) (+ rank2 @ u2^T for a stacked folded adapter)."""
     r = lora[0] if lora is not None else None
     u = lora[1] if lora is not None else None
+    r2 = lora2[0] if lora2 is not None else None
+    u2 = lora2[1] if lora2 is not None else None
     if _triton_available() and i32.is_cuda:
         return _int8_epilogue_op(
             i32,
@@ -1570,6 +1665,8 @@ def _int8_epilogue(
             r,
             u,
             bool(epi_dot),
+            r2,
+            u2,
         )
     out = i32.float() * w_scales
     out = out * a_scales.unsqueeze(1)
@@ -1577,6 +1674,8 @@ def _int8_epilogue(
         out = out + bias.float()
     if r is not None:
         out = out + r.float() @ u.float().t()
+    if r2 is not None:
+        out = out + r2.float() @ u2.float().t()
     return out.to(out_dtype)
 
 
@@ -1826,6 +1925,8 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
     # the int8 STE GEMM is the one backend that consumes the lora-epilogue
     # fold; OstrisLinear only forwards cr8_lora to backends that opt in
     accepts_cr8_lora = True
+    # the two-term (dot + elementwise) stacked epilogue is implemented here
+    accepts_cr8_lora2 = True
     # activation quantization range (per-token symmetric [-act_qmax, act_qmax]);
     # the comfy w4a4 subclass narrows this to 7
     act_qmax = 127
@@ -1914,6 +2015,7 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
         x2d: torch.Tensor,
         out_dtype: str,
         cr8_lora: tuple | None = None,
+        cr8_lora2: tuple | None = None,
     ) -> torch.Tensor:
         """Hardware STE linear for the training path. For int8 the saved qdata is
         the resident buffer itself, so autograd holds only a free reference."""
@@ -1921,18 +2023,28 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
         # mixin folds the up-projection into the epilogue kernel. The mixin's
         # fold predicate and this one must agree; a disagreement would silently
         # drop the LoRA term, so it is a hard error, never a silent fallback.
+        # cr8_lora2 is a second stacked adapter's term in the same epilogue
+        # (same predicate checks; a fold must already ride cr8_lora -- the
+        # caller never offers only the second term).
         lora = cr8_lora
-        if lora is not None:
+        for name, l in (("cr8_lora", cr8_lora), ("cr8_lora2", cr8_lora2)):
+            if l is None:
+                continue
             if (
                 getattr(module, "cr8_qdata", None) is None
-                or lora[0].shape[1] & (lora[0].shape[1] - 1) != 0
-                or lora[0].shape[1] > 64
+                or l[0].shape[1] & (l[0].shape[1] - 1) != 0
+                or l[0].shape[1] > 64
             ):
                 raise RuntimeError(
-                    "convrot int8 STE: cr8_lora passed for a module that cannot "
+                    f"convrot int8 STE: {name} passed for a module that cannot "
                     "fold it (qdata/rank predicate); the caller must not offer a "
                     "fold here"
                 )
+        if cr8_lora2 is not None and cr8_lora is None:
+            raise RuntimeError(
+                "convrot int8 STE: cr8_lora2 without cr8_lora -- a stacked "
+                "fold is only offered alongside the inner adapter's own"
+            )
         return _int8_linear_ste_op(
             x2d,
             self._qdata(module),
@@ -1946,6 +2058,8 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
             bool(getattr(module, "cr8_epi_dot", False)),
             bool(getattr(module, "cr8_cutlass_gemm", False)),
             str(getattr(module, "cr8_cutlass_bwd", "off")),
+            cr8_lora2[0] if cr8_lora2 is not None else None,
+            cr8_lora2[1] if cr8_lora2 is not None else None,
         )
 
     def fake_quant_rotated_weight(self, module, w_rot: torch.Tensor) -> torch.Tensor:
@@ -1995,11 +2109,20 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
         return module.cr8_qdata, None, 8
 
     def forward(
-        self, module, x: torch.Tensor, cr8_lora: tuple | None = None
+        self,
+        module,
+        x: torch.Tensor,
+        cr8_lora: tuple | None = None,
+        cr8_lora2: tuple | None = None,
     ) -> torch.Tensor:
         rot = self._rot(module)
         in_f, out_f = module.in_features, module.out_features
         m = x.numel() // in_f
+        if cr8_lora2 is not None and not x.requires_grad:
+            raise RuntimeError(
+                "convrot int8: cr8_lora2 (stacked fold) offered outside the "
+                "training (STE) branch"
+            )
 
         if x.requires_grad:
             # training: gated on requires_grad alone so both gradient-checkpoint
@@ -2016,8 +2139,13 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
                     rotate(x, rot).reshape(-1, in_f),
                     str(x.dtype).split(".")[-1],
                     cr8_lora=cr8_lora,
+                    cr8_lora2=cr8_lora2,
                 )
                 return out.reshape(*x.shape[:-1], out_f)
+            if cr8_lora is not None or cr8_lora2 is not None:
+                raise RuntimeError(
+                    "convrot int8: cr8 fold offered without int8 STE support"
+                )
             # no int8 hardware: straight-through fake-quant + bf16 matmul
             x2d = rotate(x, rot).reshape(-1, in_f)
             with torch.no_grad():

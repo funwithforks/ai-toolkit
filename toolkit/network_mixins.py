@@ -392,6 +392,7 @@ class ToolkitModuleMixin:
 
         org_forwarded = None
         cr8_fold = False
+        cr8_handoff = False
         if epilogue_target and is_rank and torch.is_tensor(lora_output):
             rank = lora_output.shape[-1]
             if rank & (rank - 1) == 0 and rank <= 64:
@@ -404,17 +405,66 @@ class ToolkitModuleMixin:
                 # convrot linear). __self__ is the true recipient; when it is
                 # the OstrisLinear itself this is exactly the old predicate.
                 next_link = getattr(self.org_forward, "__self__", None)
+                from toolkit.util.convrot_quant import _int8_gemm_supported
                 if (
                     getattr(next_link, "is_ostris_quantized", False)
                     and getattr(next_link.ostris_quantizer, "accepts_cr8_lora", False)
                 ):
-                    from toolkit.util.convrot_quant import _int8_gemm_supported
                     cr8_fold = (
                         getattr(next_link, "cr8_qdata", None) is not None
                         and x_for_org.requires_grad
                         and _int8_gemm_supported(x_for_org.device)
                     )
+                elif (
+                    next_link is not None
+                    and type(next_link).__name__ == "LoRAModule"
+                    and getattr(next_link, "lora_up", None) is not None
+                    and next_link.lora_up.bias is None
+                ):
+                    # stacked on another LoRA (assistant under the training
+                    # adapter on the same convrot linear): hand the rank
+                    # activation DOWN instead of adding on top. The inner
+                    # module folds its own term into the STE epilogue and
+                    # forwards ours alongside it as cr8_lora2 (two terms,
+                    # one kernel), so this module's up-projection GEMM and
+                    # the base_out + delta add both go away. Validity is
+                    # verified against the INNER module's own fold predicate
+                    # -- one level down must land on the quantized linear;
+                    # a deeper stack simply keeps the plain add.
+                    inner_link = getattr(
+                        getattr(next_link, "org_forward", None), "__self__", None
+                    )
+                    cr8_handoff = (
+                        getattr(inner_link, "is_ostris_quantized", False)
+                        and getattr(
+                            inner_link.ostris_quantizer, "accepts_cr8_lora2", False
+                        )
+                        and getattr(inner_link, "cr8_qdata", None) is not None
+                        and x_for_org.requires_grad
+                        and _int8_gemm_supported(x_for_org.device)
+                    )
         if cr8_fold:
+            # kwargs may already carry an inherited cr8_lora from a stacked
+            # outer module; it becomes the epilogue's SECOND term.
+            inherited = kwargs.pop("cr8_lora", None)
+            if inherited is not None:
+                return self.org_forward(
+                    x_for_org,
+                    *args,
+                    cr8_lora=(lora_output.reshape(-1, rank), self.lora_up.weight),
+                    cr8_lora2=inherited,
+                    **kwargs,
+                )
+            return self.org_forward(
+                x_for_org,
+                *args,
+                cr8_lora=(lora_output.reshape(-1, rank), self.lora_up.weight),
+                **kwargs,
+            )
+        if cr8_handoff:
+            # the inner module's own fold return merges this into cr8_lora2;
+            # if the inner fold ever degrades, kwargs keep flowing so the
+            # outer term still reaches the STE epilogue as cr8_lora.
             return self.org_forward(
                 x_for_org,
                 *args,
