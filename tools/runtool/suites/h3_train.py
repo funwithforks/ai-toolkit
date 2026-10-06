@@ -72,11 +72,12 @@ def _params():
                  "off saves the recompute but raises activation memory)",
         ),
         "cutlass_bwd": Param(
-            "enum", default="off", choices=("off", "fc2", "full"),
+            "enum", default="fc2", choices=("off", "fc2", "full"),
             desc="int8_cutlass_bwd model kwarg: CUTLASS NT dX arm fed by a "
-                 "per-step tiled transpose (fc2 = fc2-class layers, where "
-                 "it gains ~2ms/layer at production m and washes at m~1.4k; "
-                 "full also tags fc1-class, which loses)",
+                 "per-step tiled transpose. fc2 is the code default and the "
+                 "measured-best arm (~2ms/layer at production m, washes at "
+                 "m~1.4k); full also tags fc1-class, which loses; off is the "
+                 "escape hatch / A-B control",
         ),
         "cutlass_fwd": Param(
             "bool", default=False,
