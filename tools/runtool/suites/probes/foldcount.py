@@ -90,6 +90,11 @@ def _wrap_org(lmod, of, rec):
                + ("cr8_lora" if "cr8_lora" in kw else "plain",)] += 1
         return of(*a, **kw)
 
+    # the fold arm reads org_forward.__self__ to find the next link; a bare
+    # closure has none, which silently suppressed every fold it measured
+    # (fixed 2026-10-05; all pre-fix foldcount readings were artifacts)
+    fwd.__self__ = getattr(of, "__self__", None)
+    fwd.__wrapped__ = of
     lmod.org_forward = fwd
 
 
