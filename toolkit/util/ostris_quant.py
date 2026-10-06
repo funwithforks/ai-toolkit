@@ -33,6 +33,10 @@ class OstrisQuantizer:
     """
 
     accepts_cr8_lora = False
+    # whether forward consumes the SECOND stacked adapter term of the
+    # lora-epilogue fold (cr8_lora2). Same declaration contract; only
+    # backends with the two-term epilogue (convrot int8) set it True.
+    accepts_cr8_lora2 = False
 
     # the qtype string this instance was resolved from (stamped by
     # get_ostris_quantizer); quantized saves need it to restore the backend
@@ -108,7 +112,10 @@ class OstrisLinear(torch.nn.Linear):
         return w
 
     def forward(
-        self, x: torch.Tensor, cr8_lora: tuple | None = None
+        self,
+        x: torch.Tensor,
+        cr8_lora: tuple | None = None,
+        cr8_lora2: tuple | None = None,
     ) -> torch.Tensor:
         if x.is_cuda and not hasattr(self, "_layer_memory_manager"):
             # a module left behind on the wrong device (usually cpu after a
@@ -132,6 +139,15 @@ class OstrisLinear(torch.nn.Linear):
             # only backends that consume the lora-epilogue fold see it; every
             # other backend keeps a plain (module, x) signature and can never
             # crash on a kwarg that is meaningless to it
+            if getattr(self.ostris_quantizer, "accepts_cr8_lora2", False):
+                return self.ostris_quantizer.forward(
+                    self, x, cr8_lora=cr8_lora, cr8_lora2=cr8_lora2
+                )
+            if cr8_lora2 is not None:
+                raise RuntimeError(
+                    "OstrisLinear: cr8_lora2 offered to a backend that does "
+                    "not consume it; the stacked fold would be silently dropped"
+                )
             return self.ostris_quantizer.forward(self, x, cr8_lora=cr8_lora)
         return self.ostris_quantizer.forward(self, x)
 
