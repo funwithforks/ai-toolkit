@@ -1288,6 +1288,26 @@ def _cutlass_nt_bwd(aq, a_s, b_nt, w_scale_n, out_dtype, m):
 
 
 _dx_nt_bannerred: set = set()
+_dx_scratch: dict = {}
+
+
+def _dx_scratch_buffer(device, k_in, n_out):
+    """One reusable transpose scratch per (device, shape): keyed by operand
+    geometry, not by weight, so the ~100 tagged layers share two buffers
+    (one per fc2-class shape), not 100. Reuse is stream-order-safe: the
+    next layer's transpose kernel is enqueued after the previous CUTLASS
+    launch has consumed the buffer on the same stream."""
+    key = (getattr(device, "index", None), k_in, n_out)
+    buf = _dx_scratch.get(key)
+    if buf is None or buf.device != device:
+        buf = torch.empty(k_in, n_out, device=device, dtype=torch.int8)
+        _dx_scratch[key] = buf
+        print_acc(
+            f"ConvRot: dX transpose scratch allocated for "
+            f"[{k_in}, {n_out}] ({buf.numel() / 1e6:.0f} MB, shared by all "
+            f"layers with this operand shape)."
+        )
+    return buf
 
 
 def _cutlass_dx_bwd(gq, g_s, qdata, out_dtype, m):
@@ -1324,7 +1344,7 @@ def _cutlass_dx_bwd(gq, g_s, qdata, out_dtype, m):
             f"nothing resident)."
         )
     _, _, _, transpose_k = _get_int8_kernels()
-    b_nt = torch.empty(k_in, n_out, device=qdata.device, dtype=torch.int8)
+    b_nt = _dx_scratch_buffer(qdata.device, k_in, n_out)
     transpose_k[(n_out // 64, k_in // 256)](
         qdata, b_nt, n_out, k_in, BN=64, BK=256, num_warps=4
     )
