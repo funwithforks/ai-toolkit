@@ -14,9 +14,10 @@ model Settings {
 }
 
 model Queue {
-  id         Int     @id @default(autoincrement())
-  gpu_ids    String  @unique
-  is_running Boolean @default(false)
+  id           Int     @id @default(autoincrement())
+  gpu_ids      String  @unique
+  is_running   Boolean @default(false)
+  user_stopped Boolean @default(false) // set only by an explicit Stop; auto-drain leaves it false
 
   @@index([gpu_ids])
 }
