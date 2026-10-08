@@ -1729,8 +1729,31 @@ class LTX25Model(PhasedLoadMixin, LTX2Model):
                 f" - attached {num_quantized_dit} pre-quantized ConvRot layers to transformer"
             )
         self._mixed_file_post_load(transformer, num_quantized_dit)
+        if num_quantized_dit:
+            self._bf16_modulation_tables(transformer)
         flush()
         return transformer
+
+    def _bf16_modulation_tables(self, transformer):
+        # The comfy file stores the adaLN scale_shift tables fp32; diffusers
+        # get_mod_params adds table + train-dtype temb, and the fp32 table
+        # promotes every modulation slice -> modulate/gate/residual keep the
+        # full (B,T,dim) stream fp32 through the block (+165MB fp32 saved
+        # tensors per block boundary at 1024, 2x elementwise traffic).
+        # Official LTX casts the table to the timestep dtype at the add; the
+        # tables are frozen constants, so one load-time cast is bitwise
+        # equivalent and free. fp32 math stays where it belongs: norm
+        # variance, rope tables, loss.
+        n = 0
+        for name, param in transformer.named_parameters():
+            if name.endswith("scale_shift_table") and param.dtype == torch.float32:
+                param.data = param.data.to(self.torch_dtype)
+                n += 1
+        print(
+            f"LTX2.5: cast {n} fp32 scale_shift tables to {self.torch_dtype} "
+            "(prevents fp32 promotion of the bf16 residual stream)"
+        )
+        return n
 
     def _load_connectors_streamed(self, stream_dev):
         # connectors ride in the transformer file, plus the per-modality
@@ -1823,6 +1846,8 @@ class LTX25Model(PhasedLoadMixin, LTX2Model):
             dit_sd.pop(key, None)
         del trans_sd, dit_sd
         self._mixed_file_post_load(transformer, num_quantized_dit)
+        if num_quantized_dit:
+            self._bf16_modulation_tables(transformer)
         flush()
         return transformer
 
