@@ -1076,6 +1076,15 @@ class LTX2Model(BaseModel):
         # `False` is the legacy LTX-2.0 behavior.
         use_cross_timestep = self.ltx_version in ("2.3", "2.5")
 
+        # mask fast-path: an all-valid mask carries no information, but any
+        # non-None mask routes every text cross-attn off flash and onto the
+        # masked memory-efficient path (sm80 bprop kernels in the bs1
+        # profile). With mask=None the dispatch picks flash; over an
+        # all-valid mask the attention math is identical. One reduction per
+        # pass; partial masks still take the normal masked path.
+        if bool(connector_attention_mask.all()):
+            connector_attention_mask = None
+
         noise_pred_video, noise_pred_audio = self.transformer(
             hidden_states=packed_latents,
             audio_hidden_states=audio_latents.to(self.torch_dtype),
