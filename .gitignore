@@ -197,7 +197,9 @@ testing/.model_test_outputs
 testing/.engine_test_outputs
 testing/.*
 /issue_review
-/loading_refactor
+# private working notes and bench logs (guide packet under docs/guide is tracked)
+/docs/refactor_notes/
+/docs/kernel_opt/
 
 # local agent operating rules (not part of the distributed repo)
 AGENTS.md
