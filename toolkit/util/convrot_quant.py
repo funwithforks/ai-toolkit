@@ -988,7 +988,7 @@ def _make_int8_epilogue_dot_kernel(triton, tl):
     # memory) instead of the fp32 broadcast-and-sum. The elementwise form
     # keeps the [BLOCK_N, rank] u-tile in registers and caps at ~1.1 TB/s
     # on sm_120; the dot form reaches ~1.5 TB/s (measured at the live
-    # shapes, bench in loading_refactor). Values differ from the
+    # shapes, bench in docs/kernel_opt). Values differ from the
     # elementwise path by <=1 bf16 ulp in the lora term (tensor-core
     # accumulation order); selected per module via cr8_epi_dot, default
     # off so every other model stays bitwise unchanged.
