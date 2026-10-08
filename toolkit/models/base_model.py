@@ -16,6 +16,7 @@ from torch.nn import Parameter
 from tqdm import tqdm
 from torchvision.transforms import Resize, transforms
 
+from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.ip_adapter import IPAdapter
@@ -1007,7 +1008,20 @@ class BaseModel:
         # then we are doing it, otherwise we are not and takes half the time.
         do_classifier_free_guidance = True
 
-        if isinstance(text_embeddings.text_embeds, list):
+        if isinstance(text_embeddings, AdvancedPromptEmbeds) and "text_embeds" not in text_embeddings:
+            # advanced payload carrying only model-specific keys (LTX-2.5's
+            # connector-space embed cache). concat_prompt_embeds extends the
+            # per-key lists instead of cating dim 0, so after a CFG concat
+            # every item is still [1, seq, dim]: the batch size is the SUM of
+            # the leading dims. Pick a rank-3 key (the batch-aligned tensor
+            # stream get_noise_prediction cats on dim 0); never a mask that
+            # could store seq on dim 0.
+            key = next(
+                k for k in text_embeddings.keys()
+                if text_embeddings[k][0].ndim >= 3
+            )
+            te_batch_size = sum(t.shape[0] for t in text_embeddings[key])
+        elif isinstance(text_embeddings.text_embeds, list):
             if len(text_embeddings.text_embeds[0].shape) == 2:
                 # handle list of embeddings
                 te_batch_size = len(text_embeddings.text_embeds)
