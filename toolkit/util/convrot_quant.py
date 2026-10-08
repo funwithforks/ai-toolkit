@@ -845,12 +845,26 @@ class ConvRotQuantizer(OstrisQuantizer):
 # ---------------- convrot8: W8A8 int8 backend ----------------
 
 
-def quantize_int8_rows(x: torch.Tensor, qmax: int = 127):
+def quantize_int8_rows(x: torch.Tensor, qmax: int = 127, *, clip: float = 1.0):
     """Symmetric per-row integer quantization to [-qmax, qmax] (int8 storage).
-    Returns (int8 (rows, K), fp32 scales (rows,))."""
+    Returns (int8 (rows, K), fp32 scales (rows,)).
+
+    ``clip`` (keyword-only; callers pass qmax positionally) shrinks the stored
+    grid below the row peak: the top codes spend themselves on the tail
+    instead of one outlier. clip == 1.0 runs the original ops untouched, so
+    every existing caller is bit-identical. The dead-row rule keys off the
+    DIVIDED scale, not amax: a denormal amax whose amax/qmax flushes to 0 must
+    keep scale 1 (a predicate rewritten onto amax would store 0 and turn the
+    row into clamped noise)."""
     xf = x.float()
-    scales = xf.abs().amax(dim=1) / qmax
-    scales = torch.where(scales > 0, scales, torch.ones_like(scales))
+    if clip == 1.0:
+        scales = xf.abs().amax(dim=1) / qmax
+        scales = torch.where(scales > 0, scales, torch.ones_like(scales))
+    else:
+        if not (0.0 < clip <= 1.0):
+            raise ValueError(f"clip must be in (0, 1], got {clip}")
+        scales = clip * (xf.abs().amax(dim=1) / qmax)
+        scales = torch.where(scales > 0, scales, torch.ones_like(scales))
     q = torch.round(xf / scales.unsqueeze(1)).clamp_(-qmax, qmax).to(torch.int8)
     return q, scales
 
