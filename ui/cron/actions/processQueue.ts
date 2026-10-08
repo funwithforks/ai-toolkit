@@ -30,6 +30,29 @@ export default async function processQueue() {
           },
         });
       }
+
+      // Self-heal: a queue only stays off when the user explicitly stopped it.
+      // If it is off because it drained (user_stopped === false) and work has
+      // since been queued, turn it back on so queued jobs run without pressing
+      // Start again. A user-stopped queue is never auto-restarted.
+      if (!queue.user_stopped) {
+        const queuedJob: Job | null = await prisma.job.findFirst({
+          where: {
+            status: 'queued',
+            gpu_ids: queue.gpu_ids,
+          },
+        });
+        if (queuedJob) {
+          console.log(
+            `Queue on GPU(s) ${queue.gpu_ids} has queued jobs and was not stopped, starting`,
+          );
+          await prisma.queue.update({
+            where: { id: queue.id },
+            data: { is_running: true },
+          });
+          queue.is_running = true;
+        }
+      }
     }
     if (queue.is_running) {
       // first see if one is already running, status of running or stopping

@@ -14,7 +14,7 @@ export async function GET(request: NextRequest, { params }: { params: { queueID:
 
   await prisma.queue.update({
     where: { id: queue.id },
-    data: { is_running: false },
+    data: { is_running: false, user_stopped: true },
   });
 
   return NextResponse.json(queue);
