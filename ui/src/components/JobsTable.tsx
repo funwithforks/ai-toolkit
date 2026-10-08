@@ -315,9 +315,9 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
                         STOP
                       </button>
                     </>
-                  ) : (
+                  ) : queue?.user_stopped ? (
                     <>
-                      <span className="text-red-100 dark:text-red-400 mr-2">Queue Stopped</span>
+                      <span className="text-red-100 dark:text-red-400 mr-2">Stopped</span>
                       <button
                         onClick={async () => {
                           await startQueue(gpuKey);
@@ -328,6 +328,8 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
                         START
                       </button>
                     </>
+                  ) : (
+                    <span className="text-red-100 dark:text-red-400 mr-2">Waiting for jobs</span>
                   )}
                 </div>
               </div>
