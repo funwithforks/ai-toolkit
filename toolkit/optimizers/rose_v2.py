@@ -137,7 +137,8 @@ class RoseV2(torch.optim.Optimizer):
         centralize: bool = True,
         stabilize: bool = True,
         bf16_sr: bool | torch.Generator = True,
-        compute_dtype: torch.dtype | str | None = "fp64"
+        compute_dtype: torch.dtype | str | None = "fp64",
+        batched: bool = True,
     ):
         if lr < 0.0:
             raise ValueError(f"\nInvalid learning rate: {lr}") from None
@@ -179,9 +180,146 @@ class RoseV2(torch.optim.Optimizer):
             weight_decay=weight_decay,
             wd_schedule=wd_schedule,
             bf16_sr=bf16_sr,
-            compute_dtype=compute_dtype
+            compute_dtype=compute_dtype,
+            batched=batched,
         )
         super().__init__(params, defaults)
+
+    # Max stacked members per chunk: bounds the fp64 family buffers at
+    # ~0.4 GB peak (G, P, square temp) regardless of family size. The
+    # 32 GB fit tier cannot spare more (measured: 32M cap pushed run
+    # peak to 32118 MiB vs 31540 control).
+    _BATCH_MAX_ELEMS = 16_000_000
+
+    def _wd_factor(self, group, lr):
+        """Decoupled weight-decay factor, exactly as step() computes it."""
+        weight_decay = group["weight_decay"]
+        wd_schedule = group["wd_schedule"]
+        group.setdefault("initial_lr", lr)
+        if weight_decay and wd_schedule:
+            wd_lr = lr / (
+                wd_schedule if isinstance(wd_schedule, float)
+                else group.get("max_lr", group.get("initial_lr"))
+            )
+        else:
+            wd_lr = lr
+        return None if not weight_decay else max(0.0, 1.0 - wd_lr * weight_decay)
+
+    def _step_batched(self, group, wd_factor):
+        """Step same-shape families as stacked buffers; per-member math is
+        identical to the loop in step(), with reductions over the member
+        axis (slice reduction order/width unchanged). Returns params no
+        family applies to (singletons), which the caller loops over."""
+        compute_dtype = group["compute_dtype"]
+        lr = group["lr"]
+        by_key = {}
+        for p in group["params"]:
+            if p.grad is None or p.grad.is_sparse:
+                continue
+            key = (tuple(p.shape), p.dtype, p.device)
+            by_key.setdefault(key, []).append(p)
+
+        batched_ids = set()
+        families = []
+        for ps in by_key.values():
+            if len(ps) < 2:
+                continue
+            families.append(ps)
+            batched_ids.update(id(p) for p in ps)
+        # singletons (and anything family-batching declined, e.g. sparse)
+        # stay on the per-parameter loop, whose sparse raise is preserved
+        remaining = [
+            p for p in group["params"]
+            if p.grad is not None and id(p) not in batched_ids
+        ]
+
+        for ps in families:
+            shape = tuple(ps[0].shape)
+            per = 1
+            for s in shape:
+                per *= s
+            chunk = max(1, self._BATCH_MAX_ELEMS // per)
+            for i in range(0, len(ps), chunk):
+                self._step_family(ps[i:i + chunk], group, wd_factor,
+                                  compute_dtype, lr)
+        return remaining
+
+    @torch.no_grad()
+    def _step_family(self, ps, group, wd_factor, compute_dtype, lr):
+        n = len(ps)
+        shape = tuple(ps[0].shape)
+        fp32 = (group["bf16_sr"]
+                and ps[0].dtype == torch.bfloat16
+                and compute_dtype is None)
+        # compute_dtype None means native-dtype compute in the loop path;
+        # families are dtype-keyed so the native dtype is uniform
+        work_dtype = torch.float32 if fp32 else (
+            compute_dtype if compute_dtype is not None else ps[0].dtype
+        )
+        # stack + cast on copy (value-identical to per-param .to(dtype))
+        G = torch.empty((n, *shape), dtype=work_dtype, device=ps[0].device)
+        P = torch.empty_like(G)
+        torch._foreach_copy_(list(G.unbind()), [p.grad for p in ps])
+        torch._foreach_copy_(list(P.unbind()), list(ps))
+
+        if wd_factor is not None:
+            P.mul_(wd_factor)
+
+        if len(shape) == 0:
+            P.add_(G.sign(), alpha=-lr)
+        elif len(shape) == 1:
+            g_min, g_max = G.aminmax(dim=1)
+            denom = g_max.abs_().sub_(g_min).unsqueeze(1)
+            denom.masked_fill_(denom == 0.0, 1.0)
+            P.addcdiv_(G, denom, value=-lr)
+        else:
+            short = 32
+            trailing = 1
+            for s in shape[1:]:
+                trailing *= s
+            if len(shape) == 2 and trailing < short:
+                member_axes = (1,)          # member axis shifted from (0,)
+            else:
+                member_axes = tuple(range(2, 1 + len(shape)))
+            reduced = 1
+            for ax in member_axes:
+                reduced *= G.shape[ax]
+
+            if group["centralize"]:
+                G.sub_(G.mean(dim=member_axes, keepdim=True))
+
+            if reduced >= short:
+                denom = G.square().mean(dim=member_axes, keepdim=True).sqrt()
+            else:
+                denom = (
+                    G.amax(dim=member_axes, keepdim=True).abs_()
+                    .sub_(G.amin(dim=member_axes, keepdim=True))
+                )
+
+            if group["stabilize"]:
+                # per-member coefficient-of-variation over the member's
+                # own denominator entries (dims >= 1): same set of values
+                # the loop's std_mean(denom) sees for that param
+                std, mean = torch.std_mean(
+                    denom, dim=tuple(range(1, denom.ndim)),
+                    keepdim=True, correction=0,
+                )
+                trust = mean.div(std.add_(mean).masked_fill_(mean == 0.0, 1.0))
+                denom = mean.lerp(denom, trust)
+
+            denom.masked_fill_(denom == 0.0, 1.0)  # SGD fallback
+            P.addcdiv_(G, denom, value=-lr)
+
+        if group["bf16_sr"] and ps[0].dtype == torch.bfloat16:
+            P32 = P.to(dtype=torch.float32)
+            noise = torch.empty(P32.shape, dtype=torch.int32,
+                                device=P32.device)
+            noise.random_(0, 0x10000, generator=self.bf16_sr_gen)
+            out = P32.view(dtype=torch.int32).add_(noise).bitwise_and_(
+                -0x10000).view(dtype=torch.float32)
+            torch._foreach_copy_(list(ps), list(out.unbind()))
+        else:
+            torch._foreach_copy_(list(ps), list(P.unbind()))
 
     @torch.no_grad()
     def step(self, closure=None) -> torch.Tensor | None:
@@ -199,23 +337,13 @@ class RoseV2(torch.optim.Optimizer):
             compute_dtype = group["compute_dtype"]
 
             # --- Decoupled Weight Decay Factor ---
-            weight_decay = group["weight_decay"]
-            wd_schedule = group["wd_schedule"]
-            group.setdefault("initial_lr", lr)
+            wd_factor = self._wd_factor(group, lr)
 
-            # `wd_schedule` adapted from optimi's "Fully Decoupled Weight Decay":
-            # https://optimi.benjaminwarner.dev/fully_decoupled_weight_decay/
-            if weight_decay and wd_schedule:
-                wd_lr = lr / (
-                    wd_schedule if isinstance(wd_schedule, float)
-                    else group.get("max_lr", group.get("initial_lr"))
-                )
-            else:
-                wd_lr = lr
+            params = group["params"]
+            if group.get("batched", False):
+                params = self._step_batched(group, wd_factor)
 
-            wd_factor = None if not weight_decay else max(0.0, 1.0 - wd_lr * weight_decay)
-
-            for p in group["params"]:
+            for p in params:
                 if p.grad is None:
                     continue
                 if p.grad.is_sparse:
