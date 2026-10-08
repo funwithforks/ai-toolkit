@@ -155,6 +155,10 @@ def _derive_config(params, name, out_path):
     # sample block stays inert
     train["disable_sampling"] = True
     train["gradient_checkpointing"] = bool(params["ckpt"])
+    # measurement runs never write safetensors (~634 MB each); keep the
+    # disk clean by saving past the last step
+    train["save_every"] = int(params["steps"]) + 1
+    train["max_step_saves_to_keep"] = 1
     folders = _load_map(params["dataset"])
     ds = proc["datasets"]
     if len(folders) != len(ds):
