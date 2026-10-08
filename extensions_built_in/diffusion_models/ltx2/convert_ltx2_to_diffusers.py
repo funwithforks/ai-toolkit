@@ -203,19 +203,25 @@ LTX_2_3_VOCODER_SPECIAL_KEYS_REMAP = {
 LTX_2_0_CONNECTORS_SPECIAL_KEYS_REMAP = {}
 
 
+# single source of truth for which unified-checkpoint keys belong to the
+# text-embedding connectors instead of the transformer (the streaming
+# loaders in ltx2.py classify with this same tuple)
+CONNECTOR_KEY_PREFIXES = (
+    "video_embeddings_connector",
+    "audio_embeddings_connector",
+    "transformer_1d_blocks",
+    "text_embedding_projection",
+    "connectors.",
+    "video_connector",
+    "audio_connector",
+    "text_proj_in",
+)
+
+
 def split_transformer_and_connector_state_dict(
     state_dict: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    connector_prefixes = (
-        "video_embeddings_connector",
-        "audio_embeddings_connector",
-        "transformer_1d_blocks",
-        "text_embedding_projection",
-        "connectors.",
-        "video_connector",
-        "audio_connector",
-        "text_proj_in",
-    )
+    connector_prefixes = CONNECTOR_KEY_PREFIXES
 
     transformer_state_dict, connector_state_dict = {}, {}
     for key, value in state_dict.items():

@@ -279,6 +279,14 @@ class SDTrainer(BaseSDTrainProcess):
         except Exception as e:
             print_acc(f" - could not cache {kind} prompt embeds: {e}")
 
+    def _fixed_embed_valid(self, kind, text, flags):
+        # present + accepted by the model's cache-format check (stale
+        # formats re-encode through the TE phase, overwriting the file)
+        path = self._fixed_embed_cache_path(kind, text, flags)
+        if not os.path.exists(path):
+            return False
+        return self.sd.embed_file_valid(path)
+
     def fixed_embeds_cached(self):
         targets = self._fixed_embed_targets()
         if targets is None:
@@ -286,7 +294,7 @@ class SDTrainer(BaseSDTrainProcess):
         missing = [
             kind
             for kind, text, flags in targets
-            if not os.path.exists(self._fixed_embed_cache_path(kind, text, flags))
+            if not self._fixed_embed_valid(kind, text, flags)
         ]
         if missing:
             # say why the text encoder is being loaded: a silent True from

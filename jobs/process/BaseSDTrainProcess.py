@@ -2001,6 +2001,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.sd.vae = None
         flush()
 
+        # the embedding phase is over: models that lazily loaded components
+        # just to convert embeds (e.g. text projection layers) free them at
+        # this boundary; BaseModel is a no-op.
+        self.sd.release_encode_phase_components()
+
         # ### phase 3: transformer ###
         self.sd.load_transformer()
 

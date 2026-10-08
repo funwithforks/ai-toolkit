@@ -23,11 +23,17 @@ class Gemma3TextEncoder(Gemma3ForConditionalGeneration, OstrisTransformersMixin)
 try:
     from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel
 
+    from ..diffusion_models.ltx2 import LTX25_REPO, LTX25_TE_FILE
+
     class Gemma4TextEncoder(Gemma4TextModel, OstrisTransformersMixin):
         """Gemma4 text decoder (ltx2.5's conditioning stack)."""
 
         aitk_subfolder = "text_encoder"
         aitk_tokenizer_subfolder = "tokenizer"
+        # shipped int8 ConvRot file; also carries the connector projections
+        # and the embedded tokenizer assets (holder-side, lifted separately)
+        aitk_comfy_repo = LTX25_REPO
+        aitk_comfy_weight_names = {LTX25_REPO: [LTX25_TE_FILE]}
 
         @classmethod
         def get_transformer_block_names(cls):

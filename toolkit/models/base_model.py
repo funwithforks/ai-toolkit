@@ -418,6 +418,22 @@ class BaseModel:
     def get_prompt_embeds(self, prompt: str, control_images=None) -> PromptEmbeds:
         raise NotImplementedError(
             "get_prompt_embeds must be implemented in child classes")
+
+    def embed_file_valid(self, path: str) -> bool:
+        # cache-completeness hook. Models whose embed cache stores a derived
+        # representation (post-encoder/post-projection) override this to
+        # reject files written by an older cache format, so the text encoder
+        # phase re-encodes them instead of loading stale tensors. Default:
+        # any existing file counts, matching long-standing behavior.
+        return True
+
+    def release_encode_phase_components(self):
+        # frees components a model loaded only for the text-embedding phase
+        # (e.g. projection layers that convert embeds, loaded lazily during
+        # get_prompt_embeds). Runs once at the phase 2 -> 3 boundary, before
+        # the transformer phase. Models that hold nothing beyond the text
+        # encoder keep this no-op.
+        pass
         
     def get_model_has_grad(self):
         raise NotImplementedError(

@@ -2525,6 +2525,15 @@ class TextEmbeddingCachingMixin:
                     dopsd_targets.append((dopsd_blank_path, file_item.get_dopsd_dropout_caption()))
         return encode_targets, dropout_target_paths, dopsd_targets
 
+    def _embed_target_valid(self: 'AiToolkitDataset', path: str) -> bool:
+        # an embed cache entry counts only if present AND accepted by the
+        # model's cache-format check (models that store a derived embed
+        # representation reject files from older formats through
+        # BaseModel.embed_file_valid; the default accepts anything).
+        if not os.path.exists(path):
+            return False
+        return self.sd.embed_file_valid(path)
+
     def text_embedding_complete(self: 'AiToolkitDataset'):
         # True when every text embed this dataset would encode already exists
         # on disk, so the training process can skip loading the text encoder.
@@ -2533,7 +2542,7 @@ class TextEmbeddingCachingMixin:
         for file_item in self.file_list:
             encode_targets, _, dopsd_targets = self._caption_embed_targets(file_item)
             for path, _ in encode_targets + dopsd_targets:
-                if not os.path.exists(path):
+                if not self._embed_target_valid(path):
                     return False
         return True
 
@@ -2548,9 +2557,14 @@ class TextEmbeddingCachingMixin:
                 file_item.latent_load_device = self.sd.device
 
                 encode_targets, dropout_target_paths, dopsd_targets = self._caption_embed_targets(file_item)
-                # only process if not saved to disk
-                encode_targets = [t for t in encode_targets if not os.path.exists(t[0])]
-                dopsd_targets = [t for t in dopsd_targets if not os.path.exists(t[0])]
+                # only process if not already a valid entry on disk (stale
+                # formats re-encode over the old file)
+                encode_targets = [
+                    t for t in encode_targets if not self._embed_target_valid(t[0])
+                ]
+                dopsd_targets = [
+                    t for t in dopsd_targets if not self._embed_target_valid(t[0])
+                ]
                 if len(encode_targets) > 0:
                     # text encoder placement is handled by the model's encode_prompt
                     control_video_paths = getattr(file_item, 'control_video_paths', None) or []
