@@ -1741,6 +1741,7 @@ class LTX25Model(PhasedLoadMixin, LTX2Model):
         if num_quantized_dit:
             self._bf16_modulation_tables(transformer)
             self._fuse_rmsnorms(transformer)
+            self._fuse_split_rope()
         flush()
         return transformer
 
@@ -1802,6 +1803,29 @@ class LTX25Model(PhasedLoadMixin, LTX2Model):
             "(1 kernel vs 4 full-size eager ops per norm)"
         )
         return len(swaps)
+
+    def _fuse_split_rope(self):
+        # The eager split-rope chain costs ~10 launches per rope'd tensor
+        # and checkpointing replays them in backward (measured: 4.73ms fwd+bwd
+        # per video application vs 0.74ms fused; ~4.6k launches/step model-
+        # wide). Head-to-head at this shape (bench: docs/kernel_opt/tests/
+        # ltx2_rope_fused_bench.py): hand Triton 0.74ms < liger-triton 1.08
+        # (+per-build freq materialization) < liger-cutedsl 2.33 (+cat cost),
+        # eager 4.73. The kernel mirrors eager's fp32 rounding pattern
+        # exactly (fwd mul+addcmul-fma; bwd unfused double-rounding): the
+        # parity test is bitwise-equal forward AND backward, zero ulp flips.
+        # This patches a diffusers module global; it is process-wide for
+        # any transformer_ltx2 user in this process, and the function is
+        # only reached for rope_type == "split" call sites.
+        import diffusers.models.transformers.transformer_ltx2 as _t2
+        from .rope_split_fused import fused_apply_split_rotary_emb
+        if getattr(_t2.apply_split_rotary_emb, "_ltx25_fused", False):
+            return 0
+        fused_apply_split_rotary_emb._ltx25_fused = True
+        _t2.apply_split_rotary_emb = fused_apply_split_rotary_emb
+        print("LTX2.5: split-RoPE routed to fused Triton kernel "
+              "(bitwise-eager fwd+bwd, 1 launch per direction)")
+        return 1
 
     def _load_connectors_streamed(self, stream_dev):
         # connectors ride in the transformer file, plus the per-modality
@@ -1897,6 +1921,7 @@ class LTX25Model(PhasedLoadMixin, LTX2Model):
         if num_quantized_dit:
             self._bf16_modulation_tables(transformer)
             self._fuse_rmsnorms(transformer)
+            self._fuse_split_rope()
         flush()
         return transformer
 
