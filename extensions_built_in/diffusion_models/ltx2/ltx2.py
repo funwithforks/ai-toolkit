@@ -1740,6 +1740,7 @@ class LTX25Model(PhasedLoadMixin, LTX2Model):
         self._mixed_file_post_load(transformer, num_quantized_dit)
         if num_quantized_dit:
             self._bf16_modulation_tables(transformer)
+            self._fuse_rmsnorms(transformer)
         flush()
         return transformer
 
@@ -1763,6 +1764,44 @@ class LTX25Model(PhasedLoadMixin, LTX2Model):
             "(prevents fp32 promotion of the bf16 residual stream)"
         )
         return n
+
+    def _fuse_rmsnorms(self, transformer):
+        # diffusers RMSNorm with elementwise_affine=False runs an eager chain
+        # (fp32 cast, pow, mean, fp32-promoted multiply, bf16 downcast) --
+        # 4 full-size kernels per norm, 8 norms x 48 blocks, and grad
+        # checkpointing replays them in backward. aten::rms_norm computes the
+        # same fp32-variance formula in one kernel (the model already uses
+        # this fused path for its q/k torch.nn.RMSNorm). Reduction order
+        # differs (Welford vs mean-reduce): variance delta ~1e-6 rel, ~1000x
+        # under a bf16 ulp; output differs only at rounding-boundary elements
+        # by 1 ulp (parity test: docs/kernel_opt/tests/
+        # ltx2_rmsnorm_fused_equiv.py). Weightless modules only; any affine
+        # RMSNorm keeps the eager path.
+        from diffusers.models.normalization import RMSNorm
+
+        class _FusedRMSNorm(torch.nn.Module):
+            def __init__(self, normalized_shape, eps):
+                super().__init__()
+                self.normalized_shape = tuple(normalized_shape)
+                self.eps = eps
+
+            def forward(self, x):
+                return torch.nn.functional.rms_norm(
+                    x, self.normalized_shape, weight=None, eps=self.eps)
+
+        swaps = {}
+        for name, mod in transformer.named_modules():
+            if isinstance(mod, RMSNorm) and mod.weight is None and mod.bias is None:
+                parent_path, _, leaf = name.rpartition(".")
+                parent = transformer.get_submodule(parent_path) if parent_path else transformer
+                swaps[(parent, leaf)] = _FusedRMSNorm(mod.dim, mod.eps)
+        for (parent, leaf), fused in swaps.items():
+            setattr(parent, leaf, fused)
+        print(
+            f"LTX2.5: fused {len(swaps)} weightless RMSNorms to aten::rms_norm "
+            "(1 kernel vs 4 full-size eager ops per norm)"
+        )
+        return len(swaps)
 
     def _load_connectors_streamed(self, stream_dev):
         # connectors ride in the transformer file, plus the per-modality
@@ -1857,6 +1896,7 @@ class LTX25Model(PhasedLoadMixin, LTX2Model):
         self._mixed_file_post_load(transformer, num_quantized_dit)
         if num_quantized_dit:
             self._bf16_modulation_tables(transformer)
+            self._fuse_rmsnorms(transformer)
         flush()
         return transformer
 
