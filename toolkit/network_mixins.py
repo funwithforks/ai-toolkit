@@ -182,6 +182,8 @@ class ToolkitModuleMixin:
     def _set_runtime_scale(self: Module, value) -> None:
         """Keep float metadata while using a device tensor in compiled math."""
         self.scale = float(value)
+        # Host-side identity flag for the fold elision (see _call_forward).
+        self._scale_is_one = self.scale == 1.0
         runtime_scale = getattr(self, "_runtime_scale", None)
         if runtime_scale is None:
             reference = next(self.parameters(), None)
@@ -240,6 +242,26 @@ class ToolkitModuleMixin:
         # side muls cost ~200ms/step at bs=4 on Blackwell. <=1 bf16 ulp
         # from rounding order. Locon scalar modules keep the output path.
         if lx.dim() == 3 and not hasattr(self, 'scalar'):
+            # Identity-scale elision: when every factor that would be folded
+            # below is exactly 1.0 on the host (module runtime scale, batch
+            # multiplier, no rank-dropout rescale), the fold is a multiply by
+            # one -- an exact bf16 identity -- so both muls and their
+            # MulBackward0 nodes are skipped outright. The weights are never
+            # baked, so save/merge/other readers always see raw values.
+            # Flags are maintained at write time by _set_runtime_scale and
+            # _update_torch_multiplier; this check never syncs.
+            if (
+                getattr(self, '_scale_is_one', False)
+                and batch_scale is None
+                and not (self.rank_dropout is not None and self.rank_dropout > 0
+                         and self.training)
+            ):
+                # same-dtype .to() is a zero-kernel no-op; keep the cast call
+                # so mixed down/up dtype networks behave exactly as before
+                lx = lx.to(self.lora_up.weight.dtype)
+                if return_rank:
+                    return (lx, True)
+                return self.lora_up(lx)
             if batch_scale is not None:
                 scale = batch_scale * scale
             scale = scale.reshape(-1, 1, 1) if scale.dim() else scale
@@ -382,7 +404,10 @@ class ToolkitModuleMixin:
         )
         res = self._call_forward(
             lora_input,
-            batch_scale=multiplier if (fold_batch or epilogue_target) else None,
+            # identity multiplier: hand nothing to the fold paths and let the
+            # elision in _call_forward skip the multiply (see _scale_is_one)
+            batch_scale=None if getattr(self.network_ref(), "_multiplier_is_one", False)
+            else (multiplier if (fold_batch or epilogue_target) else None),
             return_rank=epilogue_target,
         )
         if epilogue_target:
@@ -1020,6 +1045,13 @@ class ToolkitNetworkMixin:
                 tensor_multiplier = multiplier.clone().detach().to(device, dtype=dtype)
 
             self.torch_multiplier = tensor_multiplier.clone().detach()
+            # Host-side identity flag consumed by the module fold elision.
+            # The sync float() runs once per multiplier WRITE, never per step.
+            if isinstance(multiplier, (int, float)):
+                self._multiplier_is_one = float(multiplier) == 1.0
+            else:
+                tm = self.torch_multiplier
+                self._multiplier_is_one = tm.numel() == 1 and float(tm) == 1.0
 
     @property
     def multiplier(self) -> Union[float, List[float], List[List[float]]]:
