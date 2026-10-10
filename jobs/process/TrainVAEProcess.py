@@ -1139,4 +1139,4 @@ class TrainVAEProcess(BaseTrainProcess):
             # reset epoch losses
             epoch_losses = copy.deepcopy(blank_losses)
 
-        self.save()
+        self.save(self.step_num)
