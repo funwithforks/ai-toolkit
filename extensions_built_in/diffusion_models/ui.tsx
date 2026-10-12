@@ -1940,6 +1940,44 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     additionalSections: ["model.low_vram", "model.layer_offloading"],
   },
   {
+    name: "iris3b",
+    label: "Iris 3B (pixel space)",
+    group: "image",
+    defaults: {
+      "config.name": ["iris3b_lora_v1", "my_first_lora_v1"],
+      "config.process[0].model.name_or_path": [
+        "speridlabs/iris-3b",
+        defaultNameOrPath,
+      ],
+      // pixel space: no vae, identity FakeVAE. The 3B fp32->bf16 DiT fits the
+      // card as-shipped; quantize it only as opt-in. The shared Qwen3-VL 4B
+      // encoder (Krea 2's file) is quantized by default.
+      "config.process[0].model.quantize": [false, true],
+      "config.process[0].model.qtype": ["convrot8", "qfloat8"],
+      "config.process[0].model.quantize_te": [true, false],
+      "config.process[0].model.qtype_te": ["convrot8", "qfloat8"],
+      // the reference training schedule (shift 4.0)
+      "config.process[0].train.timestep_type": ["shift", "sigmoid"],
+      "config.process[0].train.optimizer": ["automagic2", "adamw8bit"],
+      "config.process[0].train.lr": [0.0001, 0.0001],
+      "config.process[0].train.steps": [1000, 3000],
+      "config.process[0].train.cache_text_embeddings": [true, false],
+      "config.process[0].network.linear": [16, defaultLinearRank],
+      "config.process[0].network.linear_alpha": [16, defaultLinearRank],
+      "config.process[0].network.conv": [undefined, 16],
+      "config.process[0].network.conv_alpha": [undefined, 16],
+      "config.process[0].sample.guidance_scale": [3, 4],
+      "config.process[0].sample.sample_steps": [30, 25],
+      "config.process[0].save.save_every": [100, 250],
+      "config.process[0].sample.sample_every": [100, 250],
+      "config.process[0].sample.width": [1024, 1024],
+      "config.process[0].sample.height": [1024, 1024],
+      "config.process[0].sample.samples": [[], defaultSampleConfig.samples],
+    },
+    disableSections: ["network.conv"],
+    additionalSections: ["model.low_vram", "model.layer_offloading"],
+  },
+  {
     name: "krea2:turbo",
     label: "Krea 2 Turbo (w/ Training Adapter)",
     generateNameOverride: "Krea 2 Turbo",

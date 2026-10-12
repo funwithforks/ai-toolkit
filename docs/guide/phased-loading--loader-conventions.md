@@ -17,6 +17,19 @@ anchors that show how.
 
 ## 1. Resolution: never hardcode a path or a capacity
 
+**Where `MODELS_PATH` itself comes from** (settled; do not re-investigate): the
+UI settings page ("Models Folder Path", field `MODELS_PATH`,
+`ui/src/app/settings/page.tsx:113`) saves it to the sqlite `Settings` table in
+`aitk_db.db`; the cron worker injects it into the spawned `run.py` env
+(`ui/cron/actions/startJob.ts:263-268`, an already-set env always wins), and
+`run.py` `load_dotenv()` + `toolkit/paths.py:11-14` make it effective.
+Precedence: `.env`/env > DB row > `<repo>/models` default. On this machine the
+effective root is the value in repo `.env` (gitignored) — resolve it at runtime
+with `from toolkit.paths import MODELS_PATH`, never from memory, and never from
+`<repo>/models` unless that is what the env says. Weights land in its ComfyUI
+subfolders (`diffusion_models/`, `text_encoders/`, `vae/`), created on demand
+by the resolver. `COMFY_MODELS_PATH` (`paths.py:8`) is dead — no consumers.
+
 Component files resolve **only** through the existing chain. Two entry points,
 both in `toolkit/models/v2/resolver.py`:
 
