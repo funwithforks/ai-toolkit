@@ -262,7 +262,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.ema: ExponentialMovingAverage = None
         
         validate_configs(self.train_config, self.model_config, self.save_config, self.dataset_configs)
-        
+        if self.sample_config.comfy or self.first_sample_config.comfy:
+            from toolkit.comfy_sampler import validate_comfy_sample_setup
+            validate_comfy_sample_setup(self)
+
         do_profiler = self.get_conf('torch_profiler', False)
         self.torch_profiler = None if not do_profiler else torch.profiler.profile(
             activities=[
@@ -379,27 +382,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
 
-        if (
-            self.vae_training_mode == 'reload'
-            and self.sd.vae is None
-            and not getattr(self.sd, 'staged_sampling', False)
-        ):
-            # the vae was freed after dataset prep. Sampling decodes through
-            # it, so load it back for this round (see vae_training_mode).
-            # staged_sampling models skip this: they want the denoise loop
-            # without the vae and load it themselves for the decode pass.
-            print_acc("Loading vae for sampling")
-            self.sd.load_vae()
+        if sample_config.comfy:
+            # remote rendering: snapshot the weights and queue the round on
+            # the comfy worker. No local generation runs, so no VAE or text
+            # encoder load is triggered (see toolkit/comfy_sampler.py).
+            from toolkit.comfy_sampler import get_comfy_sampler
+            get_comfy_sampler(self).submit_round(
+                gen_img_config_list, step, is_first=is_first)
+        else:
+            if (
+                self.vae_training_mode == 'reload'
+                and self.sd.vae is None
+                and not getattr(self.sd, 'staged_sampling', False)
+            ):
+                # the vae was freed after dataset prep. Sampling decodes through
+                # it, so load it back for this round (see vae_training_mode).
+                # staged_sampling models skip this: they want the denoise loop
+                # without the vae and load it themselves for the decode pass.
+                print_acc("Loading vae for sampling")
+                self.sd.load_vae()
 
-        # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+            # send to be generated
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        if self.vae_training_mode in ('reload', 'unload'):
-            # free it again until the next sample round (also catches the vae
-            # a staged model loaded itself for decoding)
-            print_acc("VAE unloaded until next sample round")
-            self.sd.vae = None
-            flush()
+            if self.vae_training_mode in ('reload', 'unload'):
+                # free it again until the next sample round (also catches the vae
+                # a staged model loaded itself for decoding)
+                print_acc("VAE unloaded until next sample round")
+                self.sd.vae = None
+                flush()
 
         
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
@@ -521,7 +532,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
     
     def done_hook(self):
-        pass
+        # give the comfy sampler a window to deliver in-flight remote sample
+        # rounds before the process exits (toolkit/comfy_sampler.py)
+        sampler = getattr(self, '_comfy_sampler', None)
+        if sampler is not None:
+            sampler.wait_for_pending()
     
     def end_step_hook(self):
         pass

@@ -103,7 +103,17 @@ class SampleConfig:
         if self.num_frames > 1 and self.ext not in ['webp']:
             print("Changing sample extention to animated webp")
             self.ext = 'webp'
-        
+
+        # remote sampling through the Comfy API v2 proxy (see
+        # toolkit/comfy_sampler.py). When true, samples are rendered on the
+        # ComfyUI box from a tagged API-format workflow instead of locally.
+        self.comfy: bool = bool(kwargs.get('comfy', False))
+        self.comfy_url: Optional[str] = kwargs.get('comfy_url', None)
+        # workflow is picked by model arch: <dir>/<arch>.json (the sampler
+        # resolves it). comfy_workflow_path overrides for one-off cases.
+        self.comfy_workflow_dir: Optional[str] = kwargs.get('comfy_workflow_dir', None)
+        self.comfy_workflow_path: Optional[str] = kwargs.get('comfy_workflow_path', None)
+
         prompts: list[str] = kwargs.get('prompts', [])
         
         self.samples: Optional[List[SampleItem]] = None
