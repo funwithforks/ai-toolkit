@@ -33,6 +33,7 @@ ARCH_LATENT_FORMAT = {
     "flux2": "Flux2",
     "flux2_klein_4b": "Flux2",
     "flux2_klein_9b": "Flux2",
+    "flux3": "Flux3Image",
     "ideogram4": "Flux2",
     "mageflow": "Wan21",
     "mageflow_edit": "Wan21",
