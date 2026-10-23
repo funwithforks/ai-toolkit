@@ -18,7 +18,7 @@
  "115": {
   "inputs": {
    "aspect_ratio": "3:4 (Portrait Standard)",
-   "megapixels": 1.0,
+   "megapixels": 2.0,
    "multiple": 32
   },
   "class_type": "ResolutionSelector",
@@ -119,7 +119,7 @@
  },
  "105:111": {
   "inputs": {
-   "value": 3
+   "value": 1
   },
   "class_type": "PrimitiveFloat",
   "_meta": {
