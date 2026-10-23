@@ -109,6 +109,12 @@ MODEL_TESTS = {
         "model": {"name_or_path": "black-forest-labs/FLUX.2-klein-base-4B", "quantize_te": True},
         "sample": {**IMG, "num_inference_steps": 25, "guidance_scale": 4.0},
     },
+    "fibo2": {
+        # t2i-only build; the int8 convrot dev repack is the trained identity, so
+        # load as-shipped (no requantize). Edit/control datasets are refused.
+        "model": {"name_or_path": "Comfy-Org/Fibo-2.0"},
+        "sample": {**IMG, "num_inference_steps": 20, "guidance_scale": 5.0},
+    },
     # ---- coverage for every UI-default arch (big downloads on first run) ----
     "wan22_14b": {
         "model": {"name_or_path": "ai-toolkit/Wan2.2-T2V-A14B-Diffusers-bf16", "quantize": True, "quantize_te": True, "low_vram": True},
