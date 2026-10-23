@@ -112,9 +112,19 @@ def get_optimizer(
             optimizer_params['eps'] = 1e-6
         optimizer = AdamConvRot(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type == 'rose':
-        from rose_opt import Rose
+        from toolkit.optimizers.rose_opt import Rose
         optimizer = Rose(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type == 'rosev2':
+        # v2 slot = low-rank Rose (rank <= 16): width-blended, bias-
+        # corrected range denominator (swap 2026-10-08 per owner).
+        from toolkit.optimizers.rose_lowrank1 import RoseLowRank
+        optimizer = RoseLowRank(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type == 'rosev3':
+        from toolkit.optimizers.rose_lowrank import RoseLowRank
+        optimizer = RoseLowRank(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type == 'rosev4':
+        # v4 slot = wide Rose (rank 32+): width-driven axis selection with
+        # RMS denominator on wide reductions.
         from toolkit.optimizers.rose_v2 import RoseV2
         optimizer = RoseV2(params, lr=float(learning_rate), **optimizer_params)
     else:
