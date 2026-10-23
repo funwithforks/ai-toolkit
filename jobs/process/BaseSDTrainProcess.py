@@ -532,11 +532,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
     
     def done_hook(self):
-        # give the comfy sampler a window to deliver in-flight remote sample
-        # rounds before the process exits (toolkit/comfy_sampler.py)
+        # never wait on the remote box at end of run: hand unfinished comfy
+        # sample rounds to a detached collector (toolkit/comfy_sampler.py)
         sampler = getattr(self, '_comfy_sampler', None)
         if sampler is not None:
-            sampler.wait_for_pending()
+            sampler.spawn_collector()
+
+    def on_error(self, e: Exception):
+        # same handoff on stop/pause/error paths, which skip done_hook
+        sampler = getattr(self, '_comfy_sampler', None)
+        if sampler is not None:
+            sampler.spawn_collector()
+        super().on_error(e)
     
     def end_step_hook(self):
         pass

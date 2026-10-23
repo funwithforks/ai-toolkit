@@ -114,8 +114,17 @@ snapshot file is written, so a baseline sample never costs an upload.
   order (uploads, resubmits or just collects, depending on how far they got).
 - A job that runs and errors remotely marks that one item failed and moves
   on; the reason is kept in the journal.
-- Process exit: `done_hook` gives the worker 15 minutes to deliver
-  (`wait_for_pending`), then leaves the rest in the journal.
+- Process exit (normal end **or** stop/pause): the job never waits on the
+  remote. It spawns a detached collector (`python -m toolkit.comfy_sampler
+  drain <journal>`; its log is `comfy_collector.log` in the job folder) that
+  keeps polling and dropping samples into the samples folder after the
+  training process is gone, then exits once the journal drains (or after
+  ~24 h, when the proxy's output URLs expire anyway).
+- Pause → resume: the journal carries an advisory lock + PID file. A
+  collector waits briefly for the ending job to release the lock; a resumed
+  trainer reclaims the journal (terminating a lingering collector) and
+  continues from the same file. One writer at a time, no lost work, no
+  double submits.
 
 ## Adding a workflow for a new arch
 

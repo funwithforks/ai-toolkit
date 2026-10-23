@@ -29,12 +29,20 @@ User/agent guide: docs/guide/comfy-remote-sampling.md
 import copy
 import json
 import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import requests
+
+try:
+    import fcntl
+except ImportError:  # windows: lock degrades to pid-file best effort
+    fcntl = None
 
 from toolkit.print import print_acc
 from toolkit.basic import flush
@@ -46,8 +54,10 @@ ALL_TAGS = (TAG_LORA, TAG_LORA_STRENGTH, TAG_PROMPT)
 
 RETRY_INTERVAL_SEC = 15.0
 WAKE_INTERVAL_SEC = 5.0
-DEFAULT_DRAIN_TIMEOUT_SEC = 900.0
-REMOTE_LORA_ROOT = 'models/loras/aitk'
+# the detached collector lives until the journal drains; the ceiling matches
+# the proxy's ~24h job/output expiry window (beyond that, pending jobs would
+# expire anyway)
+COLLECTOR_TIMEOUT_SEC = 86400.0
 JOURNAL_FILENAME = 'comfy_samples.json'
 SNAPSHOT_FOLDER = 'comfy_snapshots'
 ROUND_TERMINAL = ('complete', 'failed')
@@ -226,6 +236,34 @@ def validate_comfy_sample_setup(process):
             'comfy sampling is not usable for this job:\n  - ' + '\n  - '.join(errors))
 
 
+def _read_lock_pid(fh) -> Optional[int]:
+    try:
+        fh.seek(0)
+        txt = fh.read().strip()
+        return int(txt) if txt else None
+    except (OSError, ValueError):
+        return None
+
+
+def _signal_pid(pid: int, sig):
+    if pid == os.getpid():
+        return
+    proc_cmd = f'/proc/{pid}/cmdline'
+    if os.path.exists(proc_cmd):
+        # only signal processes that are actually ours (pid may have been reused)
+        try:
+            with open(proc_cmd, 'rb') as fh:
+                cmdline = fh.read().decode('utf-8', errors='ignore')
+        except OSError:
+            return
+        if 'comfy_sampler' not in cmdline:
+            return
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
 def get_comfy_sampler(process):
     sampler = getattr(process, '_comfy_sampler', None)
     if sampler is None:
@@ -246,12 +284,44 @@ class ComfySampler:
             getattr(process, 'model_config', None), 'arch', None)
         self.workflow_path = resolve_comfy_workflow_path(sc, arch)
         self.job_name = str(process.job.name)
+        self.save_root = process.save_root
+        self._init_common(take_over=True)
+
+    @classmethod
+    def for_drain(cls, journal_path: str, lock_wait: float = 60.0):
+        """
+        Headless mode used by the detached collector child process: rebuilds
+        everything needed to finish rounds from the journal alone. Returns
+        None when another process (a resumed trainer) holds the journal.
+        """
+        with open(journal_path, 'r') as f:
+            data = json.load(f)
+        url = data.get('comfy_url')
+        wf_path = data.get('comfy_workflow_path')
+        if not url or not wf_path:
+            raise ValueError(
+                f'{journal_path} predates detached collection and cannot be '
+                'resumed stand-alone; run the job once to migrate it')
+        obj = cls.__new__(cls)
+        obj.process = None
+        obj.base_url = url.rstrip('/')
+        obj.workflow_path = wf_path
+        obj.job_name = data.get('job_name') or os.path.basename(
+            os.path.dirname(journal_path))
+        obj.save_root = os.path.dirname(journal_path)
+        # the spawning trainer still holds the lock for a moment after the
+        # handoff; wait for it to be released by process exit (a resumed
+        # job that grabs it first means we are not needed and we exit)
+        if not obj._init_common(take_over=False, lock_wait=lock_wait):
+            return None
+        return obj
+
+    def _init_common(self, take_over: bool, lock_wait: float = 0.0) -> bool:
         errors = []
         _check_workflow_file(self.workflow_path, errors)
         if errors:
             raise ValueError(errors[0])
-        print_acc(f'[comfy] using workflow for arch "{arch}": '
-                  f'{self.workflow_path}')
+        print_acc(f'[comfy] workflow: {self.workflow_path}')
         with open(self.workflow_path, 'r') as f:
             self.workflow_template = json.load(f)
         # the pre-training baseline round needs the tagged lora node to be
@@ -261,11 +331,12 @@ class ComfySampler:
             _bypassed_workflow(self.workflow_template)
         except ValueError as e:
             raise ValueError(f'comfy sampling: {e}')
-        self.save_root = process.save_root
         self.journal_path = os.path.join(self.save_root, JOURNAL_FILENAME)
         self.snapshot_folder = os.path.join(self.save_root, SNAPSHOT_FOLDER)
         self._lock = threading.Lock()
         self._dirty = threading.Event()
+        if not self._acquire_journal_lock(take_over, lock_wait):
+            return False
         self._rounds: List[dict] = self._load_journal()
         resumed = [r for r in self._rounds if r['status'] not in ROUND_TERMINAL]
         if resumed:
@@ -276,6 +347,56 @@ class ComfySampler:
         self._worker = threading.Thread(
             target=self._worker_loop, name='comfy-sampler', daemon=True)
         self._worker.start()
+        return True
+
+    # ------------------------------------------------------------------ journal lock
+    # One writer per journal. A resumed trainer (take_over=True) terminates a
+    # lingering detached collector to reclaim it; a collector (take_over=False)
+    # simply exits when the journal is already owned.
+    def _acquire_journal_lock(self, take_over: bool,
+                              lock_wait: float = 0.0) -> bool:
+        lock_path = self.journal_path + '.lock'
+        os.makedirs(os.path.dirname(lock_path) or '.', exist_ok=True)
+        fh = open(lock_path, 'a+')
+        if fcntl is not None:
+            acquired = False
+            patience = 80 if take_over else max(1, int(lock_wait / 0.25))
+            for attempt in range(patience):  # take_over: ~20s; wait: lock_wait
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError:
+                    if not take_over:
+                        time.sleep(0.25)
+                        continue
+                    holder = _read_lock_pid(fh)
+                    if attempt == 0 and holder:
+                        _signal_pid(holder, signal.SIGTERM)
+                    elif attempt == 60 and holder:
+                        _signal_pid(holder, signal.SIGKILL)
+                    time.sleep(0.25)
+            if not acquired:
+                if not take_over:
+                    # the job resumed (or is still running); it owns the journal
+                    fh.close()
+                    return False
+                print_acc('[comfy] journal lock never released; continuing '
+                          'without it (another writer may be active)')
+        else:
+            holder = _read_lock_pid(fh)
+            if take_over and holder:
+                _signal_pid(holder, signal.SIGTERM)
+                time.sleep(1.0)
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(str(os.getpid()))
+            fh.flush()
+        except OSError:
+            pass
+        self._lock_fh = fh
+        return True
 
     # ----------------------------------------------------------------- journal
     def _load_journal(self) -> List[dict]:
@@ -293,8 +414,17 @@ class ComfySampler:
     def _save_journal(self):
         os.makedirs(self.save_root, exist_ok=True)
         tmp = self.journal_path + '.tmp'
+        # self-describing payload: a detached collector can finish rounds
+        # from this file alone, without the training config
+        payload = {
+            'version': 2,
+            'job_name': self.job_name,
+            'comfy_url': self.base_url,
+            'comfy_workflow_path': os.path.abspath(self.workflow_path),
+            'rounds': self._rounds,
+        }
         with open(tmp, 'w') as f:
-            json.dump({'version': 1, 'rounds': self._rounds}, f, indent=1)
+            json.dump(payload, f, indent=1)
         os.replace(tmp, self.journal_path)
 
     # -------------------------------------------------------------- submission
@@ -338,7 +468,10 @@ class ComfySampler:
             'status': 'queued',
             'baseline': bool(is_first),
             'snapshot': snapshot_path,
-            'remote_lora': None,
+            # placement name is decided now (not at upload time) so a
+            # detached collector can resubmit items from the journal alone
+            'remote_lora': None if is_first else
+            f'aitk/{self.job_name}/{self.job_name}_{round_id}.safetensors',
             'asset_id': None,
             'items': items,
         }
@@ -370,8 +503,11 @@ class ComfySampler:
 
     # -------------------------------------------------------------------- http
     def _upload_lora(self, round_rec: dict):
-        file_name = f"{self.job_name}_{round_rec['id']}.safetensors"
-        file_path = f'{REMOTE_LORA_ROOT}/{self.job_name}/{file_name}'
+        remote_rel = round_rec.get('remote_lora') or \
+            f"aitk/{self.job_name}/{self.job_name}_{round_rec['id']}.safetensors"
+        round_rec['remote_lora'] = remote_rel
+        file_name = os.path.basename(remote_rel)
+        file_path = f'models/loras/{remote_rel}'
         try:
             with open(round_rec['snapshot'], 'rb') as fh:
                 resp = self._session.post(
@@ -590,24 +726,65 @@ class ComfySampler:
         with self._lock:
             return [r for r in self._rounds if r['status'] not in ROUND_TERMINAL]
 
-    def wait_for_pending(self, timeout: float = DEFAULT_DRAIN_TIMEOUT_SEC):
-        """Called from done_hook: give the worker a window to deliver."""
-        deadline = time.time() + timeout
-        self._dirty.set()
-        last_report = 0.0
-        while time.time() < deadline:
-            pending = self.pending_rounds()
-            if not pending:
-                return
-            now = time.time()
-            if now - last_report > 30:
-                last_report = now
-                print_acc(f'[comfy] waiting for {len(pending)} sample round(s) '
-                          f'to be collected from the remote '
-                          f'({int(deadline - now)}s left)')
-            time.sleep(2.0)
-        pending = self.pending_rounds()
-        if pending:
-            print_acc(f'[comfy] drain timeout: {len(pending)} round(s) remain '
-                      f'queued in {self.journal_path}; they will be retried '
-                      'when this job runs again or the remote comes back')
+    def spawn_collector(self):
+        """
+        Called when the training process is ending (normally or via stop):
+        hand the unfinished rounds to a detached child process so exiting
+        never waits on the remote box. The child drains the journal into the
+        job's samples folder and exits on its own; a resumed job reclaims the
+        journal by taking over the lock.
+        """
+        if not self.pending_rounds():
+            return
+        if getattr(self, '_lock_fh', None) is None:
+            return
+        repo_root = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), os.pardir))
+        log_path = os.path.join(self.save_root, 'comfy_collector.log')
+        try:
+            with open(log_path, 'a') as fh:
+                subprocess.Popen(
+                    [sys.executable, '-m', 'toolkit.comfy_sampler',
+                     'drain', self.journal_path],
+                    cwd=repo_root,
+                    stdin=subprocess.DEVNULL,
+                    stdout=fh,
+                    stderr=fh,
+                    start_new_session=True,  # survive the training process
+                )
+            print_acc('[comfy] detached collector spawned; remaining samples '
+                      f'will land in {os.path.join(self.save_root, "samples")} '
+                      'after this job exits')
+        except OSError as e:
+            print_acc(f'[comfy] collector spawn failed ({e}); rounds stay '
+                      f'queued in {self.journal_path} for the next run')
+
+
+def _drain_cli(argv) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog='python -m toolkit.comfy_sampler',
+        description='finish pending comfy sample rounds from a job journal')
+    parser.add_argument('command', choices=['drain'])
+    parser.add_argument('journal', help='path to comfy_samples.json')
+    parser.add_argument('--timeout', type=float,
+                        default=COLLECTOR_TIMEOUT_SEC)
+    args = parser.parse_args(argv)
+
+    sampler = ComfySampler.for_drain(args.journal)
+    if sampler is None:
+        print('[comfy] journal is owned by a running job; collector exiting',
+              flush=True)
+        return 0
+    print(f'[comfy] collector started for {args.journal}', flush=True)
+    deadline = time.time() + args.timeout
+    while time.time() < deadline and sampler.pending_rounds():
+        time.sleep(WAKE_INTERVAL_SEC)
+    left = len(sampler.pending_rounds())
+    print(f'[comfy] collector exiting; {left} round(s) still pending',
+          flush=True)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(_drain_cli(sys.argv[1:]))
