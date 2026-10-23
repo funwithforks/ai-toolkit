@@ -205,3 +205,6 @@ testing/.*
 AGENTS.md
 # vendored prebuilt kernel for h3 int8 path (see README)
 !toolkit/kernels/h3_cutlass/*.so
+
+# agent working scratch
+/tmp/
