@@ -1978,6 +1978,60 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     additionalSections: ["model.low_vram", "model.layer_offloading"],
   },
   {
+    name: "flux3",
+    label: "FLUX.3 Image Klein (base)",
+    group: "image",
+    gateUrl: "https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy",
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      "config.name": ["flux3_lora_v1", "my_first_lora_v1"],
+      "config.process[0].model.name_or_path": [
+        "black-forest-labs/flux-3-image-klein-comfy",
+        defaultNameOrPath,
+      ],
+      // int8 convrot checkpoint (already quantized on disk); the trained
+      // identity is the shipped precision, so no quantize flags
+      "config.process[0].model.quantize": [false, false],
+      "config.process[0].model.quantize_te": [false, false],
+      "config.process[0].model.low_vram": [false, false],
+      "config.process[0].model.compile": [true, false],
+      "config.process[0].sample.sampler": ["flowmatch", "flowmatch"],
+      "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
+      // reference training schedule (matches inference dynamic shifting)
+      "config.process[0].train.timestep_type": ["shift", "sigmoid"],
+      "config.process[0].network.linear": [16, defaultLinearRank],
+      "config.process[0].network.linear_alpha": [16, defaultLinearRank],
+      "config.process[0].network.conv": [undefined, 16],
+      "config.process[0].network.conv_alpha": [undefined, 16],
+      "config.process[0].train.optimizer": ["automagic2", "adamw8bit"],
+      "config.process[0].train.lr": [0.0001, 0.0001],
+      "config.process[0].train.steps": [1400, 3000],
+      "config.process[0].train.cache_text_embeddings": [true, false],
+      "config.process[0].save.save_every": [100, 250],
+      "config.process[0].sample.sample_every": [100, 250],
+      "config.process[0].sample.guidance_scale": [3.5, 4],
+      "config.process[0].sample.sample_steps": [28, 25],
+      "config.process[0].sample.width": [1024, 1024],
+      "config.process[0].sample.height": [1024, 1024],
+      "config.process[0].sample.samples": [[], defaultSampleConfig.samples],
+      "config.process[0].model.model_kwargs": [
+        {
+          match_target_res: true,
+        },
+        {},
+      ],
+    },
+    disableSections: ["network.conv"],
+    // no datasets.multi_control_paths: training with control datasets is
+    // refused by design; reference images are sampling-only
+    additionalSections: [
+      "sample.multi_ctrl_imgs",
+      "model.low_vram",
+      "model.layer_offloading",
+      "model.qie.match_target_res",
+    ],
+  },
+  {
     name: "krea2:turbo",
     label: "Krea 2 Turbo (w/ Training Adapter)",
     generateNameOverride: "Krea 2 Turbo",
