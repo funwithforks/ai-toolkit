@@ -36,6 +36,18 @@ and compacted as in training) or plain text.
 Flow convention matches ai-toolkit exactly (t=1 noise -> t=0 clean,
 target = noise - clean), so no time flips anywhere.
 
+The conditioning cache boundary stops at the TE->DiT handoff ON PURPOSE. The
+Perceiver/gist pass is deterministic and batch-invariant per caption, so its
+output looks cacheable (train the LoRA without it) -- but caching it requires
+freezing the Perceiver out of LoRA, and the vendor recipe (briaai/Fibo-2.0-dev
+``fine_tuning/train_lora.py``, ``build_model``) adapts EVERY ``nn.Linear`` in
+the transformer and asserts none were missed: the Perceiver is part of the
+trainable identity. Measured 2026-10-23: the gist pass costs a flat ~6.3
+ms/step (~1.7% of forward at 1024^2, ~5.2% at 512^2, bs=1, int8 ConvRot), so
+the frozen-Perceiver trade was rejected and the cache stays pre-Perceiver. Do
+not re-propose caching a LoRA-targeted module's output -- the same bar falls
+on caching the injection blocks' ``to_kv`` projections.
+
 EDIT TODO (for the edit-functionality pass -- cuts the research time):
   * keep the vision tower (drop the drop_vision_tower() call) and vendored
     ``src/references.py`` back from upstream (prepare_references/vlm_image/
