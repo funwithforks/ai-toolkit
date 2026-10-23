@@ -167,6 +167,40 @@ class Flux3Model(PhasedLoadMixin, BaseModel):
         attn_backend = self.model_config.model_kwargs.get("attention_backend", None)
         if attn_backend is not None:
             transformer.set_attention_backend(attn_backend)
+        # Dequant-free int8 STE input-gradient backward (census 2026-10-15:
+        # the bf16 STE-backward GEMMs are the ~1350 ms/step cluster at bs8,
+        # 27% of GPU busy on a 98%-busy step; measured -5.0% paired at bs8,
+        # loss band clean). Predicate is the shared convrot attach's own
+        # accessor (cr8_qdata, convrot_quant.py:2146); the shared code keeps
+        # sub-threshold shapes eager and prints per-shape notices.
+        # Default ON per owner ruling (owner ComfyUI gate); isolate with
+        # model_kwargs {int8_bwd: false}.
+        if self.model_config.model_kwargs.get("int8_bwd", True):
+            n = 0
+            for m in transformer.modules():
+                if getattr(m, "cr8_qdata", None) is not None:
+                    m.cr8_bwd_mode = "int8"
+                    n += 1
+        else:
+            n = 0
+        # ONE stack line at the end of model setup (owner ruling: silent
+        # failure is not allowed and per-feature prints scattered through
+        # a long load sequence force log-scanning -- the state must be
+        # legible at a glance where training visibly begins).
+        rope = os.environ.get("FLUX3_ROPE_FUSE", "1") != "0"
+        norm = os.environ.get("FLUX3_NORM_FUSE", "1") != "0"
+        flags = " ".join([
+            f"[{'+' if n else '-'}] int8_bwd"
+            + (f"({n} linears; below-gate shapes stay eager)" if n else ""),
+            f"[{'+' if rope else '-'}] rope_fused",
+            f"[{'+' if norm else '-'}] rmsnorm_fused",
+            f"[=] attn={attn_backend or 'native'}",
+        ])
+        self.print_and_status_update(
+            f"[flux3] TRAIN STACK: {flags} | off switches: "
+            "int8_bwd=false in model_kwargs; FLUX3_ROPE_FUSE=0; "
+            "FLUX3_NORM_FUSE=0"
+        )
         flush()
         return transformer
 

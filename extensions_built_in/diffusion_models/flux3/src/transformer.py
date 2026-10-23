@@ -84,6 +84,13 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
+    # fused Triton path (bitwise vs the eager chain below; kill switch
+    # FLUX3_ROPE_FUSE=0) -- falls through to eager only if unavailable
+    from .rope_fusion import fused_rope_apply
+
+    out = fused_rope_apply(xq, xk, freqs_cis)
+    if out is not None:
+        return out
     xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
     xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
     xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
@@ -174,6 +181,10 @@ class RMSNorm(nn.Module):
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
+        from .norm_fusion import try_rmsnorm
+        out = try_rmsnorm(x, self.scale)
+        if out is not None:
+            return out
         dtype = x.dtype
         x = x.float()
         rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
