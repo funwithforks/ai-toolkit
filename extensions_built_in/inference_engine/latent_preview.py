@@ -34,6 +34,7 @@ ARCH_LATENT_FORMAT = {
     "flux2_klein_4b": "Flux2",
     "flux2_klein_9b": "Flux2",
     "flux3": "Flux3Image",
+    "fibo2": "Flux2",  # shared FLUX.2 packed AE, same 128-ch layout
     "ideogram4": "Flux2",
     "mageflow": "Wan21",
     "mageflow_edit": "Wan21",

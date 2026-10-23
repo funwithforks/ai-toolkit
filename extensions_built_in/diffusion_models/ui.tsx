@@ -2032,6 +2032,52 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     ],
   },
   {
+    name: "fibo2",
+    label: "Bria Fibo 2.0 (dev)",
+    group: "image",
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      // the Comfy-Org repack is the source (the vendor repo is gated and
+      // diffusers-keyed); a comfy-layout .safetensors fine-tune loads through
+      // the transformer_path / text_encoder_path / vae_path model_kwargs
+      "config.process[0].model.name_or_path": [
+        "Comfy-Org/Fibo-2.0",
+        defaultNameOrPath,
+      ],
+      // int8 convrot checkpoint (already quantized on disk); the trained
+      // identity is the shipped precision, so no quantize flags
+      "config.process[0].model.quantize": [false, false],
+      "config.process[0].model.quantize_te": [false, false],
+      "config.process[0].model.low_vram": [false, false],
+      "config.process[0].sample.sampler": ["flowmatch", "flowmatch"],
+      "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
+      "config.process[0].sample.width": [1024, 1024],
+      "config.process[0].sample.height": [1024, 1024],
+      // vendor defaults: CFG 5 against the null caption, 30 steps
+      "config.process[0].sample.guidance_scale": [5, 4],
+      "config.process[0].sample.sample_steps": [30, 25],
+      // shares FLUX.2's scheduler config, so the same timestep weighting
+      "config.process[0].train.timestep_type": ["weighted", "sigmoid"],
+      "config.process[0].network.linear": [16, defaultLinearRank],
+      "config.process[0].network.linear_alpha": [16, defaultLinearRank],
+      "config.process[0].network.conv": [undefined, 16],
+      "config.process[0].network.conv_alpha": [undefined, 16],
+      "config.process[0].train.optimizer": ["automagic2", "adamw8bit"],
+      "config.process[0].train.lr": [0.0001, 0.0001],
+      "config.process[0].train.steps": [1400, 3000],
+      "config.process[0].train.cache_text_embeddings": [true, false],
+      "config.process[0].save.save_every": [100, 250],
+      "config.process[0].sample.sample_every": [100, 250],
+      "config.process[0].sample.samples": [[], defaultSampleConfig.samples],
+    },
+    disableSections: ["network.conv"],
+    // this import is text-to-image only: no datasets.multi_control_paths /
+    // sample.multi_ctrl_imgs / model.qie.match_target_res, because control and
+    // reference images are refused by design until the edit pass lands
+    additionalSections: ["model.low_vram", "model.layer_offloading"],
+    hasMultiLinePrompts: true,
+  },
+  {
     name: "krea2:turbo",
     label: "Krea 2 Turbo (w/ Training Adapter)",
     generateNameOverride: "Krea 2 Turbo",
