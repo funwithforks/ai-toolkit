@@ -12,16 +12,21 @@ own forward (attention with attention_mask=None for the per-row causal
 fast path; the chunk rule pads internally exactly as the single-caption
 encode does).
 
-That per-caption row loop is the measured correctness floor, not a hedge:
-it is BITWISE identical to the serial path (worst cosine 1.000000 over a
-207-caption real dataset). Any batched/bucketed/varlen re-shaping of the
-mixers was previously observed to diverge (worst 0.95) once bf16 kernel
-selection flips with the batch dim and the delta-rule carries amplify a
-1-ulp change over long sequences -- so it is judged against this bitwise
-standard, not a lenient line. Vectorized boundary-safe mixers (torch's
-built-in varlen_attn for attention; a seq_idx-masked chunk rule for GDN)
-are the speed path later; the win over serial today is the fused token-local
-GEMMs and zero pad waste.
+That per-caption row loop is the measured correctness floor, not a hedge.
+Measured vs the serial encode (worst cosine over real datasets):
+1.000000 (bitwise) over a 207-caption / 31.8k-token stream, but 0.9991
+when short captions ride a small mixed stream -- the stream-level
+token-local GEMMs pick batch-shape-dependent kernels, so some captions
+get a 1-ulp input flip that the delta-rule carries can amplify to the
+1e-3..1e-4 range. Treat bitwise as the observed best case, not a
+guarantee, and never judge alternative mixers against anything looser
+than the exact-row path in the SAME stream shape. Batched/bucketed
+mixers were measured to diverge materially (worst 0.95-0.98): bf16
+kernel selection inside the chunk rule and SDPA flips with the batch
+dim. Vectorized boundary-safe mixers (torch's built-in varlen_attn for
+attention; a seq_idx-masked chunk rule for GDN) are the speed path
+later; the win over serial today is the fused token-local GEMMs and
+zero pad waste.
 
 Position ids restart per segment at the model entry point (the tower's mrope
 expands 2-D position_ids itself), so the packed stream's cos/sin are
