@@ -28,6 +28,7 @@ tower resident in phase 2 and reference latents cached in phase 1 (see the
 holder's EDIT TODO header). Control datasets are refused loudly until then.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
@@ -62,12 +63,23 @@ class MossImageParams:
 
 
 class _RMSNorm(nn.Module):
+    # The manual x.float() upcast materialized a full fp32 copy of the
+    # stream (~400 MB per main-stream call, ~170 calls/step) that buys
+    # nothing: CUDA's rms_norm kernel already reduces and scales in fp32
+    # internally (acc_type) and rounds once to bf16 on store -- the same
+    # rounding class as the manual chain. MOSS_NORM_FP32=1 restores the
+    # manual path for A/B measurement.
+    _FP32_UPCAST = os.environ.get("MOSS_NORM_FP32", "0") != "0"
+
     def __init__(self, dim):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        y = F.rms_norm(x.float(), (x.shape[-1],), eps=1e-6)
+        if self._FP32_UPCAST:
+            y = F.rms_norm(x.float(), (x.shape[-1],), eps=1e-6)
+        else:
+            y = F.rms_norm(x, (x.shape[-1],), eps=1e-6)
         return y.to(x.dtype) * self.weight
 
 
