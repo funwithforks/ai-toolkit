@@ -46,6 +46,7 @@ except ImportError:  # windows: lock degrades to pid-file best effort
 
 from toolkit.print import print_acc
 from toolkit.basic import flush
+from toolkit.prompt_utils import apply_inline_dop
 
 TAG_LORA = '{{AITK_LORA}}'
 TAG_LORA_STRENGTH = '{{AITK_LORA_STRENGTH}}'
@@ -455,7 +456,14 @@ class ComfySampler:
             target = cfg.get_image_path(idx, max_count)
             items.append({
                 'idx': idx,
-                'prompt': cfg.prompt,
+                # resolve inline [trigger:X class:Y] tokens to the trigger
+                # part, exactly like the normal training captions do at
+                # embed-cache time (dataloader_mixins). Local sampling gets
+                # this for free from the cached embeds; the remote renders
+                # the raw text, so it must happen here. Resolved now, not at
+                # submit time, so journal resumes and detached collector
+                # resubmit the same text.
+                'prompt': apply_inline_dop(cfg.prompt, use_class=False),
                 'strength': float(cfg.network_multiplier),
                 'output_base': os.path.splitext(target)[0],
                 'status': 'waiting_submit',
