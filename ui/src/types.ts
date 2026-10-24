@@ -256,6 +256,7 @@ export interface SampleConfig {
   num_frames: number;
   fps: number;
   duration?: number;
+  comfy?: boolean;
 }
 
 export interface LoggingConfig {
