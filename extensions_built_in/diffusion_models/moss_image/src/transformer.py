@@ -12,9 +12,14 @@ unmasked path when lengths match. Activations follow the weight dtype exactly
 like the vendor's bf16 inference: fp32 timestep sinusoid and RoPE phases,
 everything else in the compute dtype.
 
-Attention today is the upstream mask path. The packed flash-varlen build
-(``docs/kernel_opt/MOSS_PACKED_AUDIT.md`` + ``FLASH_VARLEN_METHOD.md``) is a
-kernel-campaign session of its own, not part of this loading port.
+Attention: padded t2i training batches run PACKED (owner rule, 2026-10-24:
+varlen, never pad): the ragged per-item prompt states ride straight into
+``_forward_packed`` — live rows only, no rectangle, no masks, flash-varlen
+kernels (``docs/kernel_opt/MOSS_PACKED_AUDIT.md`` + ``FLASH_VARLEN_METHOD.md``
+are the audit and method). The dense path below is the implementation for
+the modes packing does not target (unpadded/dense forward, sampling, the
+unwired edit/ref modes), not a fallback: with varlen on, every padded
+training step takes the packed branch.
 
 EDIT IS NOT WIRED HERE. The DiT's ``ref_latents`` path (clean reference
 latents after the text, t=0 modulation, optional isolation for per-step K/V
@@ -32,6 +37,8 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from toolkit.models.v2._mixin import OstrisModelMixin
+
+from .flash_varlen import flash_varlen_sdpa, varlen_ok
 
 COMFY_REPO = "Comfy-Org/MOSS-Image"
 VENDOR_BASE_REPO = "OpenMOSS-Team/MOSS-Image-Base"
@@ -76,6 +83,33 @@ def _rotate(x, rope):
     cos = torch.cat((cos, cos), -1).unsqueeze(-2)
     a, b = x.chunk(2, -1)
     return x * cos + torch.cat((-b, a), -1) * sin
+
+
+def _rotate_packed(x, rope):
+    """_rotate for packed rows: x (N, H, D), rope (N, D)."""
+    sin, cos = rope.chunk(2, -1)
+    sin = torch.cat((sin, sin), -1).unsqueeze(1)
+    cos = torch.cat((cos, cos), -1).unsqueeze(1)
+    a, b = x.chunk(2, -1)
+    return x * cos + torch.cat((-b, a), -1) * sin
+
+
+def _flash_rows(q, k, v, rope, heads, cu, max_len):
+    """Self-attention over a packed (N, dim) stream: every row of a sample
+    attends to all of that sample's rows -- exactly the key-validity
+    semantics of the dense masks, expressed without a mask and without pad
+    rows. Runs the flash kernels (flash_varlen_sdpa); the skipped pad rows
+    are provably unobservable (the head reads only image rows, and text pad
+    rows are never keys). q/k arrive (N, H, D) from the per-head norms and
+    v (N, dim) from the projection; rope: (N, head_dim); cu: (B+1,) int32
+    offsets; max_len: python int."""
+    n = q.shape[0]
+    q = _rotate_packed(q.reshape(n, heads, -1), rope)
+    k = _rotate_packed(k.reshape(n, heads, -1), rope)
+    v = v.reshape(n, heads, -1)
+    return flash_varlen_sdpa(
+        q, k, v, cu, max_len, q.shape[-1] ** -0.5
+    ).flatten(1)
 
 
 def _attention(
@@ -124,11 +158,14 @@ class _TextBlock(nn.Module):
         self.ffn_gate, self.ffn_up = nn.Linear(dim, ffn_dim), nn.Linear(dim, ffn_dim)
         self.ffn_down = nn.Linear(ffn_dim, dim)
 
-    def forward(self, x, rope, mask):
+    def forward(self, x, rope, mask, pack=None):
         q, k, v = self.qkv(self.norm1(x)).chunk(3, -1)
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
-        x = x + self.proj(_attention(q, k, v, rope, self.heads, mask))
+        if pack is None:
+            x = x + self.proj(_attention(q, k, v, rope, self.heads, mask))
+        else:
+            x = x + self.proj(_flash_rows(q, k, v, rope, self.heads, *pack))
         y = self.norm2(x)
         return x + self.ffn_down(_situ(self.ffn_up(y), self.ffn_gate(y)))
 
@@ -158,12 +195,26 @@ class _Block(nn.Module):
         )
 
     def forward(
-        self, x, rope, modulation, mask, isolate_split=None, ref_span=None, kv_capture=None, kv_cache=None
+        self, x, rope, modulation, mask, isolate_split=None, ref_span=None, kv_capture=None, kv_cache=None, pack=None
     ):
         # modulation (B, 6, D) [shift_a, scale_a, gate_a, shift_f, scale_f,
         # gate_f], or (mod, ref_mod, split): tokens [split:] are clean
         # references modulated at t=0
-        if isinstance(modulation, tuple):
+        if pack is not None:
+            # packed t2i stream: rows (N, D); pack = (row_sample, cu,
+            # max_len). Each row selects its sample's slice of the
+            # (B, 6, D) modulation table -- the dense broadcast below and
+            # this gather are the same numbers.
+            row_sample, cu, max_len = pack
+            m = modulation.unbind(1)
+
+            def affine(h, scale, shift):
+                return h * (1 + m[scale][row_sample]) + m[shift][row_sample]
+
+            def gate(h, g):
+                return h * m[g][row_sample]
+
+        elif isinstance(modulation, tuple):
             mod, ref_mod, split = modulation
             m, r = mod.unbind(1), ref_mod.unbind(1)
 
@@ -194,9 +245,12 @@ class _Block(nn.Module):
         q, k, v = self.proj["qkv"](y).chunk(3, -1)
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
-        attn = _attention(
-            q, k, v, rope, self.heads, mask, ref_span, kv_capture, kv_cache, isolate_split
-        )
+        if pack is None:
+            attn = _attention(
+                q, k, v, rope, self.heads, mask, ref_span, kv_capture, kv_cache, isolate_split
+            )
+        else:
+            attn = _flash_rows(q, k, v, rope, self.heads, cu, max_len)
         x = x + gate(self.proj["o"](attn), 2)
         y = affine(self.norm2(x), 4, 3)
         hidden, ffn_gate = self.proj["ffn_up_gate"](y).chunk(2, -1)
@@ -300,10 +354,10 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
 
-    def _ckpt(self, module, *args):
+    def _ckpt(self, module, *args, **kwargs):
         if self.gradient_checkpointing and torch.is_grad_enabled():
-            return checkpoint(module, *args, use_reentrant=False)
-        return module(*args)
+            return checkpoint(module, *args, use_reentrant=False, **kwargs)
+        return module(*args, **kwargs)
 
     def _rope_from_coords(self, coords):
         """(B, L, 4) fp32 (r, f, h, w) coordinates -> (B, L, head_dim) rope."""
@@ -383,6 +437,108 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         mod = self.shared_block_modulation(time.to(dtype)).view(times.shape[0], 6, -1)
         return mod, time
 
+    def _packed_ctx(self, batch, num_image, lengths, device):
+        """Packed-stream layout for t2i: each sample's rows are
+        [image | its live text rows], batch-major. The lengths are python
+        ints (the ragged cache shapes the caller already holds), so the
+        whole context builds CPU-side with zero GPU syncs (audit
+        MOSS_PACKED_AUDIT.md:42-44)."""
+        counts = torch.tensor([num_image + n for n in lengths])
+        starts = counts.cumsum(0) - counts
+        text_counts = torch.tensor(lengths)
+        img_sel = torch.cat(
+            [torch.arange(s, s + num_image) for s in starts.tolist()]
+        ).to(device)
+        txt_sel = torch.cat(
+            [
+                torch.arange(s + num_image, s + num_image + n)
+                for s, n in zip(starts.tolist(), lengths)
+            ]
+        ).to(device)
+        rows = torch.arange(batch, device=device)
+        return {
+            "cu": torch.cat(
+                (torch.zeros(1, dtype=torch.int32), counts.cumsum(0, dtype=torch.int32))
+            ).to(device),
+            "max_len": int(counts.max()),
+            "cu_text": torch.cat(
+                (torch.zeros(1, dtype=torch.int32), text_counts.cumsum(0, dtype=torch.int32))
+            ).to(device),
+            "max_text": max(lengths),
+            "img_sel": img_sel,
+            "txt_sel": txt_sel,
+            "row_sample": rows.repeat_interleave(counts.to(device)),
+            # the image block is batch-major and uniform: the head reads it
+            # as a plain (B, num_image, D) view, no gather needed
+            "img_sample": rows.repeat_interleave(num_image),
+            "total": int(counts.sum()),
+            "lengths_f": text_counts.to(device, dtype=torch.float32),
+            "text_total": int(text_counts.sum()),
+        }
+
+    def _forward_packed(self, hidden_states, timestep, embeds_list):
+        """The packed t2i path (the standard for padded training batches):
+        the ragged per-item (L_i, text_dim) prompt states go straight into
+        the stream -- no pad rectangle, no masks, live rows only, flash
+        varlen attention in every block. Exact by construction: the dense
+        mask means 'attend to my live rows' (that is what flash varlen
+        computes), and the head reads only image rows, so no dropped pad
+        row is observable anywhere (audit MOSS_PACKED_AUDIT.md:34-41).
+        Coordinate RoPE and the AdaLN tables follow the rows; the output
+        head is the same affine as the dense path, applied on the b-major
+        (B, num_image, D) image view."""
+        batch, _, height, width = hidden_states.shape
+        num_image = height * width
+        device = hidden_states.device
+        dtype = self.dtype
+        lengths = [int(e.shape[0]) for e in embeds_list]
+        ctx = self._packed_ctx(batch, num_image, lengths, device)
+
+        times = torch.as_tensor(timestep, device=device, dtype=torch.float32)
+        times = times.reshape(-1).expand(batch)
+        mod, time = self._time_modulation(times, dtype)
+        head = self.video_head_modulation(time.to(dtype)).view(batch, 2, -1)
+
+        # per-token coordinates in the packed layout -- the same values the
+        # dense _rope builds: image grid with frame coord = the sample's
+        # text length, then its text token i at (0, i, 0, 0)
+        image = self._image_coords(0, 0, height, width, device)
+        image = image.repeat(batch, 1)  # tile (b-major segments), not interleave
+        image[:, 1] = ctx["lengths_f"].repeat_interleave(num_image)
+        coords = torch.zeros(ctx["total"], 4, device=device)
+        coords[ctx["img_sel"]] = image
+        text_within = (torch.arange(
+            ctx["text_total"], device=device
+        ) - ctx["cu_text"][:-1].repeat_interleave(
+            ctx["cu_text"][1:] - ctx["cu_text"][:-1]
+        )).float()
+        coords[ctx["txt_sel"], 1] = text_within
+        rope = self._rope_from_coords(coords).to(dtype)
+
+        video = hidden_states.flatten(2).transpose(1, 2).to(dtype)
+        video = self.video_embedder(video.reshape(batch * num_image, -1))
+        text = self.text_embedder.proj(
+            torch.cat([e.to(device, dtype) for e in embeds_list], 0)
+        )
+        text_rope = rope[ctx["txt_sel"]]
+        for block in self.text_embedder.blocks:
+            text = self._ckpt(
+                block, text, text_rope, None, pack=(ctx["cu_text"], ctx["max_text"])
+            )
+
+        x = torch.zeros(ctx["total"], self.params.dim, device=device, dtype=dtype)
+        x[ctx["img_sel"]] = video
+        x[ctx["txt_sel"]] = text
+        pack = (ctx["row_sample"], ctx["cu"], ctx["max_len"])
+        for layer in self.layers:
+            x = self._ckpt(layer, x, rope, mod, None, pack=pack)
+
+        out = x[ctx["img_sel"]].view(batch, num_image, -1)
+        out = self.final_norm_video(out)
+        out = out * (1 + head[:, 1, None]) + head[:, 0, None]
+        out = self.final_linear_video(out)
+        return out.transpose(1, 2).reshape(batch, -1, height, width)
+
     def forward(
         self,
         hidden_states: torch.Tensor,  # (B, latent_channels, H, W)
@@ -404,6 +560,12 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         prompt / skip-layer combination (the reference RoPE follows the text
         length)."""
         skip = frozenset(skip_layers or ())
+        if isinstance(encoder_hidden_states, (list, tuple)):
+            # the packed t2i standard: ragged per-item prompt states
+            # (L_i, text_dim) arrive as a list -> live-rows-only flash path
+            return self._forward_packed(
+                hidden_states, timestep, list(encoder_hidden_states)
+            )
         if ref_kv_cache is not None and not isolate_refs:
             raise ValueError("ref_kv_cache needs isolate_refs: cached K/V are only step-invariant when references attend to themselves")
         reuse_refs = ref_kv_cache is not None and ref_kv_cache.get("kv") is not None

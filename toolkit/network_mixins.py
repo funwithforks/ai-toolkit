@@ -49,6 +49,23 @@ ExtractMode = Union[
 
 printed_messages = []
 
+# Row->sample index maps for PACKED ragged streams, published by the model
+# around a packed forward (see MOSS-Image get_noise_prediction). The LoRA
+# multiplier is (B,)-indexed; a packed stream is ragged, so interleave-by-B
+# cannot express it and the module expands per row instead. Module-level
+# registry (not a network attribute): LoRA modules reach the multiplier via
+# weakrefs that may point at a pre-prepare instance, so object identity is
+# not dependable here. Empty outside packed forwards -> every other model
+# takes the original uniform-interleave path byte-for-byte unchanged.
+_MULTIPLIER_ROWS: tuple = ()
+
+
+def set_multiplier_rows(rows):
+    """Publish/clear the row->sample maps ((N_rows,) long tensors) for the
+    duration of a packed forward. Single training thread by contract."""
+    global _MULTIPLIER_ROWS
+    _MULTIPLIER_ROWS = tuple(rows)
+
 
 def print_once(msg):
     global printed_messages
@@ -371,9 +388,20 @@ class ToolkitModuleMixin:
         lora_batch_size = lora_input.size(0)
         multiplier_batch_size = multiplier.size(0)
         if lora_batch_size != multiplier_batch_size:
-            num_interleaves = lora_batch_size // multiplier_batch_size
-            # todo check if this is correct, do we just concat when doing cfg?
-            multiplier = multiplier.repeat_interleave(num_interleaves)
+            # Packed ragged streams (opt-in): pick the published row->sample
+            # map matching this module's rows (a packed forward sets these
+            # around itself; see set_multiplier_rows). Otherwise the
+            # original uniform interleave, byte-for-byte unchanged.
+            rows = next(
+                (r for r in _MULTIPLIER_ROWS if r.numel() == lora_batch_size),
+                None,
+            )
+            if rows is not None:
+                multiplier = multiplier[rows]
+            else:
+                num_interleaves = lora_batch_size // multiplier_batch_size
+                # todo check if this is correct, do we just concat when doing cfg?
+                multiplier = multiplier.repeat_interleave(num_interleaves)
 
         # LoRA outputs a rank activation when dim==3 (no locon scalar):
         # _call_forward folds the multiplier there before lora_up, so the
