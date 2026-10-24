@@ -71,3 +71,38 @@ def encode_text_batch(text_encoder, tokenizer, texts, max_length, device) -> Lis
         input_ids=enc["input_ids"].to(device), use_cache=False
     ).last_hidden_state
     return [states[i, :n] for i, n in enumerate(lengths)]
+
+
+@torch.no_grad()
+def encode_text_batch_packed(
+    text_encoder, tokenizer, texts, max_length, device
+) -> List[torch.Tensor]:
+    """Same contract as encode_text_batch -- per-item (L_i, D) states from
+    ONE forward -- but padding-free: every caption contributes exactly its
+    real tokens to a packed stream. The token-mixing layers run per length
+    bucket with captions as independent rows (toolkit packed path), so no
+    caption pads to another's length and attention's quadratic term
+    follows bucket lengths, not the batch max. Positions restart per
+    caption (mrope consumes our 2-D position_ids directly)."""
+    from toolkit.models.v2.text_encoders.qwen35_packed import packed_mode
+
+    ids = [
+        tokenizer(
+            t, truncation=True, max_length=max_length, return_tensors="pt"
+        ).input_ids[0].to(device)
+        for t in texts
+    ]
+    lengths = [int(x.shape[0]) for x in ids]
+    input_ids = torch.cat(ids)[None]
+    position_ids = torch.cat(
+        [torch.arange(n, device=device) for n in lengths]
+    )[None]
+    with packed_mode(lengths, device=device):
+        states = text_encoder(
+            input_ids=input_ids,
+            attention_mask=None,
+            position_ids=position_ids,
+            use_cache=False,
+        ).last_hidden_state
+    cu = [0] + list(torch.tensor(lengths).cumsum(0).tolist())
+    return [states[0, cu[i] : cu[i + 1]] for i in range(len(lengths))]

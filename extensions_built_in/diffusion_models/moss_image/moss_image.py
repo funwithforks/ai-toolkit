@@ -78,6 +78,7 @@ from .src.text_encoder import (
     MAX_TEXT_TOKENS,
     MossQwen35Encoder,
     encode_text_batch,
+    encode_text_batch_packed,
 )
 from .src.transformer import COMFY_REPO, VENDOR_BASE_REPO, MossImageTransformer
 
@@ -129,6 +130,11 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
         self.is_transformer = True
         self.target_lora_modules = ["MossImageTransformer"]
         self.supports_model_paths = True
+        # phase-2 batched caption caching (declare token counting + bytes/token)
+        self.supports_batched_text_cache = True
+        # the packed (padding-free) encode path is installed by the TE
+        # itself; captions pack by REAL tokens instead of padded ones
+        self.supports_packed_text_cache = True
         self.use_old_lokr_format = False
         # the base-model converter swaps transformer. <-> diffusion_model. on
         # save/load, matching the ComfyUI key layout
@@ -290,6 +296,35 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
         return "text_embeds" in keys
 
     # ------------------------------------------------------------------
+    # Batched caption caching (phase 2): the shared cache pass batches the
+    # plain-text targets of models declaring supports_batched_text_cache.
+    # Toolkit side: toolkit/text_cache_batching.py.
+    # ------------------------------------------------------------------
+    def count_text_tokens(self, captions):
+        # token count of the EXACT presentation the tower sees (chat
+        # template applied), capped at the encoder's truncation length
+        enc = self.tokenizer(
+            [self._chat(c) for c in captions], add_special_tokens=False
+        )
+        return [min(len(ids), self.max_text_length) for ids in enc["input_ids"]]
+
+    def text_cache_bytes_per_token(self):
+        # marginal live activation bytes per PADDED token, measured on this
+        # tower from the slope of peak allocations between batched cache
+        # groups on real captions: ~140,000 B/token (two independent
+        # slopes: 136k, 140k). Round up to 150k for measurement precision.
+        # (The old 1,520,000 came from the activation probe's single-slope
+        # fit dominated by its L=4096 cells -- a long-sequence regime real
+        # captions never run in; it over-reserved ~10x and capped batches
+        # for no reason.)
+        # Per-job override: model_kwargs.text_cache_bytes_per_token
+        # (or 0 to disable the pass).
+        override = self.model_config.model_kwargs.get("text_cache_bytes_per_token")
+        if override is not None:
+            return int(override)
+        return 150_000
+
+    # ------------------------------------------------------------------
     # Generation (training previews)
     # ------------------------------------------------------------------
     def get_generation_pipeline(self):
@@ -411,12 +446,22 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
         if self.text_encoder.device == torch.device("cpu"):
             self.text_encoder.to(self.device_torch)
 
-        states = encode_text_batch(
-            self.text_encoder,
-            self.tokenizer,
-            [self._chat(p) for p in prompt],
-            self.max_text_length,
-            self.device_torch,
+        states = (
+            encode_text_batch_packed(
+                self.text_encoder,
+                self.tokenizer,
+                [self._chat(p) for p in prompt],
+                self.max_text_length,
+                self.device_torch,
+            )
+            if getattr(self.text_encoder, "_qwen35_packed_ready", False)
+            else encode_text_batch(
+                self.text_encoder,
+                self.tokenizer,
+                [self._chat(p) for p in prompt],
+                self.max_text_length,
+                self.device_torch,
+            )
         )
         return AdvancedPromptEmbeds(text_embeds=[s.to(self.torch_dtype) for s in states])
 

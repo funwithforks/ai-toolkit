@@ -18,6 +18,7 @@ from transformers import Qwen3_5TextModel
 
 from .._mixin import OstrisTransformersMixin
 from .qwen35_fast import install_qwen35_fast_path
+from .qwen35_packed import install_qwen35_packed_path
 
 QWEN35_COMFY_REPO = "Comfy-Org/Qwen3.5"
 
@@ -57,6 +58,9 @@ class Qwen35TextOnlyEncoder(Qwen3_5TextModel, OstrisTransformersMixin):
         # and the .load()/aitk_post_load chain all construct first), and the
         # swap touches bindings only, never weights. See qwen35_fast.
         install_qwen35_fast_path(self)
+        # padding-free caption packing for the embed-cache pass (inert
+        # outside packed_mode; forward-only). See qwen35_packed.
+        install_qwen35_packed_path(self)
 
     @classmethod
     def aitk_load_config(cls, path, subfolder=None):
