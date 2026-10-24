@@ -13,6 +13,7 @@ _step_rows = defaultdict(int)          # breakdown key -> rows this step
 _step_calls = defaultdict(int)
 _step_batches = defaultdict(int)
 _hist = []
+_pad_hist = []                         # one entry per pad_layouts_to_batch call
 
 
 def _flush():
@@ -23,6 +24,7 @@ def _flush():
         "steps_done": _done["step"],
         "batches": _hist,
         "counters": {k: v for k, v in _step_rows.items()},
+        "pad_batches": _pad_hist,
     }
     tmp = _out + ".tmp"
     with open(tmp, "w") as f:
@@ -62,6 +64,8 @@ def _patch_once():
     from extensions_built_in.diffusion_models.minimax_h3 import src as _pkg
     from extensions_built_in.diffusion_models.minimax_h3.src import packing
 
+    _patch_pad(packing)
+
     orig = packing.build_packed_sequence
 
     def patched(*a, **kw):
@@ -97,6 +101,39 @@ def _patch_once():
             continue
         if getattr(mod, "build_packed_sequence", None) is orig:
             mod.build_packed_sequence = patched
+
+
+def _patch_pad(packing):
+    """Wrap pad_layouts_to_batch: per padded batch record the exact pad
+    accounting (B, max_text, media_len, per-sample text lengths, pad_counts)
+    so pad fraction is read, not inferred. pad fraction =
+    sum(pad_counts) / (B * S)."""
+    orig = packing.pad_layouts_to_batch
+
+    def patched(layouts):
+        out = orig(layouts)
+        try:
+            text_lens = [int(l.text_indices.shape[0]) for l in layouts]
+            _pad_hist.append({
+                "step": _done["step"] + 1,
+                "B": len(layouts),
+                "max_text": max(text_lens),
+                "media_len": int(layouts[0].sequence_length) - text_lens[0],
+                "S": int(out[1].shape[1]),
+                "text_lens": text_lens,
+                "pad_counts": [int(p) for p in out[5]],
+            })
+        except Exception:
+            pass
+        return out
+
+    packing.pad_layouts_to_batch = patched
+    import sys
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
+        if getattr(mod, "pad_layouts_to_batch", None) is orig:
+            mod.pad_layouts_to_batch = patched
 
 
 def _make(orig, rows, calls):
