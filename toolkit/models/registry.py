@@ -47,6 +47,7 @@ ARCH_REGISTRY: Dict[str, dict] = {
     "iris3b": {"modality": "image", "model": {"name_or_path": "speridlabs/iris-3b", "quantize_te": True}, "sample": {**IMG, "num_inference_steps": 30, "guidance_scale": 3.0}},
     "flux3": {"modality": "image", "model": {"name_or_path": "black-forest-labs/flux-3-image-klein-comfy"}, "sample": {**IMG, "num_inference_steps": 28, "guidance_scale": 3.5}},
     "fibo2": {"modality": "image", "model": {"name_or_path": "Comfy-Org/Fibo-2.0"}, "sample": {**IMG, "num_inference_steps": 30, "guidance_scale": 5.0}},
+    "moss_image": {"modality": "image", "model": {"name_or_path": "OpenMOSS-Team/MOSS-Image-Base", "model_kwargs": {"uncond_skip_layers": [22]}}, "sample": {**IMG, "num_inference_steps": 30, "guidance_scale": 3.0}},
     "f-lite": {"modality": "image", "model": {"name_or_path": "Freepik/F-Lite", "quantize": True, "quantize_te": True}, "sample": dict(IMG)},
     "sd1": {"modality": "image", "model": {"name_or_path": "stable-diffusion-v1-5/stable-diffusion-v1-5"}, "sample": {"width": 512, "height": 512, "num_inference_steps": 20, "guidance_scale": 7.5}},
     "sdxl": {"modality": "image", "model": {"name_or_path": "stabilityai/stable-diffusion-xl-base-1.0"}, "sample": {**IMG, "guidance_scale": 6.0}},
