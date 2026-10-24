@@ -17,6 +17,7 @@ prompt. It lives in upstream's ``toolkit/models/v2/text_encoders/qwen35.py``
 from transformers import Qwen3_5TextModel
 
 from .._mixin import OstrisTransformersMixin
+from .qwen35_fast import install_qwen35_fast_path
 
 QWEN35_COMFY_REPO = "Comfy-Org/Qwen3.5"
 
@@ -46,6 +47,16 @@ class Qwen35TextOnlyEncoder(Qwen3_5TextModel, OstrisTransformersMixin):
     @classmethod
     def get_transformer_block_names(cls):
         return ["layers"]
+
+    def __init__(self, config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        # transformers' gated-delta fallback is a 63-step python loop PER
+        # LAYER per forward (the CPU hog behind moss_image embed caching);
+        # swap the vectorized chunk rule in at construction -- the modules
+        # exist by then on every load path (_load_single_file, from_pretrained
+        # and the .load()/aitk_post_load chain all construct first), and the
+        # swap touches bindings only, never weights. See qwen35_fast.
+        install_qwen35_fast_path(self)
 
     @classmethod
     def aitk_load_config(cls, path, subfolder=None):
