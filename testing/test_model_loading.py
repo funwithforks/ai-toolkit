@@ -115,6 +115,16 @@ MODEL_TESTS = {
         "model": {"name_or_path": "Comfy-Org/Fibo-2.0"},
         "sample": {**IMG, "num_inference_steps": 20, "guidance_scale": 5.0},
     },
+    "moss_image": {
+        # t2i-only build; the int8 convrot Base repack (DiT + Qwen3.5-9B TE) is
+        # the trained identity, so load as-shipped (no requantize). The
+        # uncond-skip negative branch is the Base release's sampling rule.
+        "model": {
+            "name_or_path": "OpenMOSS-Team/MOSS-Image-Base",
+            "model_kwargs": {"uncond_skip_layers": [22]},
+        },
+        "sample": {**IMG, "num_inference_steps": 30, "guidance_scale": 3.0},
+    },
     # ---- coverage for every UI-default arch (big downloads on first run) ----
     "wan22_14b": {
         "model": {"name_or_path": "ai-toolkit/Wan2.2-T2V-A14B-Diffusers-bf16", "quantize": True, "quantize_te": True, "low_vram": True},
