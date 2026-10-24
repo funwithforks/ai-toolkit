@@ -1,9 +1,9 @@
-import { tool, type Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 
-// Exposes the repo runtool (tools/runtool) as four custom tools.
+// Exposes the repo runtool (tools/runtool) as five custom tools.
 // All real logic lives in the Python runner; these are thin argument
 // shippers. No shell strings: every call is an argv array.
-function runtoolCall(dir: string, args: string[], abort: AbortSignal): Promise<{ code: number; out: string; err: string }> {
+function runtoolCall(dir: string, args: string[], signal: AbortSignal): Promise<{ code: number; out: string; err: string }> {
   const proc = Bun.spawn([`${dir}/venv/bin/python`, "-m", "tools.runtool", ...args], {
     cwd: dir,
     stdout: "pipe",
@@ -15,75 +15,132 @@ function runtoolCall(dir: string, args: string[], abort: AbortSignal): Promise<{
       proc.kill()
     } catch {}
   }
-  abort.addEventListener("abort", kill)
+  signal.addEventListener("abort", kill)
   return Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]).then(([out, err, code]) => {
-    abort.removeEventListener("abort", kill)
+    signal.removeEventListener("abort", kill)
     return { code, out, err }
   })
 }
 
+type Args = Record<string, unknown>
+const str = (v: unknown): string => (typeof v === "string" ? v : v == null ? "" : String(v))
+
+// V1 zod defaults become explicit fallbacks here: JSON Schema inputs are
+// not default-applied before execute.
 const wrap =
-  (build: (a: any) => string[]) =>
-  async (a: any, ctx: any) => {
-    const r = await runtoolCall(ctx.directory, build(a), ctx.abort)
-    const text = r.out.trim() || r.err.trim() || `(no output, exit ${r.code})`
-    return { output: text, metadata: { exit: r.code } }
+  (dir: string, build: (a: Args) => string[]) =>
+  async (input: unknown, ctx: { signal: AbortSignal }) => {
+    const a = (input ?? {}) as Args
+    const r = await runtoolCall(dir, build(a), ctx.signal)
+    const content = r.out.trim() || r.err.trim() || `(no output, exit ${r.code})`
+    return { content, metadata: { exit: r.code } }
   }
 
-export default (async () => ({
-  tool: {
-    runtool_suites: tool({
-      description:
-        "List the runtool suite registry: suite ids, variants, typed params " +
-        "(defaults/bounds), and declared metrics. Call before submit.",
-      args: {},
-      execute: wrap(() => ["suites"]),
-    }),
-    runtool_submit: tool({
-      description:
-        "Submit a registered suite run. Validates suite/variant/params BEFORE " +
-        "launch (unknown anything = rejected, nothing starts). Returns a run_id " +
-        "immediately; use runtool_wait to block until done. Params is a JSON " +
-        'object string, e.g. {"dataset":"<key from datasets.json>",' +
-        '"steps":120,"warmup":20}.',
-      args: {
-        suite: tool.schema.string().describe("suite id (see runtool_suites)"),
-        variant: tool.schema.string().describe("variant within the suite"),
-        params: tool.schema
-          .string()
-          .default("{}")
-          .describe("JSON object of registered params only"),
-        note: tool.schema.string().default("").describe("free-text note for the record"),
-      },
-      execute: wrap((a) => ["submit", "--suite", a.suite, "--variant", a.variant, "--params", a.params, "--note", a.note]),
-    }),
-    runtool_wait: tool({
-      description:
-        "Block until the run exits / is cancelled / times out, then return its " +
-        "status, exit code and parsed metrics. This replaces polling and " +
-        "log-scraping; it watches the recorded pid. status is one of done, " +
-        "failed, crash (exit code attached), cancelled, timeout.",
-      args: {
-        run_id: tool.schema.string(),
-        timeout_s: tool.schema.number().optional().describe("override the suite default wait timeout"),
-      },
-      execute: wrap((a) => ["wait", a.run_id, ...(a.timeout_s ? ["--timeout-s", String(a.timeout_s)] : [])]),
-    }),
-    runtool_status: tool({
-      description:
-        "One-shot live check of a run without waiting: recorded-pid liveness, " +
-        "classification, latest structured progress event.",
-      args: { run_id: tool.schema.string() },
-      execute: wrap((a) => ["status", a.run_id]),
-    }),
-    runtool_cancel: tool({
-      description: "Signal the recorded process group of a running run (TERM then KILL).",
-      args: { run_id: tool.schema.string() },
-      execute: wrap((a) => ["cancel", a.run_id]),
-    }),
+export default Plugin.define({
+  id: "runtool",
+  async setup(ctx) {
+    const dir = ctx.location.directory
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "runtool_suites",
+        description:
+          "List the runtool suite registry: suite ids, variants, typed params " +
+          "(defaults/bounds), and declared metrics. Call before submit.",
+        input: { type: "object", properties: {}, additionalProperties: false },
+        execute: wrap(dir, () => ["suites"]),
+      })
+      editor.add({
+        name: "runtool_submit",
+        description:
+          "Submit a registered suite run. Validates suite/variant/params BEFORE " +
+          "launch (unknown anything = rejected, nothing starts). Returns a run_id " +
+          "immediately; use runtool_wait to block until done. Params is a JSON " +
+          'object string, e.g. {"dataset":"<key from datasets.json>",' +
+          '"steps":120,"warmup":20}.',
+        input: {
+          type: "object",
+          properties: {
+            suite: { type: "string", description: "suite id (see runtool_suites)" },
+            variant: { type: "string", description: "variant within the suite" },
+            params: {
+              type: "string",
+              description: "JSON object of registered params only",
+              default: "{}",
+            },
+            note: {
+              type: "string",
+              description: "free-text note for the record",
+              default: "",
+            },
+          },
+          required: ["suite", "variant"],
+          additionalProperties: false,
+        },
+        execute: wrap(dir, (a) => [
+          "submit",
+          "--suite",
+          str(a.suite),
+          "--variant",
+          str(a.variant),
+          "--params",
+          typeof a.params === "string" ? a.params : "{}",
+          "--note",
+          typeof a.note === "string" ? a.note : "",
+        ]),
+      })
+      editor.add({
+        name: "runtool_wait",
+        description:
+          "Block until the run exits / is cancelled / times out, then return its " +
+          "status, exit code and parsed metrics. This replaces polling and " +
+          "log-scraping; it watches the recorded pid. status is one of done, " +
+          "failed, crash (exit code attached), cancelled, timeout.",
+        input: {
+          type: "object",
+          properties: {
+            run_id: { type: "string" },
+            timeout_s: {
+              type: "number",
+              description: "override the suite default wait timeout",
+            },
+          },
+          required: ["run_id"],
+          additionalProperties: false,
+        },
+        execute: wrap(dir, (a) => [
+          "wait",
+          str(a.run_id),
+          ...(a.timeout_s ? ["--timeout-s", String(a.timeout_s)] : []),
+        ]),
+      })
+      editor.add({
+        name: "runtool_status",
+        description:
+          "One-shot live check of a run without waiting: recorded-pid liveness, " +
+          "classification, latest structured progress event.",
+        input: {
+          type: "object",
+          properties: { run_id: { type: "string" } },
+          required: ["run_id"],
+          additionalProperties: false,
+        },
+        execute: wrap(dir, (a) => ["status", str(a.run_id)]),
+      })
+      editor.add({
+        name: "runtool_cancel",
+        description: "Signal the recorded process group of a running run (TERM then KILL).",
+        input: {
+          type: "object",
+          properties: { run_id: { type: "string" } },
+          required: ["run_id"],
+          additionalProperties: false,
+        },
+        execute: wrap(dir, (a) => ["cancel", str(a.run_id)]),
+      })
+    })
   },
-})) satisfies Plugin
+})
