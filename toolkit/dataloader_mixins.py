@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, List, Dict, Union
@@ -2546,10 +2547,104 @@ class TextEmbeddingCachingMixin:
                     return False
         return True
 
+    def _batched_plain_text_cache_pass(self: 'AiToolkitDataset'):
+        # Phase-2 batched caption caching, opt-in per model
+        # (supports_batched_text_cache). Plain-text stale targets -- never
+        # control / i2v-first-frame / dopsd items -- are token-counted,
+        # packed against the model's measured bytes/padded-token
+        # (toolkit/text_cache_batching.py) and encoded one forward per
+        # group. Written entries pass _embed_target_valid, so the per-item
+        # loop that follows simply skips them; models that do not declare
+        # the flag never come here.
+        sd = self.sd
+        if not getattr(sd, "supports_batched_text_cache", False):
+            return
+        pairs = []  # (path, caption)
+        for file_item in self.file_list:
+            control_video_paths = getattr(file_item, 'control_video_paths', None) or []
+            if file_item.encode_control_in_text_embeddings and (
+                file_item.control_path is not None or len(control_video_paths) > 0
+            ):
+                continue
+            if (
+                getattr(sd, 'encode_first_frame_in_text_embeddings', False)
+                and self.dataset_config.do_i2v
+                and file_item.is_video
+            ):
+                continue
+            encode_targets, _, _ = self._caption_embed_targets(file_item)
+            pairs.extend(
+                (path, caption)
+                for path, caption in encode_targets
+                if not self._embed_target_valid(path)
+            )
+        if not pairs:
+            return
+        bpt = int(sd.text_cache_bytes_per_token())
+        if bpt <= 0:
+            return  # model disabled the pass via model_kwargs
+        # the budget is the rest of the card: mem_get_info's free already
+        # excludes the resident TE and everything else on the device
+        free_bytes, _ = torch.cuda.mem_get_info(sd.device_torch)
+        budget_tokens = free_bytes // bpt
+        if budget_tokens < 1:
+            return
+        from toolkit.text_cache_batching import plan_packed_groups, plan_token_groups
+
+        planner = (
+            plan_packed_groups
+            if getattr(sd, "supports_packed_text_cache", False)
+            else plan_token_groups
+        )
+        counts = sd.count_text_tokens([caption for _, caption in pairs])
+        pending = planner(list(zip(counts, pairs)), budget_tokens)
+        print_acc(
+            f" - Batched caption cache: {len(pairs)} captions -> {len(pending)} groups"
+            f" (max bs {max(len(g) for g in pending)}, token budget {budget_tokens}"
+            f" @ {bpt} B/token, {free_bytes / 2**30:.1f} GiB free)"
+        )
+        total = len(pending)
+        done = 0
+        while pending:
+            group = pending.pop(0)  # [(tokens, (path, caption)), ...]
+            t0 = time.time()
+            try:
+                batched = sd.encode_prompt([cap for _, (_, cap) in group])
+                parts = type(batched).split_prompt_embeds(batched)
+                if len(parts) != len(group):
+                    raise RuntimeError(
+                        f"batched encode returned {len(parts)} embeds for a "
+                        f"group of {len(group)}"
+                    )
+                for (_, (path, _)), part in zip(group, parts):
+                    part.save(path)
+                del batched, parts
+                dt = time.time() - t0
+                done += 1
+                tokens = sum(t for t, _ in group)
+                print_acc(
+                    f"   - group {done}/{total}: {len(group)} captions"
+                    f" ({tokens} tokens), {dt:.1f}s"
+                    f" ({len(group) / max(dt, 1e-6):.1f} captions/s)"
+                )
+            except torch.cuda.OutOfMemoryError:
+                # the budget is an estimate; splitting keeps the pass moving
+                # loudly instead of losing the cache run
+                torch.cuda.empty_cache()
+                if len(group) == 1:
+                    raise
+                half = len(group) // 2
+                print_acc(f"   - OOM at bs {len(group)}; splitting to {half}+{len(group) - half}")
+                pending[0:0] = [group[:half], group[half:]]
+
     def cache_text_embeddings(self: 'AiToolkitDataset'):
         with accelerator.main_process_first():
             print_acc(f"Caching text_embeddings for {self.dataset_path}")
             print_acc(" - Saving text embeddings to disk")
+
+            # opt-in phase-2 batching; writes land through _embed_target_valid
+            # so the per-item loop below skips anything it already saved
+            self._batched_plain_text_cache_pass()
 
             # use tqdm to show progress
             i = 0

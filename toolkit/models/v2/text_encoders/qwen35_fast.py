@@ -16,10 +16,20 @@ This module replaces that path at load. Math:
   * The cross-chunk recurrence runs fully batched with every elementwise
     factor hoisted out of the loop.
 
-Dtype policy: everything runs in the model's own dtype (bf16 as shipped).
-No widening, ever. The decay chain (``g``) arrives fp32 from the model's own
-layer and its chain math stays fp32 -- that is the model's, not the
-fallback's; decay RESULTS are stored back in the working dtype.
+Dtype policy: the I/O boundary is the model's own dtype (bf16 as shipped),
+but the chunk matmuls and the recurrent carry run in fp32 INSIDE the rule
+and are cast back on output. Measured reason (this repo, packed-caption
+branch): the rule's bf16 batched matmuls are not batch-shape invariant --
+row 0 of an identical tensor differs bitwise at bs 1 vs bs 5 (cuBLAS algo
+selection) -- and the delta-rule carry amplifies that reduction-order
+noise over the tower's 24 GDN layers to an end-to-end worst cosine of
+0.957 when captions are encoded in bucketed rows (n_b > 1) instead of one
+row per caption. fp32 rule-internal matmuls put the injection below the
+bf16 quantisation floor (acceptance: packed-vs-serial worst cosine >= 0.98,
+mean >= 0.995). The decay chain (``g``) still arrives fp32 from the model's
+own layer. Side effect to carry: the rule's internal temporaries are 2x
+their bf16 size, so per-model bytes/token budgets are measured WITH this
+rule in place (see moss text_cache_bytes_per_token).
 
 Installed at construction (see install_qwen35_fast_path), so every load path
 gets it.
@@ -60,18 +70,21 @@ def fast_chunk_gated_delta_rule(
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
 ):
-    """(B, L, H, D) in, (B, L, H, D) out -- the tower's own working dtype."""
+    """(B, L, H, D) in, (B, L, H, D) out -- the tower's own dtype at the
+    boundary, fp32 for every matmul and the carry inside (see module
+    docstring for why)."""
     wd = query.dtype
+    rd = torch.float32
+    query, key, value = [x.to(rd) for x in (query, key, value)]
     if use_qk_l2norm_in_kernel:
         query = _l2norm(query, dim=-1, eps=1e-6)
         key = _l2norm(key, dim=-1, eps=1e-6)
     query, key, value = [x.transpose(1, 2).contiguous() for x in (query, key, value)]
-    # beta is model-dtype (bf16 sigmoid); g keeps the fp32 the model's own
-    # layer forward chose for its decay chain (A_log.exp overflow guard --
-    # not fallback). The chain stays fp32; its RESULTS are stored in the
-    # working dtype. The fallback's fp32 casts of q/k/v/beta are not kept.
-    beta = beta.transpose(1, 2).contiguous().to(wd)
-    g = g.transpose(1, 2).contiguous()
+    # beta and g arrive from the model's own layer (bf16 sigmoid / fp32 decay
+    # chain); both continue in fp32 -- the boundary casts back to wd happen
+    # once, on the output.
+    beta = beta.transpose(1, 2).contiguous().to(rd)
+    g = g.transpose(1, 2).contiguous().to(rd)
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
@@ -93,10 +106,9 @@ def fast_chunk_gated_delta_rule(
     ]
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
 
-    # chunk decay (per-chunk local cumsum) -- chain math in the fp32 the
-    # model handed over, results stored in the working dtype
+    # chunk decay (per-chunk local cumsum)
     g = g.cumsum(dim=-1)
-    decay_mask = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().to(wd)
+    decay_mask = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp()
     _probe("gdn_decay_mask", decay_mask)
 
     # UT transform: T = (I - M)^-1 for the STRICT-lower transition matrix M
@@ -107,12 +119,10 @@ def fast_chunk_gated_delta_rule(
     strict_lower = torch.tril(causal, diagonal=-1)
     m = ((k_beta @ key.transpose(-1, -2)) * -decay_mask).masked_fill(~strict_lower, 0)
 
-    # UT inverse in pure working dtype: M is strictly lower triangular, so
-    # the geometric series I + M + M^2 + ... terminates at chunk_size terms
-    # and equals (I - M)^-1 exactly -- the same forward-substitution result,
-    # evaluated as log2(chunk_size) bf16 doubling steps instead of a loop.
-    # (torch.linalg.solve_triangular has no bf16 CUDA kernel; widening is
-    # not on the table.)
+    # UT inverse: M is strictly lower triangular, so the geometric series
+    # I + M + M^2 + ... terminates at chunk_size terms and equals
+    # (I - M)^-1 exactly -- the same forward-substitution result, evaluated
+    # as log2(chunk_size) doubling steps instead of a loop.
     eye = torch.eye(chunk_size, dtype=m.dtype, device=m.device)
     t_matrix = eye + m  # 2 terms: I + M
     e = m @ m  # M^k, k = 2
@@ -123,7 +133,7 @@ def fast_chunk_gated_delta_rule(
         k *= 2
     del e
     value = t_matrix @ v_beta
-    k_cumdecay = t_matrix @ (k_beta * g.exp().to(wd).unsqueeze(-1))
+    k_cumdecay = t_matrix @ (k_beta * g.exp().unsqueeze(-1))
     _probe("gdn_ut", m, m, t_matrix, value, k_cumdecay)
 
     # intra-chunk attention for ALL chunks in one batched matmul
@@ -131,18 +141,18 @@ def fast_chunk_gated_delta_rule(
     intra = (query @ key.transpose(-1, -2) * decay_mask).masked_fill(~causal, 0)
     _probe("gdn_intra", intra, intra)
 
-    # cross-chunk factors, hoisted -- chain math in fp32, storage in wd
-    g_exp = g.exp().to(wd)
+    # cross-chunk factors, hoisted
+    g_exp = g.exp()
     g_last = g[..., -1:]
-    carry = g_last.exp().to(wd).unsqueeze(-1)
-    k_decayed_scale = (g_last - g).exp().to(wd).unsqueeze(-1)
+    carry = g_last.exp().unsqueeze(-1)
+    k_decayed_scale = (g_last - g).exp().unsqueeze(-1)
 
     last_recurrent_state = (
         torch.zeros(
-            batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=wd
+            batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=rd
         )
         if initial_state is None
-        else initial_state.to(wd)
+        else initial_state.to(rd)
     )
     core_attn_out = torch.zeros_like(value)
     _probe("gdn_out", core_attn_out)
@@ -160,11 +170,15 @@ def fast_chunk_gated_delta_rule(
 
     if not output_final_state:
         last_recurrent_state = None
+    elif last_recurrent_state is not None:
+        last_recurrent_state = last_recurrent_state.to(wd)
     core_attn_out = core_attn_out.reshape(
         core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
     )
     core_attn_out = core_attn_out[:, :, :sequence_length]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous()
+    # boundary cast: fp32 stays inside the rule, the tower only ever sees
+    # its own dtype back
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(wd)
     _probe("gdn_out", core_attn_out)
     return core_attn_out, last_recurrent_state
 

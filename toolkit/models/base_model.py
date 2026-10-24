@@ -206,6 +206,13 @@ class BaseModel:
         self.use_raw_control_images = False
         # defines if the model supports model paths. Only some will
         self.supports_model_paths = False
+        # phase-2 batched caption caching (toolkit/text_cache_batching):
+        # models opt in True once their token counting + bytes/token are
+        # declared; the shared cache pass stays per-caption otherwise
+        self.supports_batched_text_cache = False
+        # packed (padding-free) encode available: captions pack by real
+        # tokens; models set True only when their TE enforces boundaries
+        self.supports_packed_text_cache = False
         
         # use new lokr format (default false for old models for backwards compatibility)
         self.use_old_lokr_format = True
