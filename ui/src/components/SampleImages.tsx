@@ -268,6 +268,44 @@ export default function SampleImages({ job }: SampleImagesProps) {
     return null;
   }, [job]);
 
+  // comfy jobs render from the sampler's journal — the exact text shipped to
+  // the remote box (inline [trigger:X class:Y] tokens already resolved). The
+  // raw config stays the editor's truth; the viewer shows what was sent.
+  // No journal before the first round, so we fall back to the config text.
+  const comfyEnabled = !!sampleConfig?.comfy;
+  const [comfyPrompts, setComfyPrompts] = useState<string[] | null>(null);
+  useEffect(() => {
+    if (!job?.id || !comfyEnabled) {
+      setComfyPrompts(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiClient.get(`/api/jobs/${job.id}/comfy_prompts`);
+        if (!cancelled) setComfyPrompts(res.data?.prompts ?? null);
+      } catch {
+        // journal missing/unreadable: keep showing the config text
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // sampleImages.length changes as rounds collect, which is when a journal
+    // first appears or gains new resolved prompts
+  }, [job?.id, comfyEnabled, sampleImages.length]);
+
+  const displayedSampleConfig = useMemo(() => {
+    if (!sampleConfig) return null;
+    if (!comfyEnabled || !comfyPrompts) return sampleConfig;
+    return {
+      ...sampleConfig,
+      samples: sampleConfig.samples.map((s, i) =>
+        typeof comfyPrompts[i] === 'string' ? { ...s, prompt: comfyPrompts[i] as string } : s,
+      ),
+    };
+  }, [sampleConfig, comfyEnabled, comfyPrompts]);
+
   return (
     <div ref={scrollParentCallback} className="absolute top-[80px] left-0 right-0 bottom-0 overflow-y-auto">
       <div className="pb-4">
@@ -341,7 +379,7 @@ export default function SampleImages({ job }: SampleImagesProps) {
         numSamples={numSamples}
         sampleImages={sampleImages}
         onChange={setPath => setSelectedSamplePath(setPath)}
-        sampleConfig={sampleConfig}
+        sampleConfig={displayedSampleConfig}
         refreshSampleImages={refreshSampleImages}
       />
       <div
