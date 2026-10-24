@@ -199,20 +199,37 @@ class OstrisModelMixin:
         return cls._local_first(cls.load_config, path, subfolder=subfolder)
 
     @staticmethod
-    def _local_first(loader, *args, **kwargs):
+    def _local_first(loader, *args, validate=None, **kwargs):
         """Serve fully-cached repos without touching the hub. Online
         from_pretrained does an etag HEAD round-trip per file (seconds of pure
         network latency on every warm load); a local_files_only attempt is
         instant when the cache can't satisfy it, so failing over to the
-        online path costs nothing."""
+        online path costs nothing. ``validate`` rejects a cache-only result
+        that loaded without raising but came back incomplete (falls over to
+        the online fetch); callers with a cheap completeness check pass it."""
         import os as _os
 
         if _os.environ.get("HF_HUB_OFFLINE") == "1":
             return loader(*args, **kwargs)
         try:
-            return loader(*args, local_files_only=True, **kwargs)
+            result = loader(*args, local_files_only=True, **kwargs)
         except Exception:
             return loader(*args, **kwargs)
+        if validate is not None and not validate(result):
+            try:
+                return loader(*args, **kwargs)
+            except Exception:
+                return result  # no hub: keep what the cache had
+        return result
+
+    @staticmethod
+    def _tokenizer_complete(result) -> bool:
+        # transformers 5.5.3 local_files_only on a partially cached repo (e.g.
+        # config.json only) returns a 1-token tokenizer instead of raising
+        tokenizer = getattr(result, "tokenizer", result)
+        if not hasattr(tokenizer, "__len__"):
+            return True
+        return len(tokenizer) >= 1000
 
     @classmethod
     def aitk_from_config(cls, config):
@@ -898,12 +915,17 @@ class OstrisModelMixin:
         cls,
         name_or_path: Optional[str] = None,
         subfolder: Optional[str] = None,
+        tokenizer_cls=None,
+        require_complete: bool = False,
         **kwargs,
     ):
         """Load the tokenizer from ``name_or_path`` (a checkpoint dir or repo
         holding it at aitk_tokenizer_subfolder), falling back to the class's
         aitk_tokenizer_repo. subfolder overrides the class default; "" loads
-        from the checkpoint root."""
+        from the checkpoint root. tokenizer_cls pins the declared class (the
+        AutoTokenizer path may need a config.json the folder lacks, which
+        fails offline). require_complete retries the hub when a cache-only
+        load came back a stub (see ``_tokenizer_complete``)."""
         from transformers import AutoTokenizer
 
         source = name_or_path if name_or_path is not None else cls.aitk_tokenizer_repo
@@ -916,7 +938,11 @@ class OstrisModelMixin:
         ):
             subfolder = None
         return cls._local_first(
-            AutoTokenizer.from_pretrained, source, subfolder=subfolder or "", **kwargs
+            (tokenizer_cls or AutoTokenizer).from_pretrained,
+            source,
+            subfolder=subfolder or "",
+            validate=cls._tokenizer_complete if require_complete else None,
+            **kwargs,
         )
 
     @classmethod
