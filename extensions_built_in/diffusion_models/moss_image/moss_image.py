@@ -60,6 +60,7 @@ from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
+from toolkit.network_mixins import set_multiplier_rows
 from toolkit.models.phased_load import PhasedLoadMixin
 from toolkit.models.v2.resolver import resolve_comfy_file
 from toolkit.models.v2.vae.flux2_kl import AutoEncoder, convert_diffusers_state_dict
@@ -81,6 +82,7 @@ from .src.text_encoder import (
     encode_text_batch_packed,
 )
 from .src.transformer import COMFY_REPO, VENDOR_BASE_REPO, MossImageTransformer
+from .src.flash_varlen import varlen_ok
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -362,6 +364,10 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
                 "remove ctrl_img from the sample prompt."
             )
 
+        # sampling never packs (the pipeline is dense bs1/bs2-cond): start
+        # the step with no packed map, so a stale training map can never
+        # hijack the LoRA multiplier during generation
+        set_multiplier_rows(())
         result = pipeline(
             conditional_embeds=conditional_embeds,
             unconditional_embeds=unconditional_embeds,
@@ -397,13 +403,20 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
         if len(embeds_list) == 1 and batch_size > 1:
             embeds_list = embeds_list * batch_size
 
+        # Every forward decides its own LoRA multiplier rows: clear first,
+        # publish below iff this is a packed (ragged) call. The publish
+        # OUTLIVES the call on purpose -- gradient checkpointing replays
+        # block forwards during loss.backward(), which happens outside this
+        # function (toolkit/guidance.py) -- the next entry clears or
+        # overwrites, so no reader ever sees another stream's map.
+        set_multiplier_rows(())
+
         with torch.no_grad():
             # toolkit timestep (0..1000, 1000 = pure noise) -> the DiT's own t,
             # same convention, straight through (no /1000, no flip).
             t = timestep.to(device, dtype=torch.float32).reshape(-1)
             if t.shape[0] != batch_size:
                 t = t.expand(batch_size)
-            embeds, mask = stack_text_embeds(embeds_list, device, dtype)
 
             # Training is t2i-only. Edit conditioning needs a VAE encode per
             # batch (references as clean latents) and the vision tower in the
@@ -418,6 +431,31 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
                     "in this build. Remove the control datasets."
                 )
 
+        if batch_size > 1 and varlen_ok():
+            # the standard for padded training batches (owner, 2026-10-24):
+            # packed flash-varlen, never pad. The ragged per-item states ride
+            # straight into the DiT (transformer._forward_packed): live rows
+            # only, no mask. bs1 never pads -> untouched dense dispatch;
+            # MOSS_VARLEN_ATTN=0 keeps the stacked-mask path for parity A/B.
+            # The per-sample LoRA multiplier is (B,)-indexed and the packed
+            # streams are ragged (interleave-by-B assumes uniform rows):
+            # publish the row->sample maps for both streams; LoRA modules
+            # expand per row, picking the map matching their own input rows
+            # (network_mixins.set_multiplier_rows -- a registry, because the
+            # modules' network weakrefs may not match sd.network's instance).
+            num_image = int(latent_model_input.shape[-2]) * int(
+                latent_model_input.shape[-1]
+            )
+            counts = torch.tensor([len(e) for e in embeds_list], device=device)
+            bidx = torch.arange(batch_size, device=device)
+            set_multiplier_rows((
+                bidx.repeat_interleave(counts + num_image),  # main stream
+                bidx.repeat_interleave(counts),              # text stream
+            ))
+            return self.transformer(
+                latent_model_input.to(device, dtype), t, embeds_list
+            )
+        embeds, mask = stack_text_embeds(embeds_list, device, dtype)
         return self.transformer(
             latent_model_input.to(device, dtype), t, embeds, mask
         )
