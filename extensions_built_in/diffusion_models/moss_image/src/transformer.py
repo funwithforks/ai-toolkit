@@ -40,6 +40,7 @@ from torch.utils.checkpoint import checkpoint
 from toolkit.models.v2._mixin import OstrisModelMixin
 
 from .flash_varlen import flash_varlen_sdpa, varlen_ok
+from .situ_fusion import situ as _situ
 
 COMFY_REPO = "Comfy-Org/MOSS-Image"
 VENDOR_BASE_REPO = "OpenMOSS-Team/MOSS-Image-Base"

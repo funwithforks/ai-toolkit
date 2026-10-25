@@ -275,6 +275,34 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
         # scheduler + pipeline + aitk_post_load placement per model_config.
         return MossImagePipeline(self)
 
+    def load_transformer(self):
+        # phased-load contract: the quantize/attach (cr8_qdata) runs inside
+        # super(). Per-module quantization flags must be applied after it
+        # (krea2/H3/flux3 precedent for the int8 STE dx backward).
+        super().load_transformer()
+        # Campaign flag (H3 +9.1%, krea2/flux3 shipped) -- NOT inherited by
+        # MOSS: live bs8 A/B measured 7969 vs 7776 ms/step median, p25/p75
+        # disjoint = +2.0% REGRESSION (records 20261024-180250 vs
+        # 20261024-171605), memory flat. Structural reason: MOSS's only
+        # weight class passing the STE backward's 33.5M amortization gate is
+        # ffn_up_gate, which is fc1-class -- wide-grad orientation the
+        # campaign measured as losing at every m (see _cutlass_dx_bwd
+        # docstring); MOSS's fc2-class layer (ffn_down, 25M) is below the
+        # gate. Available per job via model_kwargs int8_bwd=true; do not
+        # re-litigate without new shape evidence.
+        if self.model_config.model_kwargs.get("int8_bwd", False):
+            n = 0
+            for m in self.model.modules():
+                if getattr(m, "cr8_qdata", None) is not None:
+                    m.cr8_bwd_mode = "int8"
+                    n += 1
+            if n:
+                self.print_and_status_update(
+                    f"  - int8 STE input-gradient backward enabled on {n} "
+                    f"quantized linears (upstream grads quantized to int8; "
+                    f"set model_kwargs int8_bwd=false for the eager backward)"
+                )
+
     # ------------------------------------------------------------------
     # Embed cache format guard (the caption cache stores encoder output)
     # ------------------------------------------------------------------
