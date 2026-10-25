@@ -1146,8 +1146,10 @@ def _int8_epilogue_op(
             f"int8 epilogue stacked lora rank must be a power of two <= 64, "
             f"got {rank2}"
         )
-    if has_lora and epi_dot and kl >= 16:
-        # tl.dot needs K >= 16; smaller ranks keep the elementwise kernel
+    if has_lora and epi_dot and kl >= 32:
+        # tl.dot needs K >= 32 on sm_120 (measured: triton AssertionError
+        # "K >= 32" when compiling with KL=16, despite the older note here
+        # claiming 16); smaller padded ranks keep the elementwise kernel.
         block_r, block_n = 32, 128
         grid = (-(-m // block_r), -(-n // block_n))
         kernel_dot[grid](
@@ -1173,10 +1175,11 @@ def _int8_epilogue_op(
             num_warps=8,
         )
         return out
-    if has_lora and epi_dot and kl < 16:
+    if has_lora and epi_dot and kl < 32:
         print_acc(
-            f"ConvRot: cr8_epi_dot requested at rank {rank} (<16); tl.dot "
-            "cannot run, using the elementwise epilogue for this layer."
+            f"ConvRot: cr8_epi_dot requested at rank {rank} (padded {kl}, "
+            "<32); tl.dot cannot run, using the elementwise epilogue for "
+            "this layer."
         )
     block_n = 512 if (has_lora or has_lora2) else 1024
     grid = (m, -(-n // block_n))
