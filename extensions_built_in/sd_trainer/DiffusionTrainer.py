@@ -190,6 +190,10 @@ class DiffusionTrainer(SDTrainer):
     def maybe_save(self):
         if not self.is_ui_trainer:
             return
+        if self.save_config.disable_saving:
+            # save.disable_saving means zero checkpoints, so a manual
+            # "save now" request from the UI must not write one either
+            return
         if self.should_save():
             self.update_db_key("save_now", 0)
             if self.progress_bar is not None:
