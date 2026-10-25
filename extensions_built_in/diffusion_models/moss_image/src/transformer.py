@@ -12,11 +12,10 @@ unmasked path when lengths match. Activations follow the weight dtype exactly
 like the vendor's bf16 inference: fp32 timestep sinusoid and RoPE phases,
 everything else in the compute dtype.
 
-Attention: padded t2i training batches run PACKED (owner rule, 2026-10-24:
-varlen, never pad): the ragged per-item prompt states ride straight into
+Attention: padded t2i training batches run PACKED — varlen, never pad:
+the ragged per-item prompt states ride straight into
 ``_forward_packed`` — live rows only, no rectangle, no masks, flash-varlen
-kernels (``docs/kernel_opt/MOSS_PACKED_AUDIT.md`` + ``FLASH_VARLEN_METHOD.md``
-are the audit and method). The dense path below is the implementation for
+kernels. The dense path below is the implementation for
 the modes packing does not target (unpadded/dense forward, sampling, the
 unwired edit/ref modes), not a fallback: with varlen on, every padded
 training step takes the packed branch.

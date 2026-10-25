@@ -276,32 +276,35 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
         return MossImagePipeline(self)
 
     def load_transformer(self):
-        # phased-load contract: the quantize/attach (cr8_qdata) runs inside
-        # super(). Per-module quantization flags must be applied after it
-        # (krea2/H3/flux3 precedent for the int8 STE dx backward).
+        # phased-load contract: quantize/attach (cr8_qdata) runs inside
+        # super(); per-module quantization flags must be applied after it.
         super().load_transformer()
-        # int8 STE dx, MOSS-shaped: tag ONLY the fc2-class layers (in>out,
-        # narrow upstream grad) with "int8_force" -- past the 33.5M
-        # amortization gate, which was calibrated at the reference model's
-        # m~1408 rows; MOSS trains at m~34k where the campaign measured
-        # fc2-class int8 dx gaining ~2 ms/layer. The plain "int8" run (all
-        # gate-eligible layers, i.e. MOSS's fc1-class ffn_up_gate) measured
-        # +2.0% live and stays off: wide-grad orientation loses per the
-        # campaign's own numbers. Default off until THIS tag wins live.
-        if self.model_config.model_kwargs.get("int8_bwd", False):
+        # model_kwargs int8_bwd (default off): route one weight-shape class
+        # of quantized linears ("fc2" = in>out, "fc1" = in<out; true picks
+        # fc2) onto the int8 STE input-gradient backward, fused CUTLASS NT
+        # arm, forcing past the shared op's size gate (sized for small-m
+        # models; MOSS batches are large enough to amortize). Cost and
+        # quality are per-model decisions: enable only after a live
+        # measurement on this model.
+        _bwd = self.model_config.model_kwargs.get("int8_bwd", False)
+        if _bwd is True:
+            _bwd = "fc2"
+        if _bwd in ("fc1", "fc2"):
             n = 0
             for m in self.model.modules():
                 if getattr(m, "cr8_qdata", None) is None:
                     continue
-                if m.in_features > m.out_features:
+                if (m.in_features > m.out_features) == (_bwd == "fc2"):
                     m.cr8_bwd_mode = "int8_force"
+                    # fused NT arm; the value only needs != "off" -- layer
+                    # selection is done right here
+                    m.cr8_cutlass_bwd = _bwd
                     n += 1
             if n:
                 self.print_and_status_update(
-                    f"  - int8 STE input-gradient backward (fc2-class, gate-"
-                    f"forced at m~34k) on {n} quantized linears "
-                    f"(upstream grads quantized to int8; model_kwargs "
-                    f"int8_bwd=false restores the eager backward)"
+                    f"  - int8 STE dx ({_bwd}-class, gate-forced, FUSED "
+                    f"CUTLASS NT arm) on {n} quantized linears "
+                    f"(model_kwargs int8_bwd=false restores the eager backward)"
                 )
 
     # ------------------------------------------------------------------
@@ -461,11 +464,12 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
                 )
 
         if batch_size > 1 and varlen_ok():
-            # the standard for padded training batches (owner, 2026-10-24):
-            # packed flash-varlen, never pad. The ragged per-item states ride
-            # straight into the DiT (transformer._forward_packed): live rows
-            # only, no mask. bs1 never pads -> untouched dense dispatch;
-            # MOSS_VARLEN_ATTN=0 keeps the stacked-mask path for parity A/B.
+            # packed flash-varlen is the standard for padded training
+            # batches: never pad. The ragged per-item states ride
+            # straight into the DiT (transformer._forward_packed): live
+            # rows only, no mask. bs1 never pads -> untouched dense
+            # dispatch; MOSS_VARLEN_ATTN=0 keeps the stacked-mask path for
+            # parity A/B.
             # The per-sample LoRA multiplier is (B,)-indexed and the packed
             # streams are ragged (interleave-by-B assumes uniform rows):
             # publish the row->sample maps for both streams; LoRA modules

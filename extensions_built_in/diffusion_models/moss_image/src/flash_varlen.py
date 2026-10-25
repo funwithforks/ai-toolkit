@@ -1,8 +1,5 @@
 """Autograd wrapper around torch's flash-attention varlen kernels (MOSS).
 
-Mirror of ``minimax_h3/src/flash_varlen.py`` (campaign playbook:
-docs/kernel_opt/FLASH_VARLEN_METHOD.md, audit: MOSS_PACKED_AUDIT.md).
-
 The varlen ops (aten::_flash_attention_forward/_backward with cum_seq_*)
 compute exact self-attention over a packed stream where each sample
 attends to all of its own live rows -- identical semantics to MOSS's
