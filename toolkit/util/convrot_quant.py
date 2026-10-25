@@ -1623,17 +1623,24 @@ _int8_bwd_ones: dict = {}
 
 def _int8_linear_ste_backward(ctx, grad):
     qdata, w_scales_u8, lora_r, lora_u, lora2_r, lora2_u = ctx.saved_tensors
-    if getattr(ctx, "bwd_mode", "eager") == "int8":
+    mode = getattr(ctx, "bwd_mode", "eager")
+    if mode in ("int8", "int8_force"):
         # Opt-in (module.cr8_bwd_mode): run the input-gradient GEMM on the int8
         # tensor cores too. dx = (grad * w_scales) @ qdata with grad quantized
         # per-row by the same recipe as forward activations. NOT bit-identical
         # to the eager backward: the upstream gradient is quantized to int8
         # (~0.4% per-element, zero-mean), so measured loss/quality impact must
         # be accepted per model before turning this on.
+        # "int8_force": ride the path regardless of the 33.5M amortization
+        # gate -- that gate was calibrated at the reference model's m~1408
+        # rows; a model running m~10x larger amortizes the quant/epilogue
+        # overhead over far more GEMM work, and tags the gate-defeating mode
+        # itself (models own that call; nothing changes for modules using
+        # "int8").
         big = qdata.shape[0] * qdata.shape[1] >= 33_554_432
         # below that the int8 quant/epilogue overhead is not amortized
         # (measured on sm_120: 6144x1536 is already net slower) -> stay eager
-        if big and (
+        if (big or mode == "int8_force") and (
             grad.is_cuda
             and grad.dtype in (torch.bfloat16, torch.float16)
             and grad.ndim == 2
@@ -1694,7 +1701,7 @@ def _int8_linear_ste_backward(ctx, grad):
                 d_u2,
             )
         global _int8_bwd_warned
-        if not big:
+        if not big and mode != "int8_force":
             # The gate is an amortization rule, but the module still asked for
             # the int8 backward. A silent degrade to eager here hides itself in
             # benchmarks (the layer quietly runs a different path than the one
@@ -1717,7 +1724,7 @@ def _int8_linear_ste_backward(ctx, grad):
         elif not _int8_bwd_warned:
             _int8_bwd_warned = True
             print_acc(
-                f"ConvRot: cr8_bwd_mode='int8' requested but grad layout is not "
+                f"ConvRot: cr8_bwd_mode='{mode}' requested but grad layout is not "
                 f"supported (dtype={grad.dtype}, shape={tuple(grad.shape)}); "
                 f"falling back to the eager backward for every such layer."
             )
