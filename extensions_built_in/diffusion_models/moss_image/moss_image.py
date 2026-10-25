@@ -307,6 +307,44 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
                     f"(model_kwargs int8_bwd=false restores the eager backward)"
                 )
 
+        # int8 FORWARD arms (independent of the dx switch above). Both are
+        # shipped in the shared convrot op, class-default off; each is a
+        # per-model decision. Only reach modules with a lora folded into the
+        # dequant epilogue (has_lora), which is MOSS's shipped path.
+        #   epi_dot      -- tensor-core (tl.dot) lora-fold epilogue instead
+        #                   of the fp32 broadcast-and-sum (same values, <=1
+        #                   bf16 ulp in the lora term).
+        #   cutlass_gemm -- fused CUTLASS GEMM+dequant forward engine; note
+        #                   it moves the lora fold OUT of the epilogue to a
+        #                   rank addmm, so it is tested separately.
+        if self.model_config.model_kwargs.get("int8_epi_dot", False):
+            n = 0
+            for m in self.model.modules():
+                if getattr(m, "cr8_qdata", None) is not None:
+                    m.cr8_epi_dot = True
+                    n += 1
+            if n:
+                self.print_and_status_update(
+                    f"  - int8 lora-fold epilogue via the tl.dot kernel on "
+                    f"{n} quantized linears (model_kwargs int8_epi_dot=false "
+                    f"for the elementwise kernel)"
+                )
+        if self.model_config.model_kwargs.get("int8_cutlass_gemm", False):
+            from toolkit.util.convrot_quant import _get_cutlass_int8
+
+            if _get_cutlass_int8() is not None:
+                n = 0
+                for m in self.model.modules():
+                    if getattr(m, "cr8_qdata", None) is not None:
+                        m.cr8_cutlass_gemm = True
+                        n += 1
+                if n:
+                    self.print_and_status_update(
+                        f"  - int8 forward GEMM via fused CUTLASS on {n} "
+                        f"quantized linears (model_kwargs "
+                        f"int8_cutlass_gemm=false for torch._int_mm)"
+                    )
+
     # ------------------------------------------------------------------
     # Embed cache format guard (the caption cache stores encoder output)
     # ------------------------------------------------------------------
