@@ -79,9 +79,10 @@ def _params():
         ),
         "steps": Param("int", default=60, min=10, max=5000),
         "batch_size": Param(
-            "int", default=1, min=1, max=16,
-            desc="train batch; bs8 at 1024 res already sits near the 32 GB "
-                 "ceiling (owner's live run), higher values are fit probes",
+            "int", default=1, min=1, max=32,
+            desc="train batch at 1024 res; fit is machine-dependent "
+                 "(measured marginal ~3.3-3.7 GiB/sample over resident), "
+                 "high values are deliberate fit probes",
         ),
         "warmup": Param(
             "int", default=20, min=0, max=2000,
