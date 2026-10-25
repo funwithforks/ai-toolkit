@@ -132,6 +132,45 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             self.timesteps = timesteps.to(device=device)
 
             return timesteps
+        elif timestep_type == 'logit_normal':
+            # MOSS-style pretraining final-stage distribution: sigma (the noise
+            # weight) has logit(sigma) ~ N(mean, std), truncated at sigma <=
+            # cutoff by inverse-CDF sampling and rescaled onto (0, 1], rounded
+            # up onto the 1/1000 training grid, and mixed with a small uniform
+            # share. sigma is the noise weight directly (timestep = 1000 *
+            # sigma), so unlike the 'sigmoid' branch there is no reversal.
+            mean = 1.09
+            std = 0.95
+            cutoff = 0.95
+            uniform_mix = 0.01
+
+            n_ln = int(num_timesteps * (1.0 - uniform_mix))
+            n_uni = num_timesteps - n_ln
+
+            # Truncated ICDF draw: p ~ U(0, Phi((logit(cutoff) - mean) / std)),
+            # sigma = sigmoid(mean + std * Phi^-1(p)) / cutoff, so sigma spans
+            # (0, 1] with no point mass at the cutoff.
+            top = torch.special.ndtr(
+                (torch.logit(torch.tensor(cutoff)) - mean) / std
+            ).to(device)
+            p = torch.rand(n_ln, device=device) * top
+            sigma = torch.sigmoid(mean + std * torch.special.ndtri(p)) / cutoff
+
+            # grid: sigma = ceil(sigma * 1000) / 1000, clamped to [1/1000, 1];
+            # the timestep is 1000 * sigma, i.e. exactly the grid integer.
+            t_ln = torch.ceil(sigma * 1000).clamp_(1, 1000)
+
+            # uniform share, stratified over the grid (a linspace of U(0,1))
+            if n_uni > 0:
+                t_uni = torch.linspace(1000, 1, n_uni, device=device)
+                timesteps = torch.cat([t_ln, t_uni])
+            else:
+                timesteps = t_ln
+
+            timesteps, _ = torch.sort(timesteps, descending=True)
+            timesteps = timesteps.to(torch.int)
+            self.timesteps = timesteps.to(device=device)
+            return timesteps
         elif timestep_type in ['flux_shift', 'lumina2_shift', 'shift']:
             # matches inference dynamic shifting
             timesteps = np.linspace(
