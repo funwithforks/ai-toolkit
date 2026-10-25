@@ -1,0 +1,91 @@
+# MOSS-Image FULL FINE-TUNE smoke config.
+# No `network:` block => is_fine_tuning path (trains base weights directly).
+# BEFORE RUNNING:
+#   - set dataset.folder_path and sample prompts to your own
+#   - model.model_kwargs.transformer_path must point at the PLAIN bf16 single-file
+#     DiT (the resolver's registered identity is the int8 ConvRot repack, which is
+#     untrainable as a master copy; bf16 twin is reachable only via this override —
+#     moss_image.py:29, src/transformer.py:44-48)
+#   - batch_size 1 + gradient_accumulation 1: optimizer runs fused (stepping inside
+#     backward, grads never materialize ~10 GB set); accum > 1 requires fused: false
+job: extension
+config:
+  name: moss_fft_smoke
+  process:
+  - type: diffusion_trainer
+    training_folder: /home/computer/ai-toolkit/output
+    device: cuda
+    performance_log_every: 10
+    # NO network: block — full fine-tune
+    save:
+      disable_saving: true   # hard-off: no step saves, no end-of-train save, no optimizer.pt
+      dtype: bf16
+      save_every: 100        # NOTE (when saving is on): each save is the full ~10 GB model + multi-GB optimizer.pt
+      max_step_saves_to_keep: 2
+      save_format: diffusers
+      push_to_hub: false
+    datasets:
+    - folder_path: /home/computer/ai-toolkit/datasets/example_dataset
+      caption_ext: txt
+      caption_dropout_rate: 0.05
+      cache_latents_to_disk: true      # VAE loads, caches, frees — never resident in the loop
+      cache_text_embeddings: true      # same for the text encoder
+      default_caption: ''
+      is_reg: false
+      network_weight: 1
+      resolution:
+      - 1024
+      controls: []
+      num_repeats: 1
+    train:
+      batch_size: 1
+      steps: 100
+      gradient_accumulation: 1
+      train_unet: true
+      train_text_encoder: false
+      gradient_checkpointing: true
+      noise_scheduler: flowmatch
+      optimizer: automagic3
+      optimizer_params:
+        fused: true
+        min_lr: 1e-5          # pinned == lr: freezes the adaptive vote, same as the reference ships
+        max_lr: 1e-5
+        weight_decay: 0.0
+      timestep_type: sigmoid  # reference uses logit-normal(1.09,0.95)+cutoff; tune in a later session
+      cache_text_embeddings: true
+      lr: 1e-5
+      dtype: bf16
+      loss_type: mse
+      max_grad_norm: 1000.0   # reference has no global clip; trust region lives in automagic itself
+      diff_output_preservation: false
+      disable_sampling: true  # smoke: prove the loop first, sampling path second pass
+      ema_config:
+        use_ema: false        # until the CPU-offload EMA port; GPU shadow would cost ~9.5 GB
+    logging:
+      log_every: 1
+    model:
+      arch: moss_image
+      name_or_path: OpenMOSS-Team/MOSS-Image-Base
+      quantize: false
+      quantize_te: false
+      low_vram: false
+      only_if_contains:
+      - layers.
+      ignore_if_contains:
+      - norm
+    model_kwargs:
+        transformer_path: /path/to/moss_image_base_bf16.safetensors   # EDIT ME — plain bf16 only
+    sample:
+      sampler: flowmatch
+      sample_every: 50
+      width: 1024
+      height: 1024
+      samples:
+      - prompt: 'a red cube on a white table, studio lighting'
+      neg: ''
+      seed: 42
+      guidance_scale: 3
+      sample_steps: 30
+meta:
+  name: moss_fft_smoke
+  version: '1.0'
