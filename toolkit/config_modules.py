@@ -23,6 +23,10 @@ else:
 class SaveConfig:
     def __init__(self, **kwargs):
         self.save_every: int = kwargs.get('save_every', 1000)
+        # when true, no checkpoint is written at all: neither the periodic
+        # saves nor the save at the end of the train loop. save() is never
+        # called, so nothing is written and nothing needs cleaning up.
+        self.disable_saving: bool = kwargs.get('disable_saving', False)
         self.dtype: str = kwargs.get('dtype', 'float16')
         self.max_step_saves_to_keep: int = kwargs.get('max_step_saves_to_keep', 5)
         self.save_format: SaveFormat = kwargs.get('save_format', 'safetensors')

@@ -118,6 +118,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.model_config = ModelConfig(**model_config)
 
         self.save_config = SaveConfig(**self.get_conf('save', {}))
+        if self.save_config.disable_saving:
+            print_acc(
+                "Checkpoint saving is DISABLED (save.disable_saving: true). "
+                "No checkpoints or optimizer state will be written and this job cannot be resumed."
+            )
         self.sample_config = SampleConfig(**self.get_conf('sample', {}))
         first_sample_config = self.get_conf('first_sample', None)
         if first_sample_config is not None:
@@ -2778,6 +2783,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # todo improve this logic to send one of each through if we can buckets and batch size might be an issue
                 is_reg_step = False
                 is_save_step = self.save_config.save_every and self.step_num % self.save_config.save_every == 0
+                if self.save_config.disable_saving:
+                    is_save_step = False
                 is_sample_step = (
                     self.sample_config.sample_every
                     and self.step_num >= self.sample_config.sample_start_step
@@ -3051,7 +3058,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.progress_bar.close()
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and not self.save_config.disable_saving:
             self.save(self.step_num)
         if not self.train_config.disable_sampling:
             self.sample(self.step_num)
