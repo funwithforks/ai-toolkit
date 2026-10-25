@@ -4,9 +4,7 @@ situ(h, g) = (4 tanh(g/4) sigmoid(g)) * (25 tanh(h/25))
 
 Eager runs this as an eight-kernel elementwise chain over the
 (N, ffn=8192) bf16 streams, twice per block per pass (main + text), and
-backward replays a backward kernel per chain op -- the census
-(20261024, bs8) put the tanh/sigmoid kernels alone at ~0.55 s/step,
-~7% of the step, plus their share of the mul chain. Fused: one kernel
+backward replays a backward kernel per chain op. Fused: one kernel
 each direction; backward saves only (hidden, gate) -- the two chunk
 views it already had -- instead of four intermediates per call.
 
@@ -15,12 +13,12 @@ row stride 2*ffn, column stride 1; the kernel reads the row strides
 directly, no contiguous copy.
 
 Fused-or-raise: enabled means the kernel runs or the call raises; no
-silent downgrade. DEFAULT OFF (MOSS_SITU_FUSE=1) until the live bs8 A/B
-accepts it -- per-candidate rule: the live clock is the only gate.
+silent downgrade. DEFAULT OFF (MOSS_SITU_FUSE=1) -- the full-step win
+must be re-confirmed by a live clock measurement before rollout.
 
 Numerics: eager rounds every chain intermediate to bf16; the kernel
 computes in fp32 and rounds once (and backward once). One rounding
-class, not a new gradient path -- same ruling as the H3 SwiGLU probe.
+class, not a new gradient path.
 """
 
 import os
