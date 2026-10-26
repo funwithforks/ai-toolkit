@@ -22,7 +22,20 @@ min_lr == max_lr == lr (controller clamped off), this optimizer is bitwise
 identical from a fresh start -- see docs/fullfinetune/moss/test_vote_identity.py.
 """
 
+import os
+
 import torch
+
+# opt-in fused Triton update path (automagic3fft_kernels). Default off:
+# every other model keeps the eager byte-for-byte. MOSS_OPT_FUSED=1 turns
+# it on for Automagic3FFT after its identity test has passed.
+_FUSED = os.environ.get("MOSS_OPT_FUSED") == "1"
+_fused_import_error = None
+try:
+    from .automagic3fft_kernels import fused_update_param as _fused_update
+except Exception as _e:
+    _fused_update = None
+    _fused_import_error = _e
 
 
 class Automagic3FFT(torch.optim.Optimizer):
@@ -43,6 +56,16 @@ class Automagic3FFT(torch.optim.Optimizer):
             weight_decay=weight_decay,
         )
         super().__init__(params, defaults)
+
+        if _FUSED:
+            if _fused_update is None:
+                raise RuntimeError(
+                    "MOSS_OPT_FUSED=1 but the fused Triton path is "
+                    f"unavailable on this box: {_fused_import_error!r}. "
+                    "Fix the environment or unset the flag -- this "
+                    "optimizer never silently falls back to eager.")
+            print("Automagic3FFT: fused Triton stepping ENABLED "
+                  "(params outside the kernel set abort the run loudly)")
 
         self._hook_handles = []
         for group in self.param_groups:
@@ -102,7 +125,11 @@ class Automagic3FFT(torch.optim.Optimizer):
 
     def _make_backward_hook(self, group):
         def _hook(p: torch.Tensor):
-            self._update_param(p, group)
+            if _FUSED:
+                # No eager fallback by design: unsupported params raise.
+                _fused_update(p, group, self.state[p])
+            else:
+                self._update_param(p, group)
 
         return _hook
 
