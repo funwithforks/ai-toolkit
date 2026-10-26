@@ -48,13 +48,27 @@ class ExponentialMovingAverage:
             # pulls the parameter toward the shadow each update
             use_feedback: bool = False,
             feedback_rate: float = 0.001,
-            param_multiplier: float = 1.0
+            param_multiplier: float = 1.0,
+            # apply the EMA once every `interval` update() calls (optimizer
+            # steps). decay keeps its meaning as the per-STEP factor: an
+            # applied update absorbs 1-(1-decay)**interval, so the averaging
+            # horizon is unchanged by the interval. interval=1 (default) is
+            # the historical every-step path, byte-for-byte. Note the legacy
+            # use_num_updates ramp counts applied updates, so it stretches
+            # with interval if that (unused by the toolkit) path is enabled;
+            # use_feedback/param_multiplier stay per-applied-update.
+            interval: int = 1,
     ):
         if parameters is None:
             raise ValueError("parameters must be provided")
         if decay < 0.0 or decay > 1.0:
             raise ValueError('Decay must be between 0 and 1')
+        interval = int(interval)
+        if interval < 1:
+            raise ValueError('interval must be a positive integer')
         self.decay = decay
+        self.interval = interval
+        self.step_counter = 0
         self.num_updates = 0 if use_num_updates else None
         self.use_feedback = use_feedback
         self.feedback_rate = feedback_rate
@@ -116,6 +130,10 @@ class ExponentialMovingAverage:
                 initialized will be used.
         """
         parameters = self._get_parameters(parameters)
+        # every call is an optimizer step; apply only on the interval phase
+        self.step_counter += 1
+        if self.interval > 1 and self.step_counter % self.interval != 0:
+            return
         decay = self.decay
         if self.num_updates is not None:
             self.num_updates += 1
@@ -124,6 +142,10 @@ class ExponentialMovingAverage:
                 (1 + self.num_updates) / (10 + self.num_updates)
             )
         one_minus_decay = 1.0 - decay
+        if self.interval > 1:
+            # horizon-preserving absorb for an update applied once per
+            # `interval` steps: k steps of (1 - x) == one step of (1 - x)^k
+            one_minus_decay = 1.0 - (1.0 - one_minus_decay) ** self.interval
         with torch.no_grad():
             for s_param, param in zip(self.shadow_params, parameters):
                 s_param_float = s_param.float()
@@ -274,7 +296,8 @@ class ExponentialMovingAverage:
             "decay": self.decay,
             "num_updates": self.num_updates,
             "shadow_params": self.shadow_params,
-            "collected_params": self.collected_params
+            "collected_params": self.collected_params,
+            "step_counter": self.step_counter,
         }
 
     def load_state_dict(self, state_dict: dict) -> None:
@@ -292,6 +315,9 @@ class ExponentialMovingAverage:
         self.num_updates = state_dict["num_updates"]
         assert self.num_updates is None or isinstance(self.num_updates, int), \
             "Invalid num_updates"
+        # older checkpoints have no phase record; restarting the interval
+        # phase is harmless for a scale-free exponential EMA
+        self.step_counter = int(state_dict.get("step_counter", 0))
 
         self.shadow_params = state_dict["shadow_params"]
         assert isinstance(self.shadow_params, list), \

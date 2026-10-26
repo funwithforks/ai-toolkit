@@ -861,6 +861,9 @@ class EMAConfig:
     def __init__(self, **kwargs):
         self.use_ema: bool = kwargs.get('use_ema', False)
         self.ema_decay: float = kwargs.get('ema_decay', 0.999)
+        # apply the EMA once every N optimizer steps; ema_decay keeps its
+        # per-step meaning (horizon unchanged), cost drops by ~N
+        self.ema_interval: int = max(1, int(kwargs.get('ema_interval', 1)))
         # feeds back the decay difference into the parameter
         self.use_feedback: bool = kwargs.get('use_feedback', False)
         # per-step fraction of (shadow - param) pulled back into the param; keep well below 1 - ema_decay
