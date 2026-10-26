@@ -144,6 +144,68 @@ def _k_apply_2d(g_ptr, p_ptr, r_ptr, c_ptr, m_ptr, R, C,
     tl.store(p_ptr + offs, newp.to(p_ptr.dtype.element_ty), mask=m)
 
 
+# ------------------------------------------------------------------ 1-D
+
+@triton.jit
+def _k_vec_row(rs_ptr, sq_ptr, rf_ptr, acc_ptr, R, beta2, eps, inv_C,
+               BS: tl.constexpr):
+    """row_f32 = b2*row + (1-b2)*(sq/C + eps); write fp32 shadow + bf16
+    state; accumulate sum(row_f32) for the global mean."""
+    pid = tl.program_id(0)
+    offs = pid * BS + tl.arange(0, BS)
+    m = offs < R
+    sq = tl.load(sq_ptr + offs, mask=m, other=0.0)
+    v = tl.load(rs_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    t = sq * inv_C
+    t = t + eps
+    out = v * beta2 + (1.0 - beta2) * t
+    tl.store(rf_ptr + offs, out, mask=m)
+    tl.store(rs_ptr + offs, out.to(rs_ptr.dtype.element_ty), mask=m)
+    tl.atomic_add(acc_ptr, tl.sum(out), mask=None, sem="relaxed")
+
+
+@triton.jit
+def _k_vec_col(cs_ptr, sq_ptr, cf_ptr, c_ptr, C, beta2, eps, inv_R,
+               BS: tl.constexpr):
+    """col state update + c = rsqrt(col_f32) in one pass (no global mean
+    on the col side -- the factors take rsqrt directly)."""
+    pid = tl.program_id(0)
+    offs = pid * BS + tl.arange(0, BS)
+    m = offs < C
+    sq = tl.load(sq_ptr + offs, mask=m, other=0.0)
+    v = tl.load(cs_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    t = sq * inv_R
+    t = t + eps
+    out = v * beta2 + (1.0 - beta2) * t
+    tl.store(cf_ptr + offs, out, mask=m)
+    tl.store(cs_ptr + offs, out.to(cs_ptr.dtype.element_ty), mask=m)
+    tl.store(c_ptr + offs, tl.rsqrt(out), mask=m)
+
+
+@triton.jit
+def _k_row_factor(rf_ptr, acc_ptr, r_ptr, R, BS: tl.constexpr):
+    """r = rsqrt(row_f32 / mean(row_f32)), mean from the acc accumulator."""
+    pid = tl.program_id(0)
+    offs = pid * BS + tl.arange(0, BS)
+    m = offs < R
+    mean = tl.load(acc_ptr) / R.to(tl.float32)
+    v = tl.load(rf_ptr + offs, mask=m, other=0.0)
+    tl.store(r_ptr + offs, tl.rsqrt(v / mean), mask=m)
+
+
+@triton.jit
+def _k_scale(sumsq_ptr, m_ptr, sqrtN, clip):
+    """m = max(sqrt(sumsq)/sqrtN/clip, 1) -- sqrt_rn is the IEEE
+    round-to-nearest flavor (tl.sqrt is the approximation that produced
+    the 1.2e-3 scale error; anything feeding the global scale must not
+    use it)."""
+    s = tl.load(sumsq_ptr)
+    rms = tl.math.sqrt_rn(s) / sqrtN
+    m = rms / clip
+    m = tl.maximum(m, 1.0)
+    tl.store(m_ptr, m)
+
+
 # --------------------------------------------------------------------- 1-D
 
 @triton.jit
@@ -222,13 +284,14 @@ def _next_seed():
 def _ws2(R, C, device):
     ws = _WS.get((R, C, device))
     if ws is None:
-        ws = [torch.zeros(R, dtype=torch.float32, device=device),
-              torch.zeros(C, dtype=torch.float32, device=device),
-              torch.zeros(1, dtype=torch.float32, device=device)]
+        z = lambda n: torch.zeros(n, dtype=torch.float32, device=device)
+        # order: sq_row, sq_col, sumsq, row_f32, col_f32, r, c, row_acc, m
+        ws = [z(R), z(C), z(1), z(R), z(C), z(R), z(C), z(1), z(1)]
         _WS[(R, C, device)] = ws
     ws[0].zero_()
     ws[1].zero_()
     ws[2].zero_()
+    ws[7].zero_()
     return ws
 
 
@@ -292,31 +355,30 @@ def fused_update_param(p, group, state, truncate_only=False):
                             "checkpoints are an eager-path feature)")
         C = p.shape[-1]
         R = p.numel() // C
-        sq_row, sq_col, sumsq = _ws2(R, C, p.device)
+        rs = state["exp_avg_sq_row"]
+        cs = state["exp_avg_sq_col"]
+        sq_row, sq_col, sumsq, row_f, col_f, rb, cb, racc, mb = _ws2(
+            R, C, p.device)
         BR, BC = 32, 128
         grid = (triton.cdiv(R, BR), triton.cdiv(C, BC))
         _k_rowcol_sumsq[grid](grad, sq_row, sq_col, R, C,
                               BR=BR, BC=BC, num_warps=4)
-        rs = state["exp_avg_sq_row"]
-        cs = state["exp_avg_sq_col"]
-        row_f = rs.float()
-        col_f = cs.float()
-        row_f.mul_(beta2).add_(sq_row.mul_(1.0 / C).add_(eps),
-                               alpha=1.0 - beta2)
-        col_f.mul_(beta2).add_(sq_col.mul_(1.0 / R).add_(eps),
-                               alpha=1.0 - beta2)
-        rs.copy_(row_f.to(rs.dtype))
-        cs.copy_(col_f.to(cs.dtype))
-        r = torch.rsqrt(row_f / row_f.mean())
-        c = torch.rsqrt(col_f)
-        _k_update_sumsq[grid](grad, r, c, sumsq, R, C,
+        # vector phase: state update + factors, all Triton on cached
+        # buffers -- no torch ops, no per-param allocations.
+        VB = 1024
+        vgrid = (triton.cdiv(max(R, C), VB),)
+        _k_vec_row[vgrid](rs, sq_row, row_f, racc, R, beta2, eps, 1.0 / C,
+                          BS=VB)
+        _k_vec_col[vgrid](cs, sq_col, col_f, cb, C, beta2, eps, 1.0 / R,
+                          BS=VB)
+        _k_row_factor[vgrid](row_f, racc, rb, R, BS=VB)
+        _k_update_sumsq[grid](grad, rb, cb, sumsq, R, C,
                               BR=BR, BC=BC, num_warps=4)
-        # Trust scale via torch's own IEEE ops on the 1-element buffer --
-        # same sqrt/div/clamp chain eager runs (tl.sqrt is the fast-approx
-        # flavor and caused 1e-3-level scale error). No host sync: kernel
-        # C loads the scalar from this pointer.
-        m = sumsq.sqrt().div_(math.sqrt(R * C)).div_(clip).clamp_(min=1.0)
-        _k_apply_2d[grid](grad, p, r, c, m, R, C,
+        # Trust scale: sqrt_rn (IEEE) in a 1-CTA kernel; identity-tested
+        # against the torch chain the eager path runs.
+        sqrtN = math.sqrt(R * C)
+        _k_scale[(1,)](sumsq, mb, sqrtN, clip)
+        _k_apply_2d[grid](grad, p, rb, cb, mb, R, C,
                           lr, clip, wd, drop, seed,
                           TRUNC=truncate_only, BR=BR, BC=BC, num_warps=4)
     else:
@@ -325,16 +387,18 @@ def fused_update_param(p, group, state, truncate_only=False):
             _unsupported(p, "state dtype != master dtype")
         N = p.numel()
         key = (N, p.device)
-        buf = _WS1.get(key)
-        if buf is None:
-            buf = torch.zeros(1, dtype=torch.float32, device=p.device)
-            _WS1[key] = buf
+        bufs = _WS1.get(key)
+        if bufs is None:
+            bufs = (torch.zeros(1, dtype=torch.float32, device=p.device),
+                    torch.zeros(1, dtype=torch.float32, device=p.device))
+            _WS1[key] = bufs
+        buf, mb = bufs
         buf.zero_()
         BS = 1024
         grid = (triton.cdiv(N, BS),)
         _k_update_sumsq_1d[grid](grad, v, buf, N, beta2, eps, BS=BS)
-        m = buf.sqrt().div_(math.sqrt(N)).div_(clip).clamp_(min=1.0)
-        _k_apply_1d[grid](grad, p, v, m, N, beta2, eps,
+        _k_scale[(1,)](buf, mb, math.sqrt(N), clip)
+        _k_apply_1d[grid](grad, p, v, mb, N, beta2, eps,
                           lr, clip, wd, drop, seed, TRUNC=truncate_only,
                           BS=BS)
 
