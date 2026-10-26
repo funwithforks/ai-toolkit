@@ -349,6 +349,13 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         self.final_linear_video = nn.Linear(dim, params.latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
         self.gradient_checkpointing = False
+        # last N image blocks run UNcheckpointed (pure memory/recompute
+        # policy -- math unchanged; 0 = checkpoint everything, the old
+        # behavior). Held activations belong to the blocks backward
+        # consumes first, so this memory drains back before the first
+        # checkpoint-recompute transient.
+        self.gc_keep_last = 0
+        self._keep_last_printed = False
         self._bands = {}
 
     @property
@@ -365,6 +372,23 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
+
+    def _gc_keep_plain(self, index: int) -> bool:
+        """True when image block `index` runs UNcheckpointed because it falls
+        in the trailing keep-last window. Pure memory/recompute policy - the
+        math is identical. ONE mechanism shared by both block loops, so
+        coverage never depends on which forward shape (packed vs padded) the
+        step took. gc_keep_last == 0 (default) short-circuits before any
+        state access: the old path, untouched."""
+        keep = self.gc_keep_last
+        if not keep or not self.gradient_checkpointing or not torch.is_grad_enabled():
+            return False
+        if not self._keep_last_printed:
+            print(f"[moss] gc_keep_last={keep}: last {keep} image block(s) "
+                  "run uncheckpointed (resident activations, freed first "
+                  "in backward)")
+            self._keep_last_printed = True
+        return index >= len(self.layers) - keep
 
     def _ckpt(self, module, *args, **kwargs):
         if self.gradient_checkpointing and torch.is_grad_enabled():
@@ -542,8 +566,11 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         x[ctx["img_sel"]] = video
         x[ctx["txt_sel"]] = text
         pack = (ctx["row_sample"], ctx["cu"], ctx["max_len"])
-        for layer in self.layers:
-            x = self._ckpt(layer, x, rope, mod, None, pack=pack)
+        for i, layer in enumerate(self.layers):
+            if self._gc_keep_plain(i):
+                x = layer(x, rope, mod, None, pack=pack)
+            else:
+                x = self._ckpt(layer, x, rope, mod, None, pack=pack)
 
         out = x[ctx["img_sel"]].view(batch, num_image, -1)
         out = self.final_norm_video(out)
@@ -677,6 +704,8 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
                 captured[index] = slot[0]
             elif reuse_refs:
                 x = layer(x, rope, modulation, joint_mask, kv_cache=ref_kv_cache["kv"][index])
+            elif self._gc_keep_plain(index):
+                x = layer(x, rope, modulation, joint_mask, isolate_split)
             else:
                 x = self._ckpt(layer, x, rope, modulation, joint_mask, isolate_split)
         if capture:
