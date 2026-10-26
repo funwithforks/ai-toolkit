@@ -2,10 +2,11 @@ from __future__ import division
 from __future__ import unicode_literals
 
 from typing import Iterable, Optional
+import threading
 import weakref
 import copy
 import contextlib
-from toolkit.optimizers.optimizer_utils import copy_stochastic
+from toolkit.optimizers.optimizer_utils import copy_stochastic, copy_stochastic_bf16
 
 import torch
 
@@ -58,6 +59,13 @@ class ExponentialMovingAverage:
             # with interval if that (unused by the toolkit) path is enabled;
             # use_feedback/param_multiplier stay per-applied-update.
             interval: int = 1,
+            # park the shadow on the host (pinned) and run the blend on CPU.
+            # update() then only issues an async D2H of the live params on a
+            # side stream; a worker thread does the fp32 blend + stochastic
+            # round while the GPU proceeds. Frees shadow-bytes of VRAM.
+            # One flag, no fallback: if the host cannot back the pinned
+            # copies, the allocation raises at setup and the run dies there.
+            park_cpu: bool = False,
     ):
         if parameters is None:
             raise ValueError("parameters must be provided")
@@ -86,6 +94,41 @@ class ExponentialMovingAverage:
         # is kept, no references to the model or its parameters will be
         # maintained, and the model will be cleaned up.
         self._params_refs = [weakref.ref(p) for p in parameters]
+        # CPU-parked state (see park_cpu in __init__ doc)
+        self.park_cpu = False
+        self._park_bytes = sum(p.numel() * p.element_size()
+                               for p in self.shadow_params)
+        self._staging = None
+        self._copy_stream = None
+        self._job_done = threading.Event()
+        self._job_done.set()
+        self._worker_error = None
+        self._warned_busy = False
+        if park_cpu:
+            self._init_park()
+
+    def _init_park(self):
+        if not self.shadow_params:
+            return
+        dev = self.shadow_params[0].device
+        if dev.type != "cuda":
+            raise ValueError(
+                "EMA park_cpu requires CUDA parameters (nothing to park "
+                "when training runs on CPU)")
+        if self.use_feedback or self.param_multiplier != 1.0:
+            raise ValueError(
+                "EMA park_cpu does not support use_feedback / "
+                "param_multiplier (they rewrite the live params per apply); "
+                "disable them or run GPU-resident")
+        # one flag, no fallback: the shadow moves to pinned host RAM or the
+        # allocation raises and the run dies at setup, not silently degraded
+        self.shadow_params = [
+            p.detach().to("cpu").pin_memory() for p in self.shadow_params
+        ]
+        self.park_cpu = True
+        print(f"[ema] shadow parked on pinned host RAM: "
+              f"{self._park_bytes / 2 ** 30:.2f} GiB freed from VRAM; "
+              f"CPU blend runs async every {self.interval} step(s)")
 
     def _get_parameters(
             self,
@@ -146,6 +189,9 @@ class ExponentialMovingAverage:
             # horizon-preserving absorb for an update applied once per
             # `interval` steps: k steps of (1 - x) == one step of (1 - x)^k
             one_minus_decay = 1.0 - (1.0 - one_minus_decay) ** self.interval
+        if self.park_cpu:
+            self._parked_apply(one_minus_decay, parameters)
+            return
         with torch.no_grad():
             for s_param, param in zip(self.shadow_params, parameters):
                 s_param_float = s_param.float()
@@ -173,6 +219,75 @@ class ExponentialMovingAverage:
                     copy_stochastic(param, param_float)
                 
 
+    # ---- CPU-parked pipeline -------------------------------------------------
+
+    def _parked_apply(self, one_minus_decay: float, parameters) -> None:
+        """Issue async D2H of the live params on a side stream and hand the
+        blend to a worker thread. Returns without touching the GPU default
+        stream's critical path; the next apply (or any shadow reader) joins
+        the worker. Assumes params are not rewritten until the copy stream
+        drains, which the step cadence guarantees with seconds to spare."""
+        self._sync_worker()
+        first = parameters[0]
+        if self._staging is None:
+            self._staging = [
+                torch.empty_like(s, pin_memory=True) for s in self.shadow_params
+            ]
+        if self._copy_stream is None:
+            self._copy_stream = torch.cuda.Stream(device=first.device)
+        src_ready = torch.cuda.Event()
+        src_ready.record()   # after the optimizer step on the current stream
+        events = []
+        with torch.cuda.stream(self._copy_stream):
+            self._copy_stream.wait_event(src_ready)
+            for buf, param in zip(self._staging, parameters):
+                if buf.shape != param.shape:
+                    raise RuntimeError(
+                        "parked EMA: param shape changed since init "
+                        f"({tuple(buf.shape)} -> {tuple(param.shape)})")
+                buf.copy_(param.detach(), non_blocking=True)
+                ev = torch.cuda.Event()
+                ev.record(self._copy_stream)
+                events.append(ev)
+        self._job_done.clear()
+        threading.Thread(
+            target=self._blend_job,
+            args=(list(self._staging), events, one_minus_decay),
+            daemon=True,
+        ).start()
+
+    def _blend_job(self, staging, events, one_minus_decay) -> None:
+        """CPU mirror of the GPU update body: fp32 blend, stochastic-round
+        writeback (copy_stochastic_bf16 is device-generic integer math)."""
+        try:
+            with torch.no_grad():
+                for s_param, buf, ev in zip(self.shadow_params, staging, events):
+                    ev.synchronize()   # this tensor's D2H landed
+                    s_f = s_param.float()
+                    gap = s_f - buf.float()
+                    s_f.sub_(gap * one_minus_decay)
+                    copy_stochastic_bf16(s_param, s_f)
+                    del s_f, gap
+        except BaseException as e:  # surfaced loudly at the next join point
+            if self._worker_error is None:
+                self._worker_error = e
+        finally:
+            self._job_done.set()
+
+    def _sync_worker(self) -> None:
+        if not self.park_cpu:
+            return
+        if not self._job_done.is_set():
+            if not self._warned_busy:
+                print("[ema] parked EMA worker still blending; syncing "
+                      "(CPU is falling behind the apply cadence)")
+                self._warned_busy = True
+            if not self._job_done.wait(timeout=600):
+                raise RuntimeError("parked EMA blend did not finish in 600 s")
+        if self._worker_error is not None:
+            err, self._worker_error = self._worker_error, None
+            raise RuntimeError(f"parked EMA blend failed: {err!r}") from err
+
     def copy_to(
             self,
             parameters: Optional[Iterable[torch.nn.Parameter]] = None
@@ -187,6 +302,7 @@ class ExponentialMovingAverage:
                 initialized will be used.
         """
         parameters = self._get_parameters(parameters)
+        self._sync_worker()   # parked: finish any in-flight blend first
         for s_param, param in zip(self.shadow_params, parameters):
             param.data.copy_(s_param.data)
 
@@ -272,12 +388,15 @@ class ExponentialMovingAverage:
             device: like `device` argument to `torch.Tensor.to`
         """
         # .to() on the tensors handles None correctly
-        self.shadow_params = [
-            p.to(device=device, dtype=dtype)
-            if p.is_floating_point()
-            else p.to(device=device)
-            for p in self.shadow_params
-        ]
+        # (parked shadows are host-resident by design; device moves must not
+        # undo the park)
+        if not self.park_cpu:
+            self.shadow_params = [
+                p.to(device=device, dtype=dtype)
+                if p.is_floating_point()
+                else p.to(device=device)
+                for p in self.shadow_params
+            ]
         if self.collected_params is not None:
             self.collected_params = [
                 p.to(device=device, dtype=dtype)
@@ -292,6 +411,7 @@ class ExponentialMovingAverage:
         # Following PyTorch conventions, references to tensors are returned:
         # "returns a reference to the state and not its copy!" -
         # https://pytorch.org/tutorials/beginner/saving_loading_models.html#what-is-a-state-dict
+        self._sync_worker()   # never read a shadow mid-blend
         return {
             "decay": self.decay,
             "num_updates": self.num_updates,
@@ -325,6 +445,12 @@ class ExponentialMovingAverage:
         assert all(
             isinstance(p, torch.Tensor) for p in self.shadow_params
         ), "shadow_params must all be Tensors"
+        if self.park_cpu:
+            # a loaded shadow must live where a parked shadow lives
+            self.shadow_params = [
+                p.detach().to("cpu").pin_memory() for p in self.shadow_params
+            ]
+            self._staging = None   # rebuild against loaded state
 
         self.collected_params = state_dict["collected_params"]
         if self.collected_params is not None:

@@ -864,6 +864,9 @@ class EMAConfig:
         # apply the EMA once every N optimizer steps; ema_decay keeps its
         # per-step meaning (horizon unchanged), cost drops by ~N
         self.ema_interval: int = max(1, int(kwargs.get('ema_interval', 1)))
+        # keep the EMA shadow on host RAM and blend on CPU (frees its VRAM;
+        # declined loudly on boxes without the RAM for it)
+        self.ema_park_cpu: bool = bool(kwargs.get('ema_park_cpu', False))
         # feeds back the decay difference into the parameter
         self.use_feedback: bool = kwargs.get('use_feedback', False)
         # per-step fraction of (shadow - param) pulled back into the param; keep well below 1 - ema_decay
