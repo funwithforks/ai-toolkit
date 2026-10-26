@@ -26,10 +26,13 @@ import os
 
 import torch
 
-# opt-in fused Triton update path (automagic3fft_kernels). Default off:
-# every other model keeps the eager byte-for-byte. MOSS_OPT_FUSED=1 turns
-# it on for Automagic3FFT after its identity test has passed.
-_FUSED = os.environ.get("MOSS_OPT_FUSED") == "1"
+# Fused Triton update path (automagic3fft_kernels) is the DEFAULT. This
+# optimizer was built for moss full fine-tune; the fused path is
+# identity-verified on its dominant shapes (state bitwise, weights bounded
+# by lr*clip*delta) and benched on both target cards -- 65 % (PRO 6000) /
+# 61 % (5090) of the eager-hook tax recovered (findings sec. 5h).
+# MOSS_OPT_FUSED=0 restores the eager path for A/B or SR-diff work.
+_FUSED = os.environ.get("MOSS_OPT_FUSED", "1") != "0"
 _fused_import_error = None
 try:
     from .automagic3fft_kernels import fused_update_param as _fused_update
@@ -60,12 +63,15 @@ class Automagic3FFT(torch.optim.Optimizer):
         if _FUSED:
             if _fused_update is None:
                 raise RuntimeError(
-                    "MOSS_OPT_FUSED=1 but the fused Triton path is "
-                    f"unavailable on this box: {_fused_import_error!r}. "
-                    "Fix the environment or unset the flag -- this "
-                    "optimizer never silently falls back to eager.")
-            print("Automagic3FFT: fused Triton stepping ENABLED "
-                  "(params outside the kernel set abort the run loudly)")
+                    "Automagic3FFT defaults to the fused Triton path but "
+                    f"it is unavailable on this box: {_fused_import_error!r}. "
+                    "Fix the environment or set MOSS_OPT_FUSED=0 for eager "
+                    "-- this optimizer never silently mixes paths.")
+            print("Automagic3FFT: fused Triton stepping ON (default; "
+                  "params outside the kernel set abort the run loudly)")
+        else:
+            print("Automagic3FFT: fused Triton stepping OFF "
+                  "(MOSS_OPT_FUSED=0, eager path)")
 
         self._hook_handles = []
         for group in self.param_groups:
