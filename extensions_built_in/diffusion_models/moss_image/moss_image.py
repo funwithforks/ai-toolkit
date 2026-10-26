@@ -180,6 +180,16 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
             dtype=self.torch_dtype,
             aitk_device=None if self.model_config.low_vram else self.device_torch,
         )
+        # model_kwargs gc_keep_last (default 0): the last N image blocks run
+        # UNcheckpointed on cards with the VRAM for it (pure memory/recompute
+        # policy; math identical). Held activations belong to the blocks
+        # backward consumes first, so this memory drains before the first
+        # checkpoint-recompute transient. Same channel as int8_bwd/transformer_path.
+        _keep = int(self.model_config.model_kwargs.get("gc_keep_last", 0))
+        if _keep:
+            transformer.gc_keep_last = _keep
+            print(f"[moss] model_kwargs gc_keep_last={_keep} applied to "
+                  f"transformer ({len(transformer.layers)} image blocks)")
         return transformer
 
     def _load_text_encoder(self):
