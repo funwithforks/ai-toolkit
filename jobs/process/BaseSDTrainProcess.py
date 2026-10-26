@@ -469,6 +469,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
             safetensors_files = [f for f in items if f.endswith('.safetensors')]
             pt_files = [f for f in items if f.endswith('.pt')]
             directories = [d for d in items if os.path.isdir(d) and not d.endswith('.safetensors')]
+            # per-step resume-set aux (full FT): pruned below by step
+            # membership of the kept model saves, never through the
+            # pt_files count bucket (which would double-count against
+            # max_step_saves_to_keep and fight save_format=pt)
+            aux_files = [f for f in items if os.path.isfile(f)
+                         and (f.endswith('_ema_resume.pt')
+                              or f.endswith('_optimizer.pt'))
+                         and os.path.basename(f).startswith(f"{self.job.name}_")]
+            pt_files = [f for f in pt_files if f not in aux_files]
             embed_files = []
             # do embedding files
             if self.embed_config is not None:
@@ -511,6 +520,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
             critic_to_remove = critic_items[:-num_saves_to_keep] if critic_items else []
 
             items_to_remove = safetensors_to_remove + pt_files_to_remove + directories_to_remove + embeddings_to_remove + critic_to_remove
+
+            # resume-set aux (optimizer step-state + EMA resume state)
+            # follow the model save they belong to: an aux whose step is
+            # no longer among the kept model saves is pruned, so a step
+            # set is retained or dropped as a whole.
+            if aux_files:
+                kept_models = set(
+                    safetensors_files[max(0, len(safetensors_files) - num_saves_to_keep):]
+                    + pt_files[max(0, len(pt_files) - num_saves_to_keep):])
+                kept_steps = set()
+                for f in kept_models:
+                    m = re.search(r"_(\d{9})\.(safetensors|pt)$", os.path.basename(f))
+                    if m:
+                        kept_steps.add(m.group(1))
+                for f in aux_files:
+                    m = re.search(r"_(\d{9})_(ema_resume|optimizer)\.pt$",
+                                  os.path.basename(f))
+                    if m is None:
+                        continue  # not one of ours
+                    if m.group(1) not in kept_steps:
+                        items_to_remove.append(f)
 
             # remove all but the latest max_step_saves_to_keep
             # items_to_remove = combined_items[:-num_saves_to_keep]
@@ -750,6 +780,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         print_acc(f"Saved checkpoint to {file_path}")
 
         # save optimizer
+        opt_state_dict = None
         if self.optimizer is not None:
             try:
                 filename = f'optimizer.pt'
@@ -760,9 +791,49 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     state_dict = self.optimizer.state_dict()
                 torch.save(state_dict, file_path)
                 print_acc(f"Saved optimizer to {file_path}")
+                opt_state_dict = state_dict
             except Exception as e:
                 print_acc(e)
                 print_acc("Could not save optimizer")
+
+        # Full fine-tune checkpoint SETS: model safetensors + optimizer
+        # state + EMA resume state are written per step so rolling back
+        # to any retained checkpoint restores a matched triple. Pruned
+        # as sets by clean_up_saves() under max_step_saves_to_keep.
+        # LoRA/adapter runs keep the old fixed-name single-slot optimizer
+        # behaviour exactly (no aux files are ever written for them).
+        if self.is_fine_tuning and step is not None and opt_state_dict is not None:
+            opt_step_path = os.path.join(
+                self.save_root, f'{self.job.name}{step_num}_optimizer.pt')
+            torch.save(opt_state_dict, opt_step_path)
+            print_acc(f"Saved step-matched optimizer state to {opt_step_path}")
+
+        # EMA resume state. While the EMA swap above is active the
+        # safetensors intentionally contains EMA weights -- the live
+        # trajectory exists ONLY in ema.collected_params (the store()
+        # clone), and the shadow was never persisted at all. Resume
+        # therefore lost both. Persist live weights + shadow + counters
+        # so resume restores the real run. Full fine-tune: per-step file
+        # (set-pruned); otherwise fixed name, overwritten. Failure
+        # raises: an EMA run whose resume state silently failed to save
+        # is a lie waiting to run.
+        if self.ema is not None:
+            ema_state = self.ema.state_dict()  # joins parked blend worker
+            ema_state["shadow_params"] = [
+                p.detach().cpu() for p in ema_state["shadow_params"]
+            ]
+            if ema_state["collected_params"] is not None:
+                ema_state["collected_params"] = [
+                    p.detach().cpu() for p in ema_state["collected_params"]
+                ]
+            if self.is_fine_tuning and step is not None:
+                ema_file_path = os.path.join(
+                    self.save_root, f'{self.job.name}{step_num}_ema_resume.pt')
+            else:
+                ema_file_path = os.path.join(self.save_root, 'ema_resume_state.pt')
+            torch.save({"ema_state": ema_state, "step": int(self.step_num)},
+                       ema_file_path)
+            print_acc(f"Saved EMA resume state (live weights + shadow) to {ema_file_path}")
 
         self.clean_up_saves()
         self.post_save_hook(file_path)
@@ -918,6 +989,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             paths = []
             for pattern in patterns:
                 paths.extend(glob.glob(os.path.join(self.save_root, pattern)))
+
+            # never resume from a resume-set aux file (step optimizer state
+            # / EMA state): they are companions to a model save, not models
+            paths = [p for p in paths
+                     if not (p.endswith('_ema_resume.pt')
+                             or p.endswith('_optimizer.pt'))]
 
             # Filter out non-existent paths and sort by creation time
             if paths:
@@ -2421,6 +2498,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # check if it exists
         optimizer_state_filename = f'optimizer.pt'
         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
+
+        # full fine-tune: the checkpoint set loaded above is identified by
+        # self.step_num (metadata step == filename step). Prefer the
+        # optimizer state written WITH that save; a step set rolled back
+        # past retention warns loudly rather than mixing moments silently.
+        step_tag = f"_{str(self.step_num).zfill(9)}"
+        if self.is_fine_tuning:
+            optimizer_step_path = os.path.join(
+                self.save_root, f"{self.job.name}{step_tag}_optimizer.pt")
+            if os.path.exists(optimizer_step_path):
+                print_acc(f"Using step-matched optimizer state for step "
+                          f"{self.step_num}: {optimizer_step_path}")
+                optimizer_state_file_path = optimizer_step_path
+            elif (os.path.exists(optimizer_state_file_path)
+                    and glob.glob(os.path.join(
+                        self.save_root,
+                        f"{self.job.name}_*_*_optimizer.pt"))):
+                print_acc(f"[resume] WARNING: no optimizer state retained for "
+                          f"step {self.step_num} (rolled back past retention?); "
+                          "loading fixed optimizer.pt from the newest save -- "
+                          "moments may not match this checkpoint")
+
         if os.path.exists(optimizer_state_file_path):
             # try to load
             # previous param groups
@@ -2459,6 +2558,90 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # set up the ema now that the optimizer (and its params) are ready
         self.setup_ema()
+
+        # Full fine-tune resume: restore LIVE model weights, then the EMA
+        # shadow + counters. The exported safetensors intentionally carries
+        # EMA values, so loading it (above) is NOT a live resume. Order:
+        # optimizer state -> model weights -> EMA. The checkpoint set that
+        # was loaded is identified by self.step_num (metadata step ==
+        # filename step), so the step-tagged aux must come first and its
+        # stamped payload step must agree; anything else aborts loudly --
+        # restoring a state that does not describe this run is corruption
+        # dressed as a resume.
+        candidates = []
+        if self.is_fine_tuning:
+            candidates.append(os.path.join(
+                self.save_root,
+                f"{self.job.name}{step_tag}_ema_resume.pt"))
+        candidates.append(
+            os.path.join(self.save_root, 'ema_resume_state.pt'))
+        ema_resume_path = next(
+            (c for c in candidates if os.path.exists(c)), None)
+        if ema_resume_path is not None:
+            if self.network is not None and self.network.did_change_weights:
+                if self.is_fine_tuning:
+                    # aux files for this step would be deleted by the later
+                    # embedding cleanup -- the user's intent (new weights)
+                    # wins, so drop the stale resume set explicitly.
+                    for path in (os.path.join(
+                            self.save_root,
+                            f"{self.job.name}{step_tag}_ema_resume.pt"),
+                            os.path.join(
+                            self.save_root,
+                            f"{self.job.name}{step_tag}_optimizer.pt")):
+                        if os.path.exists(path):
+                            print(f"[resume] removing stale checkpoint set "
+                                  f"for step {self.step_num} (network "
+                                  f"weights changed): {path}")
+                            os.remove(path)
+                print("[resume] SKIPPING live/EMA restore: network weights "
+                      "changed since that save (did_change_weights); "
+                      "training continues from the current weights")
+            else:
+                resume_state = torch.load(ema_resume_path, weights_only=True)
+                payload_step = resume_state.get("step", None)
+                if payload_step is None:
+                    raise RuntimeError(
+                        f"{ema_resume_path} predates step stamping and "
+                        f"cannot be verified to match step "
+                        f"{self.step_num}. Delete it (or resume a run whose "
+                        "saves carry the step tag) instead of trusting an "
+                        "unverifiable state.")
+                if payload_step != int(self.step_num):
+                    raise RuntimeError(
+                        f"{ema_resume_path} describes step {payload_step} "
+                        f"but this run resumes at step {self.step_num}. "
+                        "Refusing to restore a mismatched state.")
+                ema_state = resume_state["ema_state"]
+                live = ema_state.get("collected_params")
+                if live is None:
+                    raise RuntimeError(
+                        f"{ema_resume_path} contains no live weights "
+                        "(collected_params); resuming would silently train "
+                        "from EMA weights as live. Aborting.")
+                params = [p for group in self.optimizer.param_groups
+                          for p in group["params"]]
+                if len(live) != len(params) or any(
+                        t.shape != p.shape for t, p in zip(live, params)):
+                    raise RuntimeError(
+                        f"{ema_resume_path} does not match this optimizer's "
+                        f"param set ({len(live)} saved vs {len(params)} "
+                        "params, or shape mismatch). Aborting instead of "
+                        "corrupting the run.")
+                with torch.no_grad():
+                    for p, t in zip(params, live):
+                        p.data.copy_(t.to(device=p.device, dtype=p.dtype))
+                print(f"[resume] restored LIVE model weights from "
+                      f"{ema_resume_path} (step {payload_step})")
+                if self.ema is not None:
+                    self.ema.load_state_dict(ema_state)
+                    print(f"[resume] EMA shadow + counters restored "
+                          f"(step_counter={self.ema.step_counter})")
+                else:
+                    print("[resume] use_ema is off: EMA shadow not restored "
+                          "(live weights are)")
+                del resume_state, ema_state, live
+                flush()
 
         lr_scheduler_params = self.train_config.lr_scheduler_params
 
