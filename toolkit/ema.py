@@ -106,6 +106,12 @@ class ExponentialMovingAverage:
         self._warned_busy = False
         if park_cpu:
             self._init_park()
+            # daemon blend threads killed mid-torch-call during interpreter
+            # finalization abort the process ("terminate called without an
+            # active exception") when a save did not already join them --
+            # run the join before threading tears daemons down. Print-only:
+            # must never raise or stall a run that already succeeded.
+            threading._register_atexit(self._join_at_exit)
 
     def _init_park(self):
         if not self.shadow_params:
@@ -273,6 +279,20 @@ class ExponentialMovingAverage:
                 self._worker_error = e
         finally:
             self._job_done.set()
+
+    def _join_at_exit(self) -> None:
+        """atexit: let an in-flight blend finish so the daemon thread is
+        not killed inside torch during finalization (-> SIGABRT). Bounded
+        and print-only: a completed run must exit 0 regardless."""
+        try:
+            if not self._job_done.wait(timeout=60):
+                print("[ema] WARNING: parked blend still running at exit; "
+                      "shadow state may be one apply stale in any unsaved path")
+            if self._worker_error is not None:
+                print(f"[ema] WARNING: parked blend error at exit: "
+                      f"{self._worker_error!r}")
+        except Exception as e:  # interpreter is shutting down: never raise
+            print(f"[ema] WARNING: parked EMA exit join failed: {e!r}")
 
     def _sync_worker(self) -> None:
         if not self.park_cpu:
