@@ -491,12 +491,19 @@ class ExponentialMovingAverage:
             if not any(p is None for p in params):
                 # ^ parameter references are still good
                 for i, p in enumerate(params):
+                    # parked shadows are host-resident by design: a loaded
+                    # state must not yank them to GPU (the next parked
+                    # update() would then rebuild staging with
+                    # pin_memory on CUDA tensors and raise). dtype still
+                    # follows the params.
                     self.shadow_params[i] = self.shadow_params[i].to(
-                        device=p.device, dtype=p.dtype
+                        device="cpu" if self.park_cpu else p.device,
+                        dtype=p.dtype
                     )
                     if self.collected_params is not None:
                         self.collected_params[i] = self.collected_params[i].to(
-                            device=p.device, dtype=p.dtype
+                            device="cpu" if self.park_cpu else p.device,
+                            dtype=p.dtype
                         )
         else:
             raise ValueError(
