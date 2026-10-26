@@ -881,6 +881,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 feedback_rate=self.train_config.ema_config.feedback_rate,
                 param_multiplier=self.train_config.ema_config.param_multiplier,
                 interval=self.train_config.ema_config.ema_interval,
+                park_cpu=self.train_config.ema_config.ema_park_cpu,
             )
             # expose to the model: models that run an EMA-teacher forward during training
             # (e.g. wan21_pixel self_flow) read it from here
