@@ -228,6 +228,14 @@ class BucketsMixin:
         self.buckets = {}  # clear it
 
         config: 'DatasetConfig' = self.dataset_config
+        if getattr(config, 'ragged_batches', False):
+            # variable-shape batches: one group, a per-image shape, no crop.
+            # Everything below is the shipped fixed-shape bucket path.
+            self._setup_ragged_groups(config)
+            self.shuffle_buckets()
+            self.build_batch_indices()
+            return
+
         resolution = config.resolution
         bucket_tolerance = config.bucket_tolerance
         file_list: List['FileItemDTO'] = self.file_list
@@ -314,6 +322,107 @@ class BucketsMixin:
             for key, bucket in self.buckets.items():
                 print_acc(f'{key}: {len(bucket.file_list_idx)} files')
             print_acc(f'{len(self.buckets)} buckets made')
+
+    def _setup_ragged_groups(self: 'AiToolkitDataset', config):
+        """Ragged batching (opt-in, dataset_config.ragged_batches): give each
+        image its OWN shape -- native aspect ratio snapped to the model's
+        divisibility grid at the area budget -- and put every usable image in
+        ONE group, so a batch mixes shapes instead of carrying one shape each.
+
+        The shipped resize+crop then becomes resize-only by construction: the
+        crop rect equals the scaled size at the origin, so nothing is cropped
+        and the image trains as authored. The shape chooser itself is reused
+        verbatim (get_bucket_for_image_size), so the shapes this picks are the
+        shapes the bucket path would have picked -- only the grouping changes.
+
+        Areas stay within ragged_area_tolerance of the dataset's largest area
+        so one batch's token total stays near the anchor and batch_size keeps
+        meaning what it means. Images outside the window are left out with a
+        printed count-and-area summary; they are never silently trained at a
+        different token cost.
+
+        Anything this path cannot carry raises here. Silently training
+        something other than what the config asked for is the failure mode
+        worth avoiding.
+        """
+        if self.is_video:
+            raise ValueError(
+                "ragged_batches does not support video datasets (frames are "
+                "batched as a rectangle by design)")
+        if config.square_crop:
+            raise ValueError(
+                "ragged_batches and square_crop contradict each other: one "
+                "crops every image to a square, the other keeps its shape")
+        if config.random_crop:
+            raise ValueError(
+                "ragged_batches never crops, so random_crop has nothing to "
+                "randomize. Remove random_crop or the ragged_batches flag")
+        if config.random_scale:
+            raise ValueError(
+                "ragged_batches sizes each image to its own fixed shape; "
+                "random_scale would vary it per load and invalidate the cached "
+                "geometry. Remove random_scale")
+        divisibility = config.bucket_tolerance
+        if divisibility < 2:
+            raise ValueError(
+                f"ragged_batches needs the model's pixel divisibility, got "
+                f"{divisibility}")
+
+        chosen = []
+        for idx, file_item in enumerate(self.file_list):
+            if getattr(file_item, 'is_audio_model', False):
+                raise ValueError(
+                    "ragged_batches does not support audio datasets")
+            width = int(file_item.width * config.scale)
+            height = int(file_item.height * config.scale)
+            bucket_resolution = get_bucket_for_image_size(
+                width, height,
+                resolution=config.resolution,
+                divisibility=divisibility,
+            )
+            bw = int(bucket_resolution["width"])
+            bh = int(bucket_resolution["height"])
+            chosen.append((idx, bw, bh, bw * bh))
+        if not chosen:
+            raise ValueError("ragged_batches: dataset has no images to group")
+
+        anchor = max(a for _, _, _, a in chosen)
+        floor = anchor * (1.0 - float(config.ragged_area_tolerance))
+        kept = [c for c in chosen if c[3] >= floor]
+        skipped = [c for c in chosen if c[3] < floor]
+        if not kept:
+            raise ValueError(
+                f"ragged_batches: every image falls below area {floor:.0f} "
+                f"(anchor {anchor}); check ragged_area_tolerance and resolution")
+
+        for idx, bw, bh, _area in kept:
+            file_item = self.file_list[idx]
+            # crop rect == scaled size at the origin: an identity crop
+            file_item.scale_to_width = bw
+            file_item.scale_to_height = bh
+            file_item.crop_width = bw
+            file_item.crop_height = bh
+            file_item.crop_x = 0
+            file_item.crop_y = 0
+
+        # one group => build_batch_indices slices it into batches that mix
+        # shapes, which is what the packed DiT consumes
+        key = f'ragged_{config.resolution}'
+        self.buckets[key] = Bucket(kept[0][1], kept[0][2])
+        self.buckets[key].file_list_idx = [idx for idx, _, _, _ in kept]
+
+        areas = [a for _, _, _, a in kept]
+        print_acc(
+            f'[ragged] {len(kept)} images in one mixed-shape group '
+            f'(resolution {config.resolution}, area {min(areas)}-{max(areas)}, '
+            f'anchor {anchor}, tolerance {config.ragged_area_tolerance:.2f})')
+        if skipped:
+            sa = [a for _, _, _, a in skipped]
+            print_acc(
+                f'[ragged] WARNING: {len(skipped)} images skipped, area below '
+                f'{floor:.0f} (range {min(sa)}-{max(sa)} vs anchor {anchor}). '
+                f'They are NOT trained. Raise ragged_area_tolerance or resize '
+                f'them to the area budget.')
 
 
 class CaptionProcessingDTOMixin:

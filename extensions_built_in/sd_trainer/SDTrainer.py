@@ -36,6 +36,7 @@ from torchvision import transforms
 from diffusers import EMAModel
 import math
 from toolkit.train_tools import precondition_model_outputs_flow_match
+from toolkit.ragged import is_ragged
 from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtractor, load_dfe
 from toolkit.util.losses import wavelet_loss, stepped_loss
 import torch.nn.functional as F
@@ -782,6 +783,108 @@ class SDTrainer(BaseSDTrainProcess):
         return output, batch.tensor.to(self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))
 
     # you can expand these in a child class to make customization easier
+    def _calculate_loss_ragged(self, noise_pred, noise, noisy_latents, timesteps,
+                               batch, mask_multiplier, prior_pred):
+        """Per-sample loss for a ragged batch (no shared spatial shape).
+
+        The stacked path reduces with ``loss.mean([1, 2, 3])`` -- a per-sample
+        mean over each sample's own elements. Taking that mean per item and
+        stacking yields the same (B,) vector by construction, and everything
+        after the reduction (timestep weight, loss multiplier, snr weights,
+        the batch mean) never touches a spatial axis, so it is reproduced here
+        as-is. Verified equal to the stacked path on equal shapes.
+
+        Deliberately a separate method: the shared path cannot drift, and
+        anything that genuinely needs per-element math (masks, prior and
+        preservation passes, turbo/t0/fft losses) is refused here rather than
+        approximated per sample.
+        """
+        tc = self.train_config
+        if not (is_ragged(noise_pred) and is_ragged(batch.latents)
+                and is_ragged(noise)):
+            raise NotImplementedError(
+                "ragged loss needs ragged predictions, latents and noise "
+                f"together (got pred={type(noise_pred).__name__}, "
+                f"latents={type(batch.latents).__name__}, "
+                f"noise={type(noise).__name__}). A mix means one stage stacked "
+                "the batch -- refusing instead of relying on shapes happening "
+                "to line up.")
+        if noise_pred.shapes != batch.latents.shapes or noise.shapes != batch.latents.shapes:
+            raise ValueError(
+                "ragged loss: per-sample shapes must line up across pred, "
+                f"noise and latents (got pred={noise_pred.shapes}, "
+                f"noise={noise.shapes}, latents={batch.latents.shapes})")
+        if prior_pred is not None:
+            raise NotImplementedError(
+                "prior loss (prior_reg / inverted_mask_prior) is not "
+                "implemented for ragged batches")
+        if tc.do_differential_guidance:
+            raise NotImplementedError(
+                "do_differential_guidance is not implemented for ragged batches")
+        if getattr(batch, 'dopsd_prompt_embeds', None) is not None:
+            raise NotImplementedError(
+                "D-OPSD teacher passes are not implemented for ragged batches")
+        if isinstance(mask_multiplier, torch.Tensor) or (
+                isinstance(mask_multiplier, (int, float))
+                and float(mask_multiplier) != 1.0):
+            raise NotImplementedError(
+                "ragged loss supports an unweighted batch only: a per-element "
+                "mask has no shared shape to apply to")
+        if tc.loss_type not in ('mse', 'mae'):
+            raise NotImplementedError(
+                f"ragged loss does not implement loss_type={tc.loss_type}")
+
+        with torch.no_grad():
+            # same target rule as the stacked path, in the same precedence
+            if hasattr(self.sd, 'get_loss_target'):
+                target = self.sd.get_loss_target(
+                    noise=noise, batch=batch, timesteps=timesteps).detach()
+            elif self.sd.is_flow_matching:
+                target = (noise - batch.latents).detach()
+            else:
+                raise NotImplementedError(
+                    "ragged loss supports a model-provided target or the "
+                    "flow-match (noise - latents) target only")
+
+        # per-sample mean == one row of the stacked path's mean([1, 2, 3])
+        per_sample = []
+        for pred_i, target_i in zip(noise_pred, target):
+            if tc.loss_type == 'mae':
+                per_sample.append(F.l1_loss(
+                    pred_i.float(), target_i.float(), reduction='none').mean())
+            else:
+                per_sample.append(F.mse_loss(
+                    pred_i.float(), target_i.float(), reduction='none').mean())
+        loss = torch.stack(per_sample)
+
+        # a timestep weight is constant across a sample's elements, so scaling
+        # the per-sample mean is exactly what scaling the per-element loss did
+        if self.sd.is_flow_matching and (
+                tc.linear_timesteps or tc.linear_timesteps2
+                or tc.timestep_type == 'weighted'):
+            weight = self.sd.noise_scheduler.get_weights_for_timesteps(
+                timesteps,
+                v2=tc.linear_timesteps2,
+                timestep_type=tc.timestep_type,
+                x0_pred=self.sd.x0_pred,
+            ).to(loss.device, dtype=loss.dtype)
+            loss = loss * weight.detach()
+
+        loss_multiplier = torch.tensor(
+            batch.loss_multiplier_list).to(loss.device, dtype=loss.dtype)
+        loss = loss * loss_multiplier
+
+        if tc.learnable_snr_gos:
+            loss = apply_learnable_snr_gos(loss, timesteps, self.snr_gos)
+        elif tc.snr_gamma is not None and tc.snr_gamma > 0.000001:
+            loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler,
+                                    tc.snr_gamma, fixed=True)
+        elif tc.min_snr_gamma is not None and tc.min_snr_gamma > 0.000001:
+            loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler,
+                                    tc.min_snr_gamma)
+
+        return loss.mean()
+
     def calculate_loss(
             self,
             noise_pred: torch.Tensor,
@@ -793,6 +896,11 @@ class SDTrainer(BaseSDTrainProcess):
             prior_pred: Union[torch.Tensor, None] = None,
             **kwargs
     ):
+        if is_ragged(noise_pred) or is_ragged(batch.latents) or is_ragged(noise):
+            return self._calculate_loss_ragged(
+                noise_pred, noise, noisy_latents, timesteps, batch,
+                mask_multiplier, prior_pred)
+
         loss_target = self.train_config.loss_target
         is_reg = any(batch.get_is_reg_list())
         additional_loss = 0.0

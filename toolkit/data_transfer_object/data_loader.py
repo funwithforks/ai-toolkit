@@ -10,6 +10,7 @@ import av
 from toolkit import image_utils
 from toolkit.basic import get_quick_signature_string
 from toolkit.dto import DTO
+from toolkit.ragged import RaggedBatch
 from toolkit.dataloader_mixins import (
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -258,19 +259,40 @@ class DataLoaderBatchDTO:
 
             self.num_frames: int = self.file_items[0].num_frames
 
+            # ragged batching (opt-in per dataset): the batch keeps per-sample
+            # shapes, so nothing here may stack a rectangle. Flag-driven on
+            # purpose -- a batch whose shapes happen to match still takes the
+            # shipped stacked path for every other model.
+            is_ragged_batch = bool(getattr(
+                self.file_items[0].dataset_config, 'ragged_batches', False))
+
             if (
                 not is_latents_cached
                 or self.file_items[0].dataset_config.load_image_when_caching_latents
                 or self.file_items[0].dataset_config.cache_tensors_to_disk
             ):
+                if is_ragged_batch and not is_latents_cached:
+                    raise ValueError(
+                        "ragged_batches requires cache_latents_to_disk: true. "
+                        "The live encode path stacks the batch to encode it, "
+                        "which is the rectangle ragged batching avoids.")
                 # only return a tensor if latents are not cached, or if we are explicitly
                 # loading the raw image alongside the cached latents
-                self.tensor: torch.Tensor = torch.cat(
-                    [x.tensor.unsqueeze(0) for x in self.file_items]
-                )
+                if is_ragged_batch:
+                    # carried ragged on purpose: anything that stacks it fails
+                    # loudly instead of padding it
+                    self.tensor = RaggedBatch([x.tensor for x in self.file_items])
+                else:
+                    self.tensor: torch.Tensor = torch.cat(
+                        [x.tensor.unsqueeze(0) for x in self.file_items]
+                    )
             # if we have encoded latents, we concatenate them
             self.latents: Union[torch.Tensor, None] = None
-            if is_latents_cached:
+            if is_latents_cached and is_ragged_batch:
+                # per-item latents, never concatenated. get_latent still
+                # triggers the disk load, same as the stacked path.
+                self.latents = RaggedBatch([x.get_latent() for x in self.file_items])
+            elif is_latents_cached:
                 # this get_latent call with trigger loading all cached items from the disk.
                 # DTO.stack keeps any extra streams (audio, ...) riding on the batch latents
                 self.latents = DTO.stack([x.get_latent() for x in self.file_items])

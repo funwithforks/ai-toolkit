@@ -65,6 +65,7 @@ from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, Netw
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
     DecoratorConfig
 from toolkit.logging_aitk import create_logger
+from toolkit.ragged import RaggedBatch, is_ragged
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model, drop_fp32_outcome_wrapper
 from toolkit.print import print_acc
@@ -1135,8 +1136,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return noise
     
     def get_consistent_noise(self, latents, batch: 'DataLoaderBatchDTO', dtype=torch.float32):
-        batch_num = latents.shape[0]
-        chunks = torch.chunk(latents, batch_num, dim=0)
+        ragged = is_ragged(latents)
+        batch_num = len(latents) if ragged else latents.shape[0]
+        # a ragged batch IS a list of per-sample tensors already; the stacked
+        # chunk split would need the rectangle it does not have. The seed per
+        # item comes from its path either way, so a ragged and a bucketed run
+        # over the same images draw the same noise -- what makes a trainer
+        # level A/B comparison meaningful.
+        chunks = list(latents) if ragged else torch.chunk(latents, batch_num, dim=0)
         noise_chunks = []
         for idx, chunk in enumerate(chunks):
             # get seed from path
@@ -1151,6 +1158,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             generator = torch.Generator("cpu").manual_seed(seed)
             noise_chunk = torch.randn(chunk.shape, generator=generator).to(chunk.device, dtype=dtype)
             noise_chunks.append(noise_chunk)
+        if ragged:
+            return RaggedBatch(noise_chunks)
         noise = torch.cat(noise_chunks, dim=0).to(dtype=dtype)
         return noise
             
@@ -1163,7 +1172,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         batch: 'DataLoaderBatchDTO' = None,
         timestep=None,
     ):
+        ragged = is_ragged(latents)
         if self.train_config.optimal_noise_pairing_samples > 1:
+            if ragged:
+                raise ValueError(
+                    "optimal_noise_pairing_samples stacks the batch to pair "
+                    "noise; not supported with ragged batches")
             noise = self.get_optimal_noise(latents, dtype=dtype)
         elif self.train_config.force_consistent_noise:
             if batch is None:
@@ -1171,11 +1185,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
             noise = self.get_consistent_noise(latents, batch, dtype=dtype)
         else:
             if hasattr(self.sd, 'get_latent_noise_from_latents'):
-                noise = self.sd.get_latent_noise_from_latents(
-                    latents,
-                    noise_offset=self.train_config.noise_offset
-                ).to(self.device_torch, dtype=dtype)
+                if ragged:
+                    # same recipe as the stacked path, per sample. The unsqueeze
+                    # matters: the noise offset is drawn per (batch item,
+                    # channel), so each sample must pass as a batch of one.
+                    noise = latents.map(
+                        lambda t: self.sd.get_latent_noise_from_latents(
+                            t.unsqueeze(0),
+                            noise_offset=self.train_config.noise_offset,
+                        ).squeeze(0)
+                    ).to(self.device_torch, dtype=dtype)
+                else:
+                    noise = self.sd.get_latent_noise_from_latents(
+                        latents,
+                        noise_offset=self.train_config.noise_offset
+                    ).to(self.device_torch, dtype=dtype)
             else:
+                if ragged:
+                    raise ValueError(
+                        "this model builds noise from one height/width for the "
+                        "whole batch; ragged batches need a per-sample noise "
+                        "source (get_latent_noise_from_latents)")
                 # get noise
                 noise = self.sd.get_latent_noise(
                     height=latents.shape[2],
@@ -1186,14 +1216,62 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ).to(self.device_torch, dtype=dtype)
         
         if self.train_config.blended_blur_noise:
+            if ragged:
+                raise ValueError(
+                    "blended_blur_noise operates on the stacked batch; not "
+                    "supported with ragged batches")
             noise = get_blended_blur_noise(
                 latents, noise, timestep
             )
 
         return noise
 
+    def _guard_ragged_unsupported(self, batch: 'DataLoaderBatchDTO'):
+        """A ragged batch carries no rectangle, so every knob that reaches for
+        ``latents.shape`` or a stacked (B, C, H, W) tensor is refused here by
+        name. Naming the knob is the point: a silent fallback would train
+        something the config did not ask for. Each of these can be taught
+        per-sample math later; until then it is an error, not a surprise."""
+        tc = self.train_config
+        checks = [
+            (tc.dynamic_noise_offset, 'dynamic_noise_offset'),
+            (tc.adaptive_scaling_factor, 'adaptive_scaling_factor'),
+            (tc.do_blank_stabilization, 'do_blank_stabilization'),
+            (tc.do_signal_correction_noise, 'do_signal_correction_noise'),
+            (tc.do_batch_noise_correction, 'do_batch_noise_correction'),
+            (tc.random_noise_shift > 0.0, 'random_noise_shift'),
+            (tc.random_noise_multiplier > 0.0, 'random_noise_multiplier'),
+            (tc.short_and_long_captions, 'short_and_long_captions'),
+            (tc.do_cfg, 'do_cfg'),
+            (tc.do_random_cfg, 'do_random_cfg'),
+            (tc.train_turbo, 'train_turbo'),
+            (tc.inverted_mask_prior, 'inverted_mask_prior'),
+            (tc.match_noise_norm, 'match_noise_norm'),
+            (tc.correct_pred_norm, 'correct_pred_norm'),
+            (tc.t0_loss_target, 't0_loss_target'),
+            (tc.do_fft_loss, 'do_fft_loss'),
+            (tc.do_differential_guidance, 'do_differential_guidance'),
+            (tc.loss_target in ('source', 'unaugmented', 'differential_noise'),
+             f"loss_target={tc.loss_target}"),
+            (tc.loss_type in ('wavelet', 'stepped'), f"loss_type={tc.loss_type}"),
+            (batch.mask_tensor is not None, 'mask datasets'),
+            (batch.unaugmented_tensor is not None, 'unaugmented tensors'),
+            (batch.control_tensor is not None
+             or batch.control_tensor_list is not None, 'control images'),
+            (bool(self.model_config.refiner_name_or_path), 'refiner'),
+        ]
+        hit = [name for cond, name in checks if cond]
+        if hit:
+            raise NotImplementedError(
+                "ragged batching (dataset ragged_batches: true) does not "
+                "support: " + ", ".join(hit) + ". Each one operates on the "
+                "batch as a single rectangle. Turn it off, or drop "
+                "ragged_batches and use aspect ratio buckets.")
+
     def process_general_training_batch(self, batch: 'DataLoaderBatchDTO'):
         with torch.no_grad():
+            if is_ragged(batch.latents):
+                self._guard_ragged_unsupported(batch)
             with self.timer('prepare_prompt'):
                 prompts = batch.get_caption_list()
                 is_reg_list = batch.get_is_reg_list()
@@ -1485,10 +1563,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 noise_multiplier = self.train_config.noise_multiplier
                 
-                s = (noise.shape[0], noise.shape[1], 1, 1)
-                if len(noise.shape) == 5:
-                    # if we have a 5d tensor, then we need to do it on a per batch item, per channel basis, per frame
-                    s = (noise.shape[0], noise.shape[1], noise.shape[2], 1, 1)
+                # broadcast shape for the per-channel noise knobs below. A
+                # ragged batch has no batch shape, and both knobs that read it
+                # are refused for ragged up front; the scalar multiply on the
+                # next-but-one line is per-sample by construction, so nothing
+                # here needs a rectangle.
+                s = None
+                if not is_ragged(noise):
+                    s = (noise.shape[0], noise.shape[1], 1, 1)
+                    if len(noise.shape) == 5:
+                        # if we have a 5d tensor, then we need to do it on a per batch item, per channel basis, per frame
+                        s = (noise.shape[0], noise.shape[1], noise.shape[2], 1, 1)
                 
                 noise = noise * noise_multiplier
                 

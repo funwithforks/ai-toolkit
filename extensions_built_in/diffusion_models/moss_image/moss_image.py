@@ -556,9 +556,15 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
                 bidx.repeat_interleave(counts),             # text stream
             ))
             model_input = latent_model_input.to(device, dtype)
-            return self.transformer(
+            pred = self.transformer(
                 model_input.items if ragged else model_input, t, embeds_list
             )
+            if ragged:
+                # the DiT returns per-sample tensors; carry them as the same
+                # container so the loss and the target stay aligned per item
+                from toolkit.ragged import RaggedBatch
+                return RaggedBatch(list(pred))
+            return pred
         if ragged:
             # A multi-sample ragged batch cannot use the dense fallback: it
             # stacks the samples into one rectangle, which is exactly what a
