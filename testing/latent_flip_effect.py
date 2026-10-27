@@ -29,7 +29,6 @@ import torch
 from PIL import Image, ImageDraw
 import torchvision.transforms.functional as TF
 
-from toolkit.buckets import get_bucket_for_image_size
 from toolkit.config_modules import ModelConfig
 from toolkit.util.get_model import get_model_class
 
@@ -38,6 +37,15 @@ MODES = {
     'flipy': [-2],  # mirror the latent grid vertically
     'both': [-1, -2],
 }
+
+
+def scaled_grid_size(w, h, area, div):
+    # px-area override that may UPSCALE (the shared bucket helper never
+    # enlarges, being training geometry): scale to area, round to grid
+    scaler = (area / (w * h)) ** 0.5
+    w2 = max(div, int(round(w * scaler / div)) * div)
+    h2 = max(div, int(round(h * scaler / div)) * div)
+    return h2, w2
 
 
 def to_pil(t):
@@ -58,9 +66,13 @@ def main():
                     help='override the model location (default: the arch '
                          'resolver finds the shared VAE)')
     ap.add_argument('--res', type=int, default=512,
-                    help='bucket area side in px (input is resized to the '
-                         'model-grid bucket); 0 keeps native size, floored '
-                         'to the latent grid. Smaller = coarser bands')
+                    help='pixel-area override: encode at an area of '
+                         'res*res px instead of the model\'s usual training '
+                         'bucket (input is resized to the model-grid bucket '
+                         'of that area). 0 = keep the input size, floored to '
+                         'the latent grid. Every latent cell spans 16 px, so '
+                         'smaller res = coarser illusion bands. Any input '
+                         'size/aspect works')
     ap.add_argument('--modes', nargs='+', choices=list(MODES),
                     default=['flipx', 'flipy'],
                     help='which latent mirror(s) to render')
@@ -112,8 +124,7 @@ def main():
         img = Image.open(path).convert('RGB')
         w, h = img.size
         if args.res > 0:
-            b = get_bucket_for_image_size(w, h, args.res, div)
-            size = (b['height'], b['width'])
+            size = scaled_grid_size(w, h, args.res * args.res, div)
         else:
             size = (h // div * div or div, w // div * div or div)
         x = TF.resize(TF.to_tensor(img), size, antialias=True).cuda() * 2 - 1
