@@ -473,22 +473,28 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         mod = self.shared_block_modulation(time.to(dtype)).view(times.shape[0], 6, -1)
         return mod, time
 
-    def _packed_ctx(self, batch, num_image, lengths, device):
+    def _packed_ctx(self, batch, img_counts, lengths, device):
         """Packed-stream layout for t2i: each sample's rows are
-        [image | its live text rows], batch-major. The lengths are python
-        ints (the ragged cache shapes the caller already holds), so the
-        whole context builds CPU-side with zero GPU syncs (audit
+        [image | its live text rows], batch-major. img_counts and lengths are
+        per-sample python int lists. Uniform batches (the shipped path) pass a
+        constant img_counts list; that yields EXACTLY the tables the old scalar
+        num_image built -- the ragged parity test asserts this bit-for-bit, so
+        the two regimes are one mechanism, not a fork. Ragged batches let the
+        image and text token counts differ per item. All ints, so the whole
+        context builds CPU-side with zero GPU syncs (audit
         MOSS_PACKED_AUDIT.md:42-44)."""
-        counts = torch.tensor([num_image + n for n in lengths])
+        counts = torch.tensor([n_img + n for n_img, n in zip(img_counts, lengths)])
         starts = counts.cumsum(0) - counts
         text_counts = torch.tensor(lengths)
+        img_counts_t = torch.tensor(img_counts, dtype=torch.int32)
         img_sel = torch.cat(
-            [torch.arange(s, s + num_image) for s in starts.tolist()]
+            [torch.arange(s, s + n_img)
+             for s, n_img in zip(starts.tolist(), img_counts)]
         ).to(device)
         txt_sel = torch.cat(
             [
-                torch.arange(s + num_image, s + num_image + n)
-                for s, n in zip(starts.tolist(), lengths)
+                torch.arange(s + n_img, s + n_img + n)
+                for s, n_img, n in zip(starts.tolist(), img_counts, lengths)
             ]
         ).to(device)
         rows = torch.arange(batch, device=device)
@@ -504,9 +510,11 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
             "img_sel": img_sel,
             "txt_sel": txt_sel,
             "row_sample": rows.repeat_interleave(counts.to(device)),
-            # the image block is batch-major and uniform: the head reads it
-            # as a plain (B, num_image, D) view, no gather needed
-            "img_sample": rows.repeat_interleave(num_image),
+            # per-sample image token counts: the ragged head splits the
+            # batch-major image rows with these (uniform: a constant list,
+            # equivalent to the plain (B, num_image, D) view)
+            "img_counts": img_counts,
+            "img_sample": rows.repeat_interleave(img_counts_t.to(device)),
             "total": int(counts.sum()),
             "lengths_f": text_counts.to(device, dtype=torch.float32),
             "text_total": int(text_counts.sum()),
@@ -522,13 +530,21 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         row is observable anywhere (audit MOSS_PACKED_AUDIT.md:34-41).
         Coordinate RoPE and the AdaLN tables follow the rows; the output
         head is the same affine as the dense path, applied on the b-major
-        (B, num_image, D) image view."""
+        (B, num_image, D) image view.
+
+        ``hidden_states`` given as a per-sample list of (C, h_i, w_i) tensors
+        routes to :meth:`_forward_packed_ragged` (variable-shape batches).
+        The tensor path below is the shipped uniform behaviour, unchanged."""
+        if isinstance(hidden_states, (list, tuple)):
+            return self._forward_packed_ragged(
+                list(hidden_states), timestep, embeds_list
+            )
         batch, _, height, width = hidden_states.shape
         num_image = height * width
         device = hidden_states.device
         dtype = self.dtype
         lengths = [int(e.shape[0]) for e in embeds_list]
-        ctx = self._packed_ctx(batch, num_image, lengths, device)
+        ctx = self._packed_ctx(batch, [num_image] * batch, lengths, device)
 
         times = torch.as_tensor(timestep, device=device, dtype=torch.float32)
         times = times.reshape(-1).expand(batch)
@@ -577,6 +593,101 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         out = out * (1 + head[:, 1, None]) + head[:, 0, None]
         out = self.final_linear_video(out)
         return out.transpose(1, 2).reshape(batch, -1, height, width)
+
+    def _forward_packed_ragged(self, lat_list, timestep, embeds_list):
+        """Variable-shape packed t2i: per-sample (C, h_i, w_i) image latents
+        and (L_i, text_dim) prompt states, packed into ONE live-row stream
+        (b-major [image_i | text_i] per sample) with flash-varlen attention
+        and coordinate RoPE -- no bucketing, no padding, no crop.
+
+        Identical mechanism to :meth:`_forward_packed` with per-sample image
+        counts: `_packed_ctx`, the coord/AdaLN tables and every block are the
+        same code. With all shapes equal it reproduces the uniform path bit
+        for bit (asserted by ragged parity). The head is applied per sample
+        (each segment keeps its own (C, h_i, w_i)); returns a per-sample list,
+        so downstream must handle the ragged container -- only reached when
+        the batch is ragged.
+
+        CFG constraint: input order must stay batch-major -- the published
+        multiplier rows and ctx cu/row_sample maps are b-major, so the
+        cond/uncond doubling in BaseModel.predict_noise (cat([x] * 2, dim=0))
+        must stay b-major to stay compatible (owner-approved invariant)."""
+        batch = len(lat_list)
+        if batch != len(embeds_list):
+            raise ValueError(
+                f"ragged forward: {batch} latent items vs {len(embeds_list)} "
+                "prompt items -- batch-major pairing would be ambiguous"
+            )
+        device = lat_list[0].device
+        dtype = self.dtype
+        shapes = [(int(t.shape[-2]), int(t.shape[-1])) for t in lat_list]
+        img_counts = [h * w for h, w in shapes]
+        lengths = [int(e.shape[0]) for e in embeds_list]
+        ctx = self._packed_ctx(batch, img_counts, lengths, device)
+
+        times = torch.as_tensor(timestep, device=device, dtype=torch.float32)
+        times = times.reshape(-1).expand(batch)
+        mod, time = self._time_modulation(times, dtype)
+        head = self.video_head_modulation(time.to(dtype)).view(batch, 2, -1)
+
+        # per-token coordinates: the same _image_coords grid the uniform path
+        # builds, once per sample at ITS OWN (h_i, w_i), concatenated b-major
+        # (torch.cat over per-sample grids == .repeat(batch) when shapes match)
+        image = torch.cat(
+            [self._image_coords(0, 0, h, w, device) for h, w in shapes], 0
+        )
+        image[:, 1] = ctx["lengths_f"].repeat_interleave(
+            torch.tensor(img_counts, device=device)
+        )
+        coords = torch.zeros(ctx["total"], 4, device=device)
+        coords[ctx["img_sel"]] = image
+        text_within = (torch.arange(
+            ctx["text_total"], device=device
+        ) - ctx["cu_text"][:-1].repeat_interleave(
+            ctx["cu_text"][1:] - ctx["cu_text"][:-1]
+        )).float()
+        coords[ctx["txt_sel"], 1] = text_within
+        rope = self._rope_from_coords(coords).to(dtype)
+
+        video = self.video_embedder(
+            torch.cat(
+                [t.reshape(t.shape[0], -1).transpose(0, 1) for t in lat_list], 0
+            ).to(device, dtype)
+        )
+        text = self.text_embedder.proj(
+            torch.cat([e.to(device, dtype) for e in embeds_list], 0)
+        )
+        text_rope = rope[ctx["txt_sel"]]
+        for block in self.text_embedder.blocks:
+            text = self._ckpt(
+                block, text, text_rope, None, pack=(ctx["cu_text"], ctx["max_text"])
+            )
+
+        x = torch.zeros(ctx["total"], self.params.dim, device=device, dtype=dtype)
+        x[ctx["img_sel"]] = video
+        x[ctx["txt_sel"]] = text
+        pack = (ctx["row_sample"], ctx["cu"], ctx["max_len"])
+        for i, layer in enumerate(self.layers):
+            if self._gc_keep_plain(i):
+                x = layer(x, rope, mod, None, pack=pack)
+            else:
+                x = self._ckpt(layer, x, rope, mod, None, pack=pack)
+
+        # head: the same per-row affine as the uniform path, applied to each
+        # sample's own segment of the b-major image rows (uniform: those
+        # segments are equal-length, which is what the .view() read assumes)
+        img_rows = x[ctx["img_sel"]]
+        channels = self.params.latent_channels
+        outs = []
+        offset = 0
+        for i, ((h, w), n) in enumerate(zip(shapes, img_counts)):
+            seg = img_rows[offset:offset + n]
+            offset += n
+            seg = self.final_norm_video(seg)
+            seg = seg * (1 + head[i, 1]) + head[i, 0]
+            seg = self.final_linear_video(seg)
+            outs.append(seg.transpose(0, 1).reshape(channels, h, w))
+        return outs
 
     def forward(
         self,
