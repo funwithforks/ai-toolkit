@@ -196,14 +196,27 @@ class Bucket:
 class BucketsMixin:
     def __init__(self):
         self.buckets: Dict[str, Bucket] = {}
-        self.batch_indices: List[List[int]] = []
+        # each batch is a list of (file_idx, flip_x, flip_y) slots
+        self.batch_indices: List[List[tuple]] = []
 
     def build_batch_indices(self: 'AiToolkitDataset'):
+        # bucket.file_list_idx holds UNIQUE file indices. Repeats and flip
+        # variants are expanded into (file_idx, flip_x, flip_y) slots here --
+        # the expansion the old code performed by copying DTOs. Slots are
+        # shuffled after expansion so the variants of one file scatter across
+        # batches the way the old expanded-then-shuffled lists did.
+        repeats = max(1, int(self.dataset_config.num_repeats))
+        variants = self._slot_variants()
         self.batch_indices = []
         for key, bucket in self.buckets.items():
-            for start_idx in range(0, len(bucket.file_list_idx), self.batch_size):
-                end_idx = min(start_idx + self.batch_size, len(bucket.file_list_idx))
-                batch = bucket.file_list_idx[start_idx:end_idx]
+            slots = []
+            for file_idx in bucket.file_list_idx:
+                for _ in range(repeats):
+                    slots.extend((file_idx, fx, fy) for fx, fy in variants)
+            random.shuffle(slots)
+            for start_idx in range(0, len(slots), self.batch_size):
+                end_idx = min(start_idx + self.batch_size, len(slots))
+                batch = slots[start_idx:end_idx]
                 # if the bucket has fewer items left than the requested batch size,
                 # duplicate items from this batch to pad it up to batch_size
                 if len(batch) < self.batch_size and len(batch) > 0:
@@ -1995,6 +2008,10 @@ class LatentCachingFileItemDTOMixin:
         self._cached_waveform_sample_rate: Union[int, None] = None
         self._latent_path: Union[str, None] = None
         self.is_latent_cached = False
+        # guards the slot-layer flip in get_latent: the same per-fetch copy
+        # is queried twice (load_and_process_image and DataLoaderBatchDTO),
+        # and the flip must apply once
+        self._latent_flip_applied = False
         self.is_caching_to_disk = False
         self.is_caching_to_memory = False
         self.latent_load_device = 'cpu'
@@ -2113,9 +2130,11 @@ class LatentCachingFileItemDTOMixin:
             if 'waveform' in state_dict:
                 self._cached_waveform_int16 = state_dict['waveform']
                 self._cached_waveform_sample_rate = int(state_dict['waveform_sample_rate'].item())
+        tensor_rebuilt_from_cache = False
         if self._cached_tensor_uint8 is not None and getattr(self, 'tensor', None) is None:
             # rebuild the pixel tensor as it would be if loaded without caching
             self.tensor = _latent_from_uint8(self._cached_tensor_uint8)
+            tensor_rebuilt_from_cache = True
         if self._cached_waveform_int16 is not None and self.audio_data is None:
             # rebuild the audio waveform as it would be if loaded without caching
             waveform = _waveform_from_int16(self._cached_waveform_int16)
@@ -2124,6 +2143,36 @@ class LatentCachingFileItemDTOMixin:
             if self.is_audio_model:
                 # audio-only models use the waveform as the main tensor
                 self.tensor = waveform
+        if (
+                not self._latent_flip_applied
+                and (self.flip_x or self.flip_y)
+                and not self.is_audio_model
+        ):
+            # Slot-layer flip variant. _get_single_item set these flags on the
+            # per-fetch copy before it loaded; the latent cache now holds ONE
+            # unflipped latent per file, so the flip is applied to the copy's
+            # loaded tensors here. The live path flips pixels pre-encode;
+            # flip-after-encode differs at border pixels (conv padding/bias),
+            # the same accepted divergence class as crop edges. Everything
+            # downstream reads these per-fetch copies, then batch.cleanup()
+            # drops them, so the shared base DTO stays unflipped.
+            self._latent_flip_applied = True
+            if self.flip_x:
+                self._encoded_latent = torch.flip(self._encoded_latent, [-1])
+                if self._cached_first_frame_latent is not None:
+                    self._cached_first_frame_latent = torch.flip(
+                        self._cached_first_frame_latent, [-1]
+                    )
+                if tensor_rebuilt_from_cache:
+                    self.tensor = torch.flip(self.tensor, [-1])
+            if self.flip_y:
+                self._encoded_latent = torch.flip(self._encoded_latent, [-2])
+                if self._cached_first_frame_latent is not None:
+                    self._cached_first_frame_latent = torch.flip(
+                        self._cached_first_frame_latent, [-2]
+                    )
+                if tensor_rebuilt_from_cache:
+                    self.tensor = torch.flip(self.tensor, [-2])
         return self._encoded_latent
 
 
@@ -2244,6 +2293,11 @@ class LatentCachingMixin:
                 if len(bucket.file_list_idx) == 0:
                     del self.buckets[key]
             self.build_batch_indices()
+        else:
+            # the non-bucket slot list indexes file_list; rebuild it after
+            # the indices moved (ordering is irrelevant -- the dataloader
+            # shuffles).
+            self._build_slot_list()
 
     def _cache_one_latent(
             self: 'AiToolkitDataset',
