@@ -1248,6 +1248,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             (tc.inverted_mask_prior, 'inverted_mask_prior'),
             (tc.match_noise_norm, 'match_noise_norm'),
             (tc.correct_pred_norm, 'correct_pred_norm'),
+            (tc.single_item_batching, 'single_item_batching'),
+            (tc.diff_output_preservation, 'diff_output_preservation'),
+            (tc.blank_prompt_preservation, 'blank_prompt_preservation'),
+            (tc.do_guidance_loss, 'do_guidance_loss'),
+            (getattr(self, 'adapter', None) is not None, 'adapter'),
             (tc.t0_loss_target, 't0_loss_target'),
             (tc.do_fft_loss, 'do_fft_loss'),
             (tc.do_differential_guidance, 'do_differential_guidance'),
@@ -1687,11 +1692,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if noisy_latent_multiplier != 1.0:
                 noisy_latents = noisy_latents * noisy_latent_multiplier
 
-            # remove grads for these
-            noisy_latents.requires_grad = False
-            noisy_latents = noisy_latents.detach()
-            noise.requires_grad = False
-            noise = noise.detach()
+            # remove grads for these. Per-item detach is the identical
+            # operation on a ragged batch: its items never share a graph
+            # node, so there is no batch-level flag to clear.
+            if is_ragged(noisy_latents):
+                noisy_latents = noisy_latents.detach()
+                noise = noise.detach()
+            else:
+                noisy_latents.requires_grad = False
+                noisy_latents = noisy_latents.detach()
+                noise.requires_grad = False
+                noise = noise.detach()
 
         return noisy_latents, noise, timesteps, conditioned_prompts, imgs
 
