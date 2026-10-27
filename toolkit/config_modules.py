@@ -991,6 +991,18 @@ class DatasetConfig:
         self.scale: float = kwargs.get('scale', 1.0)
         self.buckets: bool = kwargs.get('buckets', True)
         self.bucket_tolerance: int = kwargs.get('bucket_tolerance', 64)
+        # Ragged batching: keep each image's native aspect ratio within one
+        # area budget and let the packed DiT carry the differing shapes,
+        # instead of grouping aspect ratios into fixed-shape buckets. Opt-in;
+        # default off leaves the bucket path exactly as shipped.
+        self.ragged_batches: bool = kwargs.get('ragged_batches', False)
+        # How far below the dataset's largest image area a sample may fall and
+        # still join a ragged batch. Keeps one batch's token total near the
+        # anchor so batch_size keeps meaning what it means. Outliers are
+        # skipped with a printed summary, never silently trained at a
+        # different token cost.
+        self.ragged_area_tolerance: float = float(
+            kwargs.get('ragged_area_tolerance', 0.1))
         self.is_reg: bool = kwargs.get('is_reg', False)
         self.prior_reg: bool = kwargs.get('prior_reg', False)
         self.network_weight: float = float(kwargs.get('network_weight', 1.0))

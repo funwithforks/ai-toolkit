@@ -17,6 +17,7 @@ from tqdm import tqdm
 from torchvision.transforms import Resize, transforms
 
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
+from toolkit.ragged import RaggedBatch, is_ragged
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.ip_adapter import IPAdapter
@@ -959,6 +960,27 @@ class BaseModel:
             timesteps: torch.IntTensor,
             **kwargs,
     ) -> torch.FloatTensor:
+        if is_ragged(original_samples):
+            # Same per-sample scheduler call as the chunk loop below, in the
+            # same order -- order is load-bearing, the packed row maps are
+            # indexed by position. Only the final concat is impossible: the
+            # items have no shared shape to concat into.
+            if not is_ragged(noise):
+                raise ValueError(
+                    "add_noise: ragged latents with a stacked noise tensor -- "
+                    "one of the two branches missed the ragged case")
+            noisy_chunks = []
+            for idx in range(len(original_samples)):
+                if hasattr(self.noise_scheduler, '_step_index'):
+                    self.noise_scheduler._step_index = None
+                noisy = self.noise_scheduler.add_noise(
+                    original_samples[idx].unsqueeze(0),
+                    noise[idx].unsqueeze(0),
+                    timesteps[idx:idx + 1],
+                )
+                noisy_chunks.append(noisy.squeeze(0))
+            return RaggedBatch(noisy_chunks)
+
         original_samples_chunks = torch.chunk(
             original_samples, original_samples.shape[0], dim=0)
         noise_chunks = torch.chunk(noise, noise.shape[0], dim=0)
@@ -1080,6 +1102,16 @@ class BaseModel:
         def scale_model_input(model_input, timestep_tensor):
             if is_input_scaled:
                 return model_input
+            if is_ragged(model_input):
+                # same per-sample call, same order; no concat at the end
+                scaled = []
+                for idx in range(len(model_input)):
+                    if hasattr(self.noise_scheduler, '_step_index'):
+                        self.noise_scheduler._step_index = None
+                    scaled.append(self.noise_scheduler.scale_model_input(
+                        model_input[idx].unsqueeze(0),
+                        timestep_tensor[idx:idx + 1]).squeeze(0))
+                return RaggedBatch(scaled)
             mi_chunks = torch.chunk(model_input, model_input.shape[0], dim=0)
             timestep_chunks = torch.chunk(
                 timestep_tensor, timestep_tensor.shape[0], dim=0)
@@ -1097,6 +1129,16 @@ class BaseModel:
 
         with torch.no_grad():
             if do_classifier_free_guidance:
+                if is_ragged(latents):
+                    # Doubling has to keep the latents AND their per-sample
+                    # text rows batch-major in lockstep, and the packed row
+                    # maps are built from that order. Left unimplemented
+                    # rather than half-wired: see the ragged forward's note on
+                    # the batch-major invariant.
+                    raise NotImplementedError(
+                        "classifier-free guidance in training with a ragged "
+                        "batch is not implemented. Disable do_cfg / "
+                        "unconditional embeddings for ragged runs.")
                 # if we are doing classifier free guidance, need to double up
                 latent_model_input = torch.cat([latents] * 2, dim=0)
                 timestep = torch.cat([timestep] * 2)
