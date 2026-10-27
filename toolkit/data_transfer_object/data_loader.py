@@ -191,6 +191,12 @@ class FileItemDTO(
         self.crop_height: int = kwargs.get("crop_height", self.scale_to_height)
         self.flip_x: bool = kwargs.get("flip_x", False)
         self.flip_y: bool = kwargs.get("flip_x", False)
+        # mechanism selector for get_latent's tensor-view latent flip (see
+        # BaseModel.cache_latent_flip_is_view). In the default per-combo mode
+        # the DTO itself carries the variant and its cache entry is variant-
+        # native -- a view flip there would double-flip, so the block is gated
+        # on this flag.
+        self._latent_flip_is_view = bool(kwargs.get("latent_flip_is_view", False))
         self.augments: List[str] = self.dataset_config.augments
         self.loss_multiplier: float = self.dataset_config.loss_multiplier
 

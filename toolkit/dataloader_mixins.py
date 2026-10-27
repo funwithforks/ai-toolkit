@@ -2144,7 +2144,8 @@ class LatentCachingFileItemDTOMixin:
                 # audio-only models use the waveform as the main tensor
                 self.tensor = waveform
         if (
-                not self._latent_flip_applied
+                self._latent_flip_is_view
+                and not self._latent_flip_applied
                 and (self.flip_x or self.flip_y)
                 and not self.is_audio_model
         ):

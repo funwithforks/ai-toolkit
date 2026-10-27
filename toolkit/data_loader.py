@@ -418,6 +418,15 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         # (file_list index, flip_x, flip_y) per training slot; used by the
         # non-bucket fetch path, buckets use batch_indices (same tuples)
         self.slot_list: list = []
+        # flip mechanism selector (see BaseModel.cache_latent_flip_is_view):
+        # per-combo DTO copies with flip-keyed cache entries (default), or
+        # tensor-view flips of one shared cache entry (opt-in, verified
+        # models only). Read once; DTOs, the slot layer and the fetch copy
+        # path all follow it.
+        self._latent_flip_view = (
+            bool(getattr(sd, 'cache_latent_flip_is_view', False))
+            if sd is not None else False
+        )
 
         self.sd = sd
 
@@ -534,6 +543,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     sd=self.sd,
                     path=file,
                     is_audio_model=self.is_audio_model or (self.is_multimodal_llm and file.lower().endswith(tuple(audio_extensions))),
+                    latent_flip_is_view=self._latent_flip_view,
                     dataset_config=dataset_config,
                     dataloader_transforms=self.transform,
                     size_database=self.size_database,
@@ -574,16 +584,42 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             print_acc(f"  -  Found {len(self.file_list)} images")
             assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
 
-        # flip_x/flip_y variants are slots, not DTO copies (see the num_repeats
-        # note above): _get_single_item sets the variant flags on the per-fetch
-        # copy before it loads, so the caches hold one latent/embedding per
-        # file while every flip combo still gets its training slots.
         if self.dataset_config.flip_x or self.dataset_config.flip_y:
-            print_acc(
-                f"  -  flip variants handled at slot layer "
-                f"(flip_x={self.dataset_config.flip_x}, "
-                f"flip_y={self.dataset_config.flip_y})"
-            )
+            if self._latent_flip_view:
+                # the model's encoder commutes with flips (verified): slots
+                # carry the variant, the cache keeps one entry per file.
+                print_acc(
+                    f"  -  flip variants handled at slot layer "
+                    f"(flip_x={self.dataset_config.flip_x}, "
+                    f"flip_y={self.dataset_config.flip_y})"
+                )
+            else:
+                # Canonical mechanism (default): one DTO copy per flip combo,
+                # so the phase-1 cache pass encodes FLIPPED PIXELS once per
+                # combo and writes separate flip-keyed entries (the flags are
+                # cache-key components). Repeats stay slot-level -- only the
+                # variant axis is materialized here. A tensor flip of the
+                # cached latent is only valid for flip-equivariant encoders
+                # (BaseModel.cache_latent_flip_is_view).
+                print_acc(
+                    f"  -  flip variants materialized as per-combo DTO copies "
+                    f"(cache_latent_flip_is_view=False; "
+                    f"flip_x={self.dataset_config.flip_x}, "
+                    f"flip_y={self.dataset_config.flip_y})"
+                )
+                if self.dataset_config.flip_x:
+                    for file_item in [x for x in self.file_list]:
+                        # copy of every current entry (base only at this point)
+                        new_file_item = copy.deepcopy(file_item)
+                        new_file_item.flip_x = True
+                        self.file_list.append(new_file_item)
+                if self.dataset_config.flip_y:
+                    # iterates base + x copies -> adds y and x+y combos, the
+                    # old multiplicities exactly
+                    for file_item in [x for x in self.file_list]:
+                        new_file_item = copy.deepcopy(file_item)
+                        new_file_item.flip_y = True
+                        self.file_list.append(new_file_item)
 
         self._build_slot_list()
 
@@ -626,6 +662,10 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         return len(self.slot_list)
 
     def _slot_variants(self):
+        if not self._latent_flip_view:
+            # flip combos are DTO copies in file_list with flip-keyed cache
+            # entries; the only remaining slot axis is repeats.
+            return [(False, False)]
         # flip combos each file gets per repeat. Same multiplicity as the old
         # DTO copies: (none, x) for flip_x, (none, y) for flip_y, crossed.
         flip_x = [False, True] if self.dataset_config.flip_x else [False]
