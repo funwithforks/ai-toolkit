@@ -393,6 +393,18 @@ class BaseModel:
 
     staged_sampling = False
 
+    # How flip_x/flip_y datasets interact with latent caching.
+    # False (default): one DTO per flip combo; the phase-1 cache pass encodes
+    # FLIPPED PIXELS per combo and writes separate entries (the flip flags are
+    # latent-cache-key components). This is the pre-slot mechanism, correct for
+    # every encoder. True: ONE unflipped entry per file and the cached latent
+    # is flipped as a tensor view at fetch -- valid only when the encoder
+    # commutes with flips (pure-conv + per-channel affine). Measured NOT to
+    # hold for the packed/BN AEs (rel L2 ~0.77 between flip-view and the
+    # latent of flipped pixels). Models opt in per model only after a live
+    # A/B (decode(view-flip(latent)) vs decode(latent of flipped pixels)).
+    cache_latent_flip_is_view = False
+
     def decode_sample_payload(self, payload):
         # staged_sampling models: turn one payload returned by
         # generate_single_image back into the image object the savers expect.
