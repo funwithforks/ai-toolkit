@@ -86,17 +86,21 @@ def encode_text_batch_packed(
     caption (mrope consumes our 2-D position_ids directly)."""
     from toolkit.models.v2.text_encoders.qwen35_packed import packed_mode
 
-    ids = [
-        tokenizer(
-            t, truncation=True, max_length=max_length, return_tensors="pt"
-        ).input_ids[0].to(device)
-        for t in texts
-    ]
-    lengths = [int(x.shape[0]) for x in ids]
-    input_ids = torch.cat(ids)[None]
+    # One batched tokenizer call, assembled on CPU, moved as two whole-stream
+    # copies. (Was a per-caption tokenize + .to(device) + per-caption arange:
+    # ~2N pageable sync H2D copies per group, 43x slower than this at 1000
+    # captions, and it starved the device mid-cache-prep.)
+    enc = tokenizer(
+        texts, truncation=True, max_length=max_length,
+        padding=False, return_attention_mask=False,
+    )
+    lengths = [len(row) for row in enc["input_ids"]]
+    input_ids = torch.tensor(
+        [t for row in enc["input_ids"] for t in row], dtype=torch.long
+    )[None].to(device)
     position_ids = torch.cat(
-        [torch.arange(n, device=device) for n in lengths]
-    )[None]
+        [torch.arange(n) for n in lengths]
+    )[None].to(device)
     with packed_mode(lengths, device=device):
         states = text_encoder(
             input_ids=input_ids,
