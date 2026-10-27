@@ -2066,6 +2066,31 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # ### phase 1: vae + dataset latent caching ###
 
+        # ragged batching cannot encode live: the live encode path stacks the
+        # batch pixels into one rectangle, which is exactly what ragged avoids.
+        # Latent caching is therefore a hard requirement of the mode, not a
+        # preference. Fail at the top of phase 1, before any gated component
+        # load, instead of at the first training batch (after the full
+        # startup, including the VAE load this configuration forces via
+        # vae_training_mode='keep'). The setting is never rewritten here: a
+        # dataset with caching disabled says so intentionally. The condition
+        # mirrors the process gate's definition of cached (see
+        # self.is_latents_cached in __init__); the collate-time check in
+        # DataLoaderBatchDTO stays as a backstop.
+        for ds_list in [self.datasets, self.datasets_reg]:
+            if ds_list is None:
+                continue
+            for ds in ds_list:
+                if getattr(ds, 'ragged_batches', False) and not (
+                        ds.cache_latents or ds.cache_latents_to_disk):
+                    raise ValueError(
+                        f"ragged_batches requires latent caching on dataset "
+                        f"{ds.folder_path}: set cache_latents_to_disk (or "
+                        f"cache_latents), or disable ragged_batches. Live "
+                        f"encoding stacks a batch into one rectangle, which "
+                        f"ragged batching cannot carry."
+                    )
+
         ### HOOK ###
         self.before_dataset_load()
         if getattr(self.sd, 'require_pixel_tensor_cache', False):
