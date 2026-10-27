@@ -337,9 +337,9 @@ class BucketsMixin:
 
         Areas stay within ragged_area_tolerance of the dataset's largest area
         so one batch's token total stays near the anchor and batch_size keeps
-        meaning what it means. Images outside the window are left out with a
-        printed count-and-area summary; they are never silently trained at a
-        different token cost.
+        meaning what it means. Images outside the window are removed from the
+        dataset (never trained, never cached) with a printed count-and-area
+        summary; they are never silently trained at a different token cost.
 
         Anything this path cannot carry raises here. Silently training
         something other than what the config asked for is the failure mode
@@ -395,6 +395,24 @@ class BucketsMixin:
                 f"ragged_batches: every image falls below area {floor:.0f} "
                 f"(anchor {anchor}); check ragged_area_tolerance and resolution")
 
+        if skipped:
+            # "not trained" must mean GONE from file_list, not just out of the
+            # batches: the latent/TE cache passes walk file_list, and a
+            # skipped file keeps its legacy native-sized geometry, which many
+            # models cannot even encode (e.g. a VAE that patch-packs latents
+            # 2x2 rejects a side not divisible by its grid). Removing here
+            # keeps every downstream count: trained == cached == warned.
+            dropped_idx = {c[0] for c in skipped}
+            remap = {}
+            new_file_list = []
+            for i, item in enumerate(self.file_list):
+                if i in dropped_idx:
+                    continue
+                remap[i] = len(new_file_list)
+                new_file_list.append(item)
+            self.file_list = new_file_list
+            kept = [(remap[i], w, h, a) for (i, w, h, a) in kept]
+
         for idx, bw, bh, _area in kept:
             file_item = self.file_list[idx]
             # crop rect == scaled size at the origin: an identity crop
@@ -419,10 +437,11 @@ class BucketsMixin:
         if skipped:
             sa = [a for _, _, _, a in skipped]
             print_acc(
-                f'[ragged] WARNING: {len(skipped)} images skipped, area below '
-                f'{floor:.0f} (range {min(sa)}-{max(sa)} vs anchor {anchor}). '
-                f'They are NOT trained. Raise ragged_area_tolerance or resize '
-                f'them to the area budget.')
+                f'[ragged] WARNING: {len(skipped)} images removed from the '
+                f'dataset, area below {floor:.0f} (range {min(sa)}-{max(sa)} '
+                f'vs anchor {anchor}). They are NOT trained and NOT cached. '
+                f'Raise ragged_area_tolerance or resize them to the area '
+                f'budget.')
 
 
 class CaptionProcessingDTOMixin:
