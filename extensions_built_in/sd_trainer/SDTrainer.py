@@ -818,18 +818,32 @@ class SDTrainer(BaseSDTrainProcess):
             raise NotImplementedError(
                 "prior loss (prior_reg / inverted_mask_prior) is not "
                 "implemented for ragged batches")
+        if getattr(self, 'assistant_adapter', None) is not None:
+            raise NotImplementedError(
+                "assistant adapters run the batch through one rectangle; not "
+                "implemented for ragged batches")
         if tc.do_differential_guidance:
             raise NotImplementedError(
                 "do_differential_guidance is not implemented for ragged batches")
         if getattr(batch, 'dopsd_prompt_embeds', None) is not None:
             raise NotImplementedError(
                 "D-OPSD teacher passes are not implemented for ragged batches")
-        if isinstance(mask_multiplier, torch.Tensor) or (
-                isinstance(mask_multiplier, (int, float))
-                and float(mask_multiplier) != 1.0):
-            raise NotImplementedError(
-                "ragged loss supports an unweighted batch only: a per-element "
-                "mask has no shared shape to apply to")
+        # mask_multiplier arrives as the trainer's (B,1,1,1) tensor (ones when
+        # the batch is unmasked -- real mask tensors are refused before here).
+        # It is constant per sample, so multiplying the per-sample means is
+        # EXACTLY the stacked path's pre-reduction per-element multiply.
+        mask_mult = mask_multiplier
+        if isinstance(mask_mult, torch.Tensor):
+            if mask_mult.numel() == 1:
+                mask_mult = float(mask_mult.reshape(-1)[0])
+            elif mask_mult.numel() == len(noise_pred):
+                mask_mult = mask_mult.reshape(-1)  # applied after stacking
+            else:
+                raise NotImplementedError(
+                    "ragged loss: mask_multiplier carries more values than "
+                    f"samples ({mask_mult.numel()} for {len(noise_pred)} "
+                    "samples) -- that is a per-element mask, which has no "
+                    "shared shape across a ragged batch")
         if tc.loss_type not in ('mse', 'mae'):
             raise NotImplementedError(
                 f"ragged loss does not implement loss_type={tc.loss_type}")
@@ -856,6 +870,10 @@ class SDTrainer(BaseSDTrainProcess):
                 per_sample.append(F.mse_loss(
                     pred_i.float(), target_i.float(), reduction='none').mean())
         loss = torch.stack(per_sample)
+        # per-sample mask/reg weight (see normalization above the stack):
+        # constant across each sample's elements, so applying it to the means
+        # matches the stacked path's pre-reduction per-element multiply
+        loss = loss * mask_mult
 
         # a timestep weight is constant across a sample's elements, so scaling
         # the per-sample mean is exactly what scaling the per-element loss did
@@ -1878,7 +1896,11 @@ class SDTrainer(BaseSDTrainProcess):
             self.timer.stop('preprocess_batch')
 
             is_reg = False
-            loss_multiplier = torch.ones((noisy_latents.shape[0], 1, 1, 1), device=self.device_torch, dtype=dtype)
+            # per-sample count, ragged-safe: this tensor is only ever consumed
+            # as a whole (loss_multiplier.mean()), so a ragged batch needs the
+            # same construction -- only the count cannot come from .shape[0]
+            b_count = len(noisy_latents) if is_ragged(noisy_latents) else noisy_latents.shape[0]
+            loss_multiplier = torch.ones((b_count, 1, 1, 1), device=self.device_torch, dtype=dtype)
             for idx, file_item in enumerate(batch.file_items):
                 if file_item.is_reg:
                     loss_multiplier[idx] = loss_multiplier[idx] * self.train_config.reg_weight
@@ -1907,7 +1929,7 @@ class SDTrainer(BaseSDTrainProcess):
                     if batch.clip_image_tensor is not None:
                         clip_images = batch.clip_image_tensor.to(self.device_torch, dtype=dtype).detach()
 
-            mask_multiplier = torch.ones((noisy_latents.shape[0], 1, 1, 1), device=self.device_torch, dtype=dtype)
+            mask_multiplier = torch.ones((b_count, 1, 1, 1), device=self.device_torch, dtype=dtype)
             if batch.mask_tensor is not None and self.sd.do_masked_loss:
                 with self.timer('get_mask_multiplier'):
                     # upsampling no supported for bfloat16

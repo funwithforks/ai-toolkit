@@ -1058,9 +1058,12 @@ class BaseModel:
                 te_batch_size = text_embeddings.text_embeds[0].shape[0]
         else:
             te_batch_size = text_embeddings.text_embeds.shape[0]
-        if latents.shape[0] == te_batch_size:
+        # batch size of the latents. A ragged batch has no .shape, and its
+        # batch size is simply the item count.
+        lat_bsz = len(latents) if is_ragged(latents) else latents.shape[0]
+        if lat_bsz == te_batch_size:
             do_classifier_free_guidance = False
-        elif latents.shape[0] * 2 != te_batch_size:
+        elif lat_bsz * 2 != te_batch_size:
             raise ValueError(
                 "Batch size of latents must be the same or half the batch size of text embeddings")
         latents = latents.to(self.device_torch)
@@ -1072,12 +1075,12 @@ class BaseModel:
             timestep = timestep.unsqueeze(0)
 
         # if we only have 1 timestep, we can just use the same timestep for all
-        if timestep.shape[0] == 1 and latents.shape[0] > 1:
+        if timestep.shape[0] == 1 and lat_bsz > 1:
             # check if it is rank 1 or 2
             if len(timestep.shape) == 1:
-                timestep = timestep.repeat(latents.shape[0])
+                timestep = timestep.repeat(lat_bsz)
             else:
-                timestep = timestep.repeat(latents.shape[0], 0)
+                timestep = timestep.repeat(lat_bsz, 0)
 
         # handle t2i adapters
         if 'down_intrablock_additional_residuals' in kwargs:
