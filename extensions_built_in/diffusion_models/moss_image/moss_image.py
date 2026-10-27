@@ -61,6 +61,7 @@ from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
 from toolkit.network_mixins import set_multiplier_rows
+from toolkit.ragged import is_ragged
 from toolkit.models.phased_load import PhasedLoadMixin
 from toolkit.models.v2.resolver import resolve_comfy_file
 from toolkit.models.v2.vae.flux2_kl import AutoEncoder, convert_diffusers_state_dict
@@ -478,7 +479,19 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
         if self.model.device == torch.device("cpu"):
             self.model.to(device)
 
-        batch_size = latent_model_input.shape[0]
+        # A ragged batch (per-sample shapes, toolkit.ragged) reaches here only
+        # when the dataset opted into ragged batching. One sample needs no
+        # pack, so it degrades to the ordinary stacked path; a multi-sample
+        # ragged batch packs below. Anything else keeps the tensor path
+        # exactly as shipped.
+        ragged = is_ragged(latent_model_input)
+        if ragged and len(latent_model_input) == 1:
+            latent_model_input = latent_model_input[0].unsqueeze(0)
+            ragged = False
+        batch_size = (
+            latent_model_input.batch_size if ragged
+            else latent_model_input.shape[0]
+        )
         embeds_list = text_embeddings.text_embeds
         if len(embeds_list) == 1 and batch_size > 1:
             embeds_list = embeds_list * batch_size
@@ -524,18 +537,37 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
             # expand per row, picking the map matching their own input rows
             # (network_mixins.set_multiplier_rows -- a registry, because the
             # modules' network weakrefs may not match sd.network's instance).
-            num_image = int(latent_model_input.shape[-2]) * int(
-                latent_model_input.shape[-1]
-            )
+            if ragged:
+                # per-sample image token counts: the same table feeds the
+                # multiplier rows here and the packed layout in the DiT, so
+                # there is no single num_image to assume
+                img_rows = torch.tensor(
+                    latent_model_input.token_counts, device=device)
+            else:
+                num_image = int(latent_model_input.shape[-2]) * int(
+                    latent_model_input.shape[-1]
+                )
+                img_rows = torch.full(
+                    (batch_size,), num_image, device=device, dtype=torch.long)
             counts = torch.tensor([len(e) for e in embeds_list], device=device)
             bidx = torch.arange(batch_size, device=device)
             set_multiplier_rows((
-                bidx.repeat_interleave(counts + num_image),  # main stream
-                bidx.repeat_interleave(counts),              # text stream
+                bidx.repeat_interleave(counts + img_rows),  # main stream
+                bidx.repeat_interleave(counts),             # text stream
             ))
+            model_input = latent_model_input.to(device, dtype)
             return self.transformer(
-                latent_model_input.to(device, dtype), t, embeds_list
+                model_input.items if ragged else model_input, t, embeds_list
             )
+        if ragged:
+            # A multi-sample ragged batch cannot use the dense fallback: it
+            # stacks the samples into one rectangle, which is exactly what a
+            # ragged batch refuses to be. Fail here with the reason instead
+            # of letting torch raise inside the stack.
+            raise NotImplementedError(
+                "ragged (variable-shape) MOSS batches require the packed "
+                "flash-varlen path, which is disabled (MOSS_VARLEN_ATTN=0). "
+                "Unset MOSS_VARLEN_ATTN to train with ragged batches.")
         embeds, mask = stack_text_embeds(embeds_list, device, dtype)
         return self.transformer(
             latent_model_input.to(device, dtype), t, embeds, mask
