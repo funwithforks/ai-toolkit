@@ -415,6 +415,9 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.is_caching_clip_vision_to_disk = dataset_config.cache_clip_vision_to_disk
         self.is_generating_controls = len(dataset_config.controls) > 0
         self.epoch_num = 0
+        # (file_list index, flip_x, flip_y) per training slot; used by the
+        # non-bucket fetch path, buckets use batch_indices (same tuples)
+        self.slot_list: list = []
 
         self.sd = sd
 
@@ -459,9 +462,12 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         # remove items in the _controls_ folder
         file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
 
-        if self.dataset_config.num_repeats > 1:
-            # repeat the list
-            file_list = file_list * self.dataset_config.num_repeats
+        # num_repeats is NOT materialized into the file list anymore: one
+        # FileItemDTO is built per unique file and repeats (like flip
+        # variants below) are expanded at the slot layer --
+        # _build_slot_list/_slot_variants for the non-bucket path,
+        # build_batch_indices for buckets. Every cache pass and every skip
+        # gate now sees each source file exactly once.
 
         if self.dataset_config.standardize_images:
             if self.sd.is_xl or self.sd.is_vega or self.sd.is_ssd:
@@ -568,31 +574,18 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             print_acc(f"  -  Found {len(self.file_list)} images")
             assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
 
-        # handle x axis flips
-        if self.dataset_config.flip_x:
-            print_acc("  -  adding x axis flips")
-            current_file_list = [x for x in self.file_list]
-            for file_item in current_file_list:
-                # create a copy that is flipped on the x axis
-                new_file_item = copy.deepcopy(file_item)
-                new_file_item.flip_x = True
-                self.file_list.append(new_file_item)
-
-        # handle y axis flips
-        if self.dataset_config.flip_y:
-            print_acc("  -  adding y axis flips")
-            current_file_list = [x for x in self.file_list]
-            for file_item in current_file_list:
-                # create a copy that is flipped on the y axis
-                new_file_item = copy.deepcopy(file_item)
-                new_file_item.flip_y = True
-                self.file_list.append(new_file_item)
-
+        # flip_x/flip_y variants are slots, not DTO copies (see the num_repeats
+        # note above): _get_single_item sets the variant flags on the per-fetch
+        # copy before it loads, so the caches hold one latent/embedding per
+        # file while every flip combo still gets its training slots.
         if self.dataset_config.flip_x or self.dataset_config.flip_y:
-            if self.is_video:
-                print_acc(f"  -  Found {len(self.file_list)} videos after adding flips")
-            else:
-                print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
+            print_acc(
+                f"  -  flip variants handled at slot layer "
+                f"(flip_x={self.dataset_config.flip_x}, "
+                f"flip_y={self.dataset_config.flip_y})"
+            )
+
+        self._build_slot_list()
 
         self.setup_epoch()
 
@@ -630,7 +623,28 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
     def __len__(self):
         if self.dataset_config.buckets:
             return len(self.batch_indices)
-        return len(self.file_list)
+        return len(self.slot_list)
+
+    def _slot_variants(self):
+        # flip combos each file gets per repeat. Same multiplicity as the old
+        # DTO copies: (none, x) for flip_x, (none, y) for flip_y, crossed.
+        flip_x = [False, True] if self.dataset_config.flip_x else [False]
+        flip_y = [False, True] if self.dataset_config.flip_y else [False]
+        return [(fx, fy) for fx in flip_x for fy in flip_y]
+
+    def _build_slot_list(self):
+        # one entry per training slot (file index, flip_x, flip_y) for the
+        # non-bucket path; repeats x flip variants, matching the slot count
+        # the old multiplied file_list had. Buckets expand per bucket in
+        # build_batch_indices instead.
+        repeats = max(1, int(self.dataset_config.num_repeats))
+        variants = self._slot_variants()
+        self.slot_list = [
+            (i, fx, fy)
+            for i in range(len(self.file_list))
+            for _ in range(repeats)
+            for (fx, fy) in variants
+        ]
 
     def _get_replacement_index(self, index) -> int:
         # when an image fails to load we have to swap in a different one. With buckets the
@@ -645,7 +659,25 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         return random.randint(0, len(self.file_list) - 1)
 
     def _get_single_item(self, index, _attempts=0) -> 'FileItemDTO':
-        file_item: 'FileItemDTO' = copy.deepcopy(self.file_list[index])
+        # index is a slot tuple (file_idx, flip_x, flip_y); a bare int is the
+        # legacy form (plain file index, no variant applied).
+        if isinstance(index, tuple):
+            file_idx, flip_x, flip_y = index
+        else:
+            file_idx, flip_x, flip_y = index, None, None
+        file_item: 'FileItemDTO' = copy.deepcopy(self.file_list[file_idx])
+        if flip_x or flip_y:
+            # set the variant flags on the copy BEFORE it loads: the pixel
+            # path flips at load time, get_latent flips the cached latent,
+            # and the clip branch all read these flags. A clip-vision entry
+            # was cached for the unflipped base only, so the flipped copy
+            # drops the cached flag and serves the clip live through the
+            # processor, like a non-cached clip dataset always has.
+            file_item.flip_x = bool(flip_x)
+            file_item.flip_y = bool(flip_y)
+            if getattr(file_item, 'is_vision_clip_cached', False):
+                file_item.is_vision_clip_cached = False
+                file_item._clip_vision_embeddings_path = None
         try:
             file_item.load_and_process_image(self.transform)
         except Exception as e:
@@ -653,7 +685,11 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if _attempts >= 10:
                 # avoid infinite recursion if many files are corrupt
                 raise
-            new_index = self._get_replacement_index(index)
+            new_index = self._get_replacement_index(file_idx)
+            if isinstance(index, tuple):
+                return self._get_single_item(
+                    (new_index, flip_x, flip_y), _attempts=_attempts + 1
+                )
             return self._get_single_item(new_index, _attempts=_attempts + 1)
         file_item.load_caption(self.caption_dict)
         return file_item
@@ -669,8 +705,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             idx_list = self.batch_indices[item]
             return [self._get_single_item(idx) for idx in idx_list]
         else:
-            # Dataloader is batching
-            return self._get_single_item(item)
+            # Dataloader is batching. Map the global slot index to its slot.
+            return self._get_single_item(self.slot_list[item])
 
 
 def dto_collation(batch: List['FileItemDTO']):
