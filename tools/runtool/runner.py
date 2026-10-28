@@ -94,6 +94,8 @@ def _git(*args):
 def submit(suite_id, variant, overrides, note=""):
     suite = get_suite(suite_id)
     params = suite.validate(variant, overrides or {})
+    if suite.precheck is not None:
+        suite.precheck(params)  # reject here, not in a doomed launch
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     run_id = f"{stamp}_{suite.id}_{variant}"
     paths = _run_dir(run_id)

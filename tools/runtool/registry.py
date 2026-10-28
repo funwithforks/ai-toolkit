@@ -126,6 +126,11 @@ class Suite:
     # parse(paths: RunPaths, params: dict) -> metrics dict (must reproduce
     # result.json metrics from the record alone)
     parse: Callable = None
+    # precheck(params) -> None; runs in the SUBMIT process after validate,
+    # before anything launches. Raise ParamError to reject with teaching.
+    # The harness keeps its own copy of any check it guards -- precheck is
+    # for rejecting at the tool call, not for trusting the caller.
+    precheck: Callable = None
     done: str = "result.json"  # the contract value; validated below
     timeout_s: int = 3600
     desc: str = ""
