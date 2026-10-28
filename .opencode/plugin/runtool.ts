@@ -155,6 +155,46 @@ export default Plugin.define({
         execute: wrap(dir, (a) => ["status", str(a.run_id)]),
       })
       editor.add({
+        name: "runtool_inspect",
+        description:
+          "Diagnostic digest of a run — for when something looks strange and " +
+          "nobody predicted what to look for. Returns: ugly-line signals " +
+          "(traceback/OOM/NaN/Killed counts + last line), stall seconds for " +
+          "live runs, repeated-line spam, last events, marker positions, " +
+          "record sizes, and the raw log tails. tailLines chooses how much " +
+          "raw text (0 = whole file); grep runs YOUR regex over the full " +
+          "record with line numbers (context = surrounding lines); showConfig " +
+          "inlines the derived config. The sanctioned way to read a run's " +
+          "own logs — richer than shell grep and one call.",
+        input: {
+          type: "object",
+          properties: {
+            run_id: { type: "string" },
+            tail_lines: {
+              type: "number",
+              description: "tail lines per log; 0 or negative = whole file",
+            },
+            grep: { type: "string", description: "regex over full stdout+stderr" },
+            context: {
+              type: "number",
+              description: "surrounding lines per grep hit",
+            },
+            show_config: { type: "boolean" },
+          },
+          required: ["run_id"],
+          additionalProperties: false,
+        },
+        execute: wrap(dir, (a) => [
+          "inspect",
+          str(a.run_id),
+          ...(a.tail_lines != null ? ["--tail", String(a.tail_lines)] : []),
+          ...(typeof a.grep === "string" && a.grep
+            ? ["--grep", a.grep, "--context", String(a.context ?? 0)]
+            : []),
+          ...(a.show_config ? ["--show-config"] : []),
+        ]),
+      })
+      editor.add({
         name: "runtool_cancel",
         description: "Signal the recorded process group of a running run (TERM then KILL).",
         input: {

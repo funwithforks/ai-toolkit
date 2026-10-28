@@ -9,13 +9,17 @@
             --rm K [--delete-files]]
                               machine-local dataset registry; file
                               deletion only for tool-created rt_ folders
-      submit --suite S --variant V [--params JSON] [--expect JSON] [--note ...]
+  submit --suite S --variant V [--params JSON] [--expect JSON] [--note ...]
                               --expect declares the run's intent; the
                               verdict grades it at wait (markers/metrics)
   wait   RUN_ID [--timeout-s N]
                               returns status + metrics + markers + phases
                               + expect verdict (when one was declared)
   status RUN_ID
+  inspect RUN_ID [--tail N] [--grep RX] [--context C] [--show-config]
+                              diagnostic digest for strange runs: ugly-line
+                              signals, stall seconds, line spam, raw tails
+                              (0 = whole file), caller regex over the record
   cancel RUN_ID
   list   [--limit N]
   recompute RUN_ID
@@ -25,8 +29,8 @@ import argparse
 import json
 import sys
 
-from . import datasets, runner, schema
-from .registry import ParamError, registry
+from . import datasets, inspect, runner, schema
+from .registry import ParamError, RunPaths, get_suite, registry
 
 
 def main(argv=None):
@@ -80,6 +84,19 @@ def main(argv=None):
         p.add_argument("run_id")
         if name == "wait":
             p.add_argument("--timeout-s", type=float, default=None)
+
+    p = sub.add_parser("inspect")
+    p.add_argument("run_id")
+    p.add_argument("--tail", type=int, default=30,
+                   help="tail lines from each log; 0 or negative = whole "
+                        "file (uncapped)")
+    p.add_argument("--grep", default=None, metavar="REGEX",
+                   help="caller regex over full stdout+stderr, line-numbered")
+    p.add_argument("--context", type=int, default=0,
+                   help="surrounding lines per --grep hit")
+    p.add_argument("--show-config", action="store_true",
+                   help="inline the derived config (registered real dataset "
+                        "paths mechanically replaced by their keys)")
 
     p = sub.add_parser("list")
     p.add_argument("--limit", type=int, default=15)
@@ -147,6 +164,17 @@ def main(argv=None):
             res = runner.wait(a.run_id, timeout_s=a.timeout_s)
         elif a.op == "status":
             res = runner.classify(a.run_id)
+        elif a.op == "inspect":
+            res = runner.classify(a.run_id)
+            try:
+                suite = get_suite(res["suite"])
+            except ParamError:
+                suite = None
+            paths = RunPaths(run_id=res["run_id"], root=res["record"])
+            res.update(inspect.build(
+                paths, suite, res["alive"], tail_lines=a.tail,
+                grep_pattern=a.grep, grep_context=a.context,
+                show_config=a.show_config))
         elif a.op == "cancel":
             res = runner.cancel(a.run_id)
         elif a.op == "recompute":
