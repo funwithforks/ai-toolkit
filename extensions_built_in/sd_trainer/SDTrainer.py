@@ -92,12 +92,13 @@ class SDTrainer(BaseSDTrainProcess):
         self.unconditional_embeds = None
         
         if self.train_config.diff_output_preservation:
-            # datasets can have their own trigger words, the global one is copied to them if not set
-            has_dataset_trigger = any(
-                dataset.trigger_word is not None for dataset in self.dataset_configs
-            )
-            if self.trigger_word is None and not has_dataset_trigger:
-                raise ValueError("diff_output_preservation requires a trigger_word to be set")
+            # DOP identity comes from the captions, NOT from a required config
+            # trigger word (owner contract 2026-10-27): inline
+            # [trigger:X class:Y] tokens supply the pair per caption; a
+            # dataset/global trigger_word (when set) supplies it for captions
+            # without inline tokens. Items carrying neither already alias their
+            # normal embed for the class pass (the existing
+            # "trigger-not-in-caption" path), so nothing here needs a trigger.
             if self.network_config is None:
                 raise ValueError("diff_output_preservation requires a network to be set")
             if self.train_config.train_text_encoder:
