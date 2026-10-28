@@ -7,7 +7,7 @@ import math
 import os
 import random
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict, deque, namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, List, Dict, Union
 import traceback
@@ -499,6 +499,29 @@ def dop_prior_fallback_text(class_name):
     return class_name
 
 
+def dop_class_side_prompt(prompt, inline_pairs, trigger_word, class_name):
+    # Class-side conditioning for a DOP regularisation step, derived from the
+    # ALREADY-BUILT LIVE prompt (cached mode pre-encodes the pair and never
+    # comes here). load_caption's caption_dop is not reused: the live prompt
+    # carries per-step token ops (token dropout, shuffles), so the swap rides
+    # the live text (owner contract 2026-10-27). Inline [trigger:X class:Y]
+    # tokens were resolved to their triggers in the trained prompt -- swap
+    # those back to classes; config-trigger datasets then swap the config
+    # trigger for the preservation class.
+    if inline_pairs is not None:
+        for pair_trigger, pair_class in inline_pairs:
+            prompt = prompt.replace(pair_trigger, pair_class)
+    if trigger_word is not None:
+        prompt = prompt.replace(trigger_word, class_name)
+    return prompt
+
+
+# One row per text-embed variant an item can have (see
+# TextEmbeddingFileItemDTOMixin.get_embed_variants -- the single table the
+# phase-2 planner, the train-time reader, and the completeness gate share).
+EmbedVariant = namedtuple('EmbedVariant', 'name path caption dropout_plain self_ref')
+
+
 class CaptionProcessingDTOMixin:
     def __init__(self: 'FileItemDTO', *args, **kwargs):
         if hasattr(super(), '__init__'):
@@ -603,6 +626,51 @@ class CaptionProcessingDTOMixin:
         # the item is always the only reference in D-OPSD mode
         return "<Video 1>" if self.is_video else "<Picture 1>"
 
+    def _drop_caption_tokens(self: 'FileItemDTO', token_list):
+        # token-level dropout: the first keep_tokens tags always survive; the
+        # rest drop independently at token_dropout_rate (rate >= 1.0 drops
+        # every non-kept token).
+        keep_tokens: int = self.dataset_config.keep_tokens
+        rate = self.dataset_config.token_dropout_rate
+        kept = []
+        for idx, token in enumerate(token_list):
+            if idx < keep_tokens:
+                kept.append(token)
+            elif rate >= 1.0:
+                # drop the token
+                pass
+            else:
+                # get a random float form 0 to 1
+                rand = random.random()
+                if rand > rate:
+                    # keep the token
+                    kept.append(token)
+        return kept
+
+    def _apply_tag_token_ops(self: 'FileItemDTO', raw_caption, do_token_dropout):
+        # tag-style token ops (dropout / shuffle) split on commas; anything
+        # else keeps the text exactly as written (splitting and re-joining
+        # with ", " doubled the space after every comma in prose captions)
+        if not (do_token_dropout or self.dataset_config.shuffle_tokens):
+            return raw_caption
+        token_list = [t.strip() for t in raw_caption.split(',')]
+        if do_token_dropout:
+            token_list = self._drop_caption_tokens(token_list)
+        if self.dataset_config.shuffle_tokens:
+            random.shuffle(token_list)
+        return ', '.join(token_list)
+
+    def _append_random_triggers(self: 'FileItemDTO', caption):
+        # random_triggers datasets append a random sample of their trigger
+        # list as trailing tags (0..max, uniform)
+        num_triggers = self.dataset_config.random_triggers_max
+        if num_triggers > 1:
+            num_triggers = random.randint(0, num_triggers)
+        if num_triggers <= 0:
+            return caption
+        triggers = random.sample(self.dataset_config.random_triggers, num_triggers)
+        return caption + ', ' + ', '.join(triggers)
+
     def get_caption(
             self: 'FileItemDTO',
             trigger=None,
@@ -638,41 +706,13 @@ class CaptionProcessingDTOMixin:
                 self._caption_was_dropped = True
                 return ''
 
-        # tag-style token ops (dropout / shuffle) split on commas; anything else keeps the
-        # text exactly as written (splitting and re-joining with ", " doubled the space after
-        # every comma in prose captions)
         do_token_dropout = (
             self.dataset_config.token_dropout_rate > 0
             and not short_caption
             and not self.dataset_config.cache_text_embeddings
         )
-        token_list = None
-        if do_token_dropout or self.dataset_config.shuffle_tokens:
-            token_list = [t.strip() for t in raw_caption.split(',')]
+        caption = self._apply_tag_token_ops(raw_caption, do_token_dropout)
 
-        # handle token dropout
-        if do_token_dropout:
-            new_token_list = []
-            keep_tokens: int = self.dataset_config.keep_tokens
-            for idx, token in enumerate(token_list):
-                if idx < keep_tokens:
-                    new_token_list.append(token)
-                elif self.dataset_config.token_dropout_rate >= 1.0:
-                    # drop the token
-                    pass
-                else:
-                    # get a random float form 0 to 1
-                    rand = random.random()
-                    if rand > self.dataset_config.token_dropout_rate:
-                        # keep the token
-                        new_token_list.append(token)
-            token_list = new_token_list
-
-        if self.dataset_config.shuffle_tokens:
-            random.shuffle(token_list)
-
-        # join back together
-        caption = ', '.join(token_list) if token_list is not None else raw_caption
         if add_if_not_present and len(extract_inline_dop_pairs(caption)) > 0:
             # the inline [trigger:X class:Y] tokens bring their own trigger word.
             # do not auto-prepend the config trigger on top of them
@@ -680,26 +720,14 @@ class CaptionProcessingDTOMixin:
         caption = inject_trigger_into_prompt(caption, trigger, to_replace_list, add_if_not_present)
 
         if self.dataset_config.random_triggers:
-            num_triggers = self.dataset_config.random_triggers_max
-            if num_triggers > 1:
-                num_triggers = random.randint(0, num_triggers)
-
-            if num_triggers > 0:
-                triggers = random.sample(self.dataset_config.random_triggers, num_triggers)
-                caption = caption + ', ' + ', '.join(triggers)
-                # add random triggers
-                # for i in range(num_triggers):
-                #     # fastest method
-                #     trigger = self.dataset_config.random_triggers[int(random.random() * (len(self.dataset_config.random_triggers)))]
-                #     caption = caption + ', ' + trigger
+            caption = self._append_random_triggers(caption)
 
         if self.dataset_config.shuffle_tokens:
-            # shuffle again
+            # shuffle again (after injection so the trigger shuffles with the
+            # rest of the tags)
             token_list = [t.strip() for t in caption.split(',')]
             random.shuffle(token_list)
             caption = ', '.join(token_list)
-        if caption == '':
-            pass
         return caption
 
 class AudioProcessingDTOMixin:
@@ -2495,22 +2523,17 @@ class TextEmbeddingFileItemDTOMixin:
         if hasattr(super(), '__init__'):
             super().__init__(*args, **kwargs)
         self.prompt_embeds: Union[PromptEmbeds, None] = None
-        self._text_embedding_path: Union[str, None] = None
+        # THE variant memo: one list of EmbedVariant rows replacing the old
+        # six per-variant path attributes (caption, DOP pair, the dataset-
+        # level shared blank and DOP class-side entries, the per-file D-OPSD
+        # teacher pair). Built and gated in get_embed_variants; every
+        # consumer (planner, reader, completeness) reads that one table.
+        self._embed_variants: Union[list, None] = None
         # diff output preservation embeds (caption with trigger word replaced by class)
         self.dop_prompt_embeds: Union[PromptEmbeds, None] = None
-        self._dop_text_embedding_path: Union[str, None] = None
-        # caption-dropout blanks: dataset-level SHARED entries (one file per
-        # media folder per model, basename-free content-addressed name; see
-        # get_blank_text_embedding_path). Same path on every item of a folder.
-        self._blank_text_embedding_path: Union[str, None] = None
-        # DOP embeds for dropout steps (dropout caption with trigger replaced
-        # by class), also dataset-level shared
-        self._dop_blank_text_embedding_path: Union[str, None] = None
         # D-OPSD teacher embeds (caption with trigger replaced by the self-reference
         # token, encoded WITH the item's own image/video as the vision reference)
         self.dopsd_prompt_embeds: Union[PromptEmbeds, None] = None
-        self._dopsd_text_embedding_path: Union[str, None] = None
-        self._dopsd_blank_text_embedding_path: Union[str, None] = None
         self._loaded_text_embedding_path: Union[str, None] = None
         self._caption_was_dropped = False
         self.is_text_embedding_cached = False
@@ -2580,28 +2603,73 @@ class TextEmbeddingFileItemDTOMixin:
             filename_no_ext = f'{os.path.splitext(os.path.basename(self.path))[0]}_{hash_str}'
         return os.path.join(te_dir, f'{filename_no_ext}.safetensors')
 
-    def get_text_embedding_path(self: 'FileItemDTO', recalculate=False):
-        if self._text_embedding_path is not None and not recalculate:
-            return self._text_embedding_path
-        else:
-            self._text_embedding_path = self._build_text_embedding_path()
+    def get_embed_variants(self: 'FileItemDTO', recalculate=False):
+        # THE single table of text-embed variants for this item. Every
+        # consumer reads it -- the phase-2 planner (_caption_embed_targets),
+        # the train-time reader (load_prompt_embedding), and the completeness
+        # gate through the planner -- and none of them gate or dedupe by
+        # hand anymore; the gates live here, stated once:
+        #   caption      the item caption (control conditioning rides in its
+        #                cache key when present, unchanged scheme)
+        #   dop          DOP class-side twin of the caption; only under DOP.
+        #                If no trigger appears in the caption it hashes onto
+        #                the caption path and the file is shared.
+        #   blank        the dropout slot: '' (owner contract 2026-10-27),
+        #                dataset-level SHARED entry (content-addressed, no
+        #                basename -- one file per media folder per model),
+        #                plain text only. Planned on every item; identical
+        #                paths collapse at the write side.
+        #   dop_blank    DOP class side of a DROPPED caption; shared the same
+        #                way. Triggerless tokenless items hash it onto '' and
+        #                dedupe onto 'blank'.
+        #   dopsd        D-OPSD teacher pair (FENCED: per-file by nature --
+        #                the vision reference IS the item's own media, so the
+        #                basename-prefixed name is deliberate. Do not
+        #                "align" these two with the shared blank.)
+        #   dopsd_blank  teacher side of a dropped caption, same fencing.
+        # The _build_text_embedding_path kwargs are byte-identical to the old
+        # per-variant getters', so every existing cache key is unchanged.
+        if self._embed_variants is not None and not recalculate:
+            return self._embed_variants
+        # load the caption first: dop/dopsd texts and inline pairs are built there
+        if self.caption is None:
+            self.load_caption()
+        dc = self.dataset_config
 
-        return self._text_embedding_path
+        variants = []
 
-    def get_dop_text_embedding_path(self: 'FileItemDTO', recalculate=False):
-        if self._dop_text_embedding_path is not None and not recalculate:
-            return self._dop_text_embedding_path
-        else:
-            # make sure the caption is loaded so caption_dop is built
-            if self.caption is None:
-                self.load_caption()
-            # if the trigger word is not in the caption, this hashes to the same
-            # path as the normal embedding and the cache file is shared
-            self._dop_text_embedding_path = self._build_text_embedding_path(
-                caption_override=self.caption_dop
-            )
+        def add(name, caption, dropout_plain=False, self_ref=False, **build_kwargs):
+            variants.append(EmbedVariant(
+                name=name,
+                path=self._build_text_embedding_path(caption_override=caption, **build_kwargs),
+                caption=caption,
+                dropout_plain=dropout_plain,
+                self_ref=self_ref,
+            ))
 
-        return self._dop_text_embedding_path
+        add('caption', self.caption)
+        if dc.diff_output_preservation:
+            add('dop', self.caption_dop)
+        if dc.caption_dropout_rate > 0:
+            add('blank', self.get_dropout_caption(),
+                dropout_plain=True, text_only=True, shared_name=True)
+            if dc.diff_output_preservation:
+                add('dop_blank', self.get_dop_dropout_caption(),
+                    dropout_plain=True, text_only=True, shared_name=True)
+        if getattr(self, 'dopsd_self_ref', False):
+            add('dopsd', self.caption_dopsd, self_ref=True, dopsd_self_ref=True)
+            if dc.caption_dropout_rate > 0:
+                add('dopsd_blank', self.get_dopsd_dropout_caption(),
+                    self_ref=True, dopsd_self_ref=True)
+
+        self._embed_variants = variants
+        return variants
+
+    def get_embed_variant(self: 'FileItemDTO', name, recalculate=False):
+        for variant in self.get_embed_variants(recalculate=recalculate):
+            if variant.name == name:
+                return variant
+        return None
 
     def get_dropout_caption(self: 'FileItemDTO'):
         # Dropout means DROPPED: the text is BLANK_CAPTION_TEXT ('') for
@@ -2624,34 +2692,6 @@ class TextEmbeddingFileItemDTOMixin:
             self.is_reg,
         )
 
-    def get_dop_blank_text_embedding_path(self: 'FileItemDTO', recalculate=False):
-        # The DOP CLASS-side entry (see get_dop_dropout_caption): what the
-        # regularisation prediction conditions on when the caption is dropped
-        # on a DOP step. Shares the dataset-level scheme with the blank
-        # (content-addressed, one file per folder per model); triggerless
-        # tokenless files hash onto the '' blank and dedupe onto it.
-        if self._dop_blank_text_embedding_path is not None and not recalculate:
-            return self._dop_blank_text_embedding_path
-        else:
-            # text_only: these embeds carry no control conditioning
-            self._dop_blank_text_embedding_path = self._build_text_embedding_path(
-                caption_override=self.get_dop_dropout_caption(), text_only=True,
-                shared_name=True,
-            )
-
-        return self._dop_blank_text_embedding_path
-
-    def get_dopsd_text_embedding_path(self: 'FileItemDTO', recalculate=False):
-        if self._dopsd_text_embedding_path is not None and not recalculate:
-            return self._dopsd_text_embedding_path
-        # make sure the caption is loaded so caption_dopsd is built
-        if self.caption is None:
-            self.load_caption()
-        self._dopsd_text_embedding_path = self._build_text_embedding_path(
-            caption_override=self.caption_dopsd, dopsd_self_ref=True
-        )
-        return self._dopsd_text_embedding_path
-
     def get_dopsd_dropout_caption(self: 'FileItemDTO'):
         # D-OPSD-INTERNAL teacher dropout text (owner: leave D-OPSD as it is).
         # This is NOT the dataset caption dropout -- dataset dropout is always
@@ -2670,39 +2710,6 @@ class TextEmbeddingFileItemDTOMixin:
             )
         return f"{self.get_dopsd_ref_token()} {dropout_caption}".strip()
 
-    def get_dopsd_blank_text_embedding_path(self: 'FileItemDTO', recalculate=False):
-        if self._dopsd_blank_text_embedding_path is not None and not recalculate:
-            return self._dopsd_blank_text_embedding_path
-        # unlike DOP, dropout embeds keep the vision reference -- and that
-        # reference IS the item's own media, so this embed is per-file by
-        # nature: it deliberately keeps the basename-prefixed name and is NOT
-        # the shared dataset blank. Do not "align" it with
-        # get_blank_text_embedding_path.
-        self._dopsd_blank_text_embedding_path = self._build_text_embedding_path(
-            caption_override=self.get_dopsd_dropout_caption(), dopsd_self_ref=True
-        )
-        return self._dopsd_blank_text_embedding_path
-
-    def get_blank_text_embedding_path(self: 'FileItemDTO', recalculate=False):
-        # THE dataset-level blank: exactly one file per media folder per model
-        # (model identity is in the key via text_embedding_space_version; the
-        # filename is content-addressed with no image basename). Every item's
-        # dropout swap reads this one path, and the phase-2 cache pass writes
-        # it like any other target. Writer, reader and the completeness gate
-        # all resolve the blank HERE -- there is no per-file blank mechanism
-        # to fall back to.
-        # contract: docs/refactor_notes/DECISION--blank-embeds-and-dop-gating.md
-        if self._blank_text_embedding_path is not None and not recalculate:
-            return self._blank_text_embedding_path
-        else:
-            # text_only: dropout embeds carry no control conditioning
-            self._blank_text_embedding_path = self._build_text_embedding_path(
-                caption_override=self.get_dropout_caption(), text_only=True,
-                shared_name=True,
-            )
-
-        return self._blank_text_embedding_path
-
     def cleanup_text_embedding(self):
         if self.prompt_embeds is not None:
             # we are caching on disk, don't save in memory
@@ -2713,10 +2720,12 @@ class TextEmbeddingFileItemDTOMixin:
             self.dopsd_prompt_embeds = None
 
     def load_prompt_embedding(self, device=None):
+        # train-time reader: consumes the variant table (get_embed_variants)
+        # by name -- the SAME table the phase-2 planner wrote from, so a path
+        # can never be read differently from how it was written.
         if not self.is_text_embedding_cached:
             return
         if self.prompt_embeds is None:
-            te_path = self.get_text_embedding_path()
             self._caption_was_dropped = False
             if self.dataset_config.caption_dropout_rate > 0:
                 # get a random float form 0 to 1
@@ -2725,31 +2734,32 @@ class TextEmbeddingFileItemDTOMixin:
                     # drop the caption by using the cached blank embedding
                     # (the dataset-level shared file -- the same path for
                     # every item in the folder)
-                    te_path = self.get_blank_text_embedding_path()
+                    variant = self.get_embed_variant('blank')
                     self._caption_was_dropped = True
+            if not self._caption_was_dropped:
+                variant = self.get_embed_variant('caption')
             # load it from disk
-            self.prompt_embeds = PromptEmbeds.load(te_path)
-            self._loaded_text_embedding_path = te_path
+            self.prompt_embeds = PromptEmbeds.load(variant.path)
+            self._loaded_text_embedding_path = variant.path
         if self.dataset_config.diff_output_preservation and self.dop_prompt_embeds is None:
-            if self._caption_was_dropped:
-                # DOP is not dropout: a dropped caption still conditions the
-                # regularisation prediction on the class side (matches the
-                # live path, which routes _caption_was_dropped items through
-                # get_dop_dropout_caption)
-                dop_path = self.get_dop_blank_text_embedding_path()
-            else:
-                dop_path = self.get_dop_text_embedding_path()
-            if dop_path == self._loaded_text_embedding_path:
-                # no trigger word in caption, same embedding
+            # DOP is not dropout: a dropped caption still conditions the
+            # regularisation prediction on the class side (matches the live
+            # path, which routes _caption_was_dropped items through
+            # get_dop_dropout_caption). Table names follow that split.
+            variant = self.get_embed_variant(
+                'dop_blank' if self._caption_was_dropped else 'dop')
+            if variant.path == self._loaded_text_embedding_path:
+                # no trigger word in caption (or class aliased to the blank):
+                # same embedding file
                 self.dop_prompt_embeds = self.prompt_embeds
             else:
-                self.dop_prompt_embeds = PromptEmbeds.load(dop_path)
+                self.dop_prompt_embeds = PromptEmbeds.load(variant.path)
         if getattr(self, 'dopsd_self_ref', False) and self.dopsd_prompt_embeds is None:
-            if self._caption_was_dropped:
-                dopsd_path = self.get_dopsd_blank_text_embedding_path()
-            else:
-                dopsd_path = self.get_dopsd_text_embedding_path()
-            self.dopsd_prompt_embeds = PromptEmbeds.load(dopsd_path)
+            # D-OPSD pair is fenced per-file (the item's own media is the
+            # vision reference) -- table names, same mechanism
+            variant = self.get_embed_variant(
+                'dopsd_blank' if self._caption_was_dropped else 'dopsd')
+            self.dopsd_prompt_embeds = PromptEmbeds.load(variant.path)
 
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
@@ -2759,40 +2769,34 @@ class TextEmbeddingCachingMixin:
         self.is_caching_text_embeddings = self.dataset_config.cache_text_embeddings
 
     def _caption_embed_targets(self: 'AiToolkitDataset', file_item):
-        # every (path, caption) text-embed target for one item, the subset that
-        # are plain-text dropout variants, and the D-OPSD self-ref targets
-        text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
-        encode_targets = [(text_embedding_path, file_item.caption)]
-        if self.dataset_config.diff_output_preservation:
-            dop_path = file_item.get_dop_text_embedding_path(recalculate=True)
-            if dop_path != text_embedding_path:
-                # trigger word was in the caption, cache the DOP version too
-                encode_targets.append((dop_path, file_item.caption_dop))
-        # Dropout embeds are plain text (no control images). The blank is the
-        # embed of '' -- dropout means DROPPED (owner contract 2026-10-27):
-        # nothing is injected into a dropped caption. It is the dataset-level
-        # SHARED entry (one file per media folder per model, see
-        # get_blank_text_embedding_path), planned for every item; identical
-        # paths collapse at the write side (batch pass dedupes by path, the
-        # per-item loop re-checks validity), so a folder pays exactly one
-        # blank encode. DOP is a separate mechanism: it adds the CLASS-side
-        # entry the regularisation prediction conditions on when the caption
-        # is dropped; triggerless tokenless files hash that onto '' and dedupe
-        # onto the blank.
+        # every text-embed target for one item comes from the item's variant
+        # table (get_embed_variants): the gates (DOP / dropout / D-OPSD), the
+        # path scheme, and the shared-vs-per-file naming are stated THERE,
+        # once -- this function only reshapes rows into what phase 2 writes,
+        # and the reader + completeness gate see the identical paths.
+        # First occurrence of a path wins: two variants that resolve to one
+        # file carry byte-equal hash dicts and therefore equal caption text,
+        # so encoding either text writes the same bytes (this subsumes the
+        # old hand-written per-pair dedupe checks: caption/dop aliasing when
+        # no trigger appears, and a triggerless tokenless item's class side
+        # aliasing onto the '' blank).
+        encode_targets = []
         dropout_target_paths = set()
-        if self.dataset_config.caption_dropout_rate > 0:
-            blank_path = file_item.get_blank_text_embedding_path(recalculate=True)
-            encode_targets.append((blank_path, file_item.get_dropout_caption()))
-            dropout_target_paths.add(blank_path)
-            if self.dataset_config.diff_output_preservation:
-                # the DOP class side (see get_dop_dropout_caption)
-                dop_blank_path = file_item.get_dop_blank_text_embedding_path(recalculate=True)
-                if dop_blank_path not in [t[0] for t in encode_targets]:
-                    encode_targets.append((dop_blank_path, file_item.get_dop_dropout_caption()))
-                    dropout_target_paths.add(dop_blank_path)
         dopsd_targets = []
-        if getattr(file_item, 'dopsd_self_ref', False):
-            # D-OPSD teacher embeds encode with the item's own media as the reference
+        seen_paths = set()
+        for variant in file_item.get_embed_variants(recalculate=True):
+            if variant.path in seen_paths:
+                continue
+            seen_paths.add(variant.path)
+            if variant.self_ref:
+                # D-OPSD teacher embeds are written WITH the item's own media
+                # as the reference -- separate list, per-file names
+                dopsd_targets.append((variant.path, variant.caption))
+            else:
+                encode_targets.append((variant.path, variant.caption))
+                if variant.dropout_plain:
+                    dropout_target_paths.add(variant.path)
+        if dopsd_targets:
             control_video_paths = getattr(file_item, 'control_video_paths', None) or []
             if file_item.control_path is not None or len(control_video_paths) > 0:
                 raise ValueError(
@@ -2800,14 +2804,6 @@ class TextEmbeddingCachingMixin:
                     "control images/videos: the item itself must be the only "
                     f"reference. Offending item: {file_item.path}"
                 )
-            dopsd_targets.append((
-                file_item.get_dopsd_text_embedding_path(recalculate=True),
-                file_item.caption_dopsd,
-            ))
-            if self.dataset_config.caption_dropout_rate > 0:
-                dopsd_blank_path = file_item.get_dopsd_blank_text_embedding_path(recalculate=True)
-                if dopsd_blank_path != dopsd_targets[0][0]:
-                    dopsd_targets.append((dopsd_blank_path, file_item.get_dopsd_dropout_caption()))
         return encode_targets, dropout_target_paths, dopsd_targets
 
     def _embed_target_valid(self: 'AiToolkitDataset', path: str) -> bool:

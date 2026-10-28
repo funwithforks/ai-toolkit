@@ -18,7 +18,7 @@ from toolkit.config_modules import GenerateImageConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.dataloader_mixins import (
-    BLANK_CAPTION_TEXT, dop_prior_fallback_text,
+    BLANK_CAPTION_TEXT, dop_prior_fallback_text, dop_class_side_prompt,
 )  # caption-slot contract home -- see toolkit/dataloader_mixins module header
 from toolkit.dto import DTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
@@ -2246,16 +2246,17 @@ class SDTrainer(BaseSDTrainProcess):
                                         # class side (owner contract
                                         # 2026-10-27; matches cached mode)
                                         return file_item.get_dop_dropout_caption()
-                                    # inline [trigger:X class:Y] tokens were already swapped to
-                                    # their trigger words in the caption, swap those back to classes
-                                    pairs = getattr(file_item, '_inline_dop_pairs', None)
-                                    if pairs is not None:
-                                        for pair_trigger, pair_class in pairs:
-                                            prompt = prompt.replace(pair_trigger, pair_class)
-                                    trigger = file_item.trigger_word if file_item.trigger_word is not None else self.trigger_word
-                                    if trigger is None:
-                                        return prompt
-                                    return prompt.replace(trigger, self.train_config.diff_output_preservation_class)
+                                    # inline trigger tokens back to classes, config
+                                    # trigger to the preservation class -- the swap
+                                    # derivation is defined ONCE in the mixins
+                                    # contract block (dop_class_side_prompt); this
+                                    # closure is a per-item adapter onto it
+                                    return dop_class_side_prompt(
+                                        prompt,
+                                        getattr(file_item, '_inline_dop_pairs', None),
+                                        file_item.trigger_word if file_item.trigger_word is not None else self.trigger_word,
+                                        self.train_config.diff_output_preservation_class,
+                                    )
                                 dop_prompts = [replace_trigger_with_class(p, fi) for p, fi in zip(conditioned_prompts, batch.file_items)]
                                 dop_prompts_2 = None
                                 if prompt_2 is not None:

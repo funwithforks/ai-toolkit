@@ -49,17 +49,22 @@ Owner: `TextEmbeddingCachingMixin` (`toolkit/dataloader_mixins.py`).
   `text_embedding_space_version`, `text_embedding_version`, plus control
   conditioning when present. Edit the caption file → different hash → the old
   entry is simply never looked at again.
-- **One item can have up to five targets** (`_caption_embed_targets`): the
-  caption, its DOP class variant (only when DOP is on and the caption carries
-  a trigger/inline identity to swap), the shared dropout blank (the empty
-  caption -- `''`, one content-addressed file per media dir per model;
-  DOP adds one shared class-side entry the same way), and the D-OPSD
-  self-ref teacher variants. Real-caption targets hash with a per-item
+- **One variant table** (`get_embed_variants`): the ONLY place an item's
+  text-embed variants and their gates are stated — caption, DOP class twin
+  (DOP only), shared dropout blank (the empty caption -- `''`, one
+  content-addressed file per media dir per model; DOP adds one shared
+  class-side entry the same way), and the fenced per-file D-OPSD teacher
+  pair. The phase-2 planner (`_caption_embed_targets`), the train-time
+  reader (`load_prompt_embedding`), and the completeness gate all consume
+  this same table and dedupe by path (first wins — equal paths carry
+  byte-equal hash dicts). Real-caption targets hash with a per-item
   basename prefix; the shared blank/class-side entries have none.
 - **Writing**: `cache_text_embeddings()` (`:2549`) runs in phase 2 and
   encodes only targets failing `_embed_target_valid`.
-- **Consumption**: at train time the DTO loads its files with
-  `PromptEmbeds.load` (`:2456`, dop `:2469`, dopsd `:2475`) — dispatch again.
+- **Consumption**: at train time the DTO loads its entries by TABLE NAME
+  from `get_embed_variants` with `PromptEmbeds.load` — the same table the
+  planner wrote, so a path can never be read differently from how it was
+  written; class-dispatch on load remains the file-format contract.
 - **Completeness**: `text_embedding_complete()` (`:2537`) is what the TE gate
   asks per dataset; it walks the same `_caption_embed_targets` list.
 
