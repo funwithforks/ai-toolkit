@@ -2450,9 +2450,12 @@ class TextEmbeddingFileItemDTOMixin:
         # diff output preservation embeds (caption with trigger word replaced by class)
         self.dop_prompt_embeds: Union[PromptEmbeds, None] = None
         self._dop_text_embedding_path: Union[str, None] = None
-        # blank caption embeds used for caption dropout when caching text embeddings
+        # caption-dropout blanks: dataset-level SHARED entries (one file per
+        # media folder per model, basename-free content-addressed name; see
+        # get_blank_text_embedding_path). Same path on every item of a folder.
         self._blank_text_embedding_path: Union[str, None] = None
-        # DOP embeds for dropout steps (dropout caption with trigger replaced by class)
+        # DOP embeds for dropout steps (dropout caption with trigger replaced
+        # by class), also dataset-level shared
         self._dop_blank_text_embedding_path: Union[str, None] = None
         # D-OPSD teacher embeds (caption with trigger replaced by the self-reference
         # token, encoded WITH the item's own image/video as the vision reference)
@@ -2504,17 +2507,29 @@ class TextEmbeddingFileItemDTOMixin:
             item["first_frame_in_te"] = True
         return item
 
-    def _build_text_embedding_path(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False):
+    def _build_text_embedding_path(self: 'FileItemDTO', caption_override=None, text_only=False,
+                                   dopsd_self_ref=False, shared_name=False):
         # we store text embeddings in a folder in same path as image called _text_embedding_cache
         img_dir = os.path.dirname(self.path)
         te_dir = os.path.join(img_dir, '_t_e_cache')
         hash_dict = self.get_text_embedding_info_dict(caption_override=caption_override, text_only=text_only, dopsd_self_ref=dopsd_self_ref)
-        filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
         # get base64 hash of md5 checksum of hash_dict
         hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
         hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
         hash_str = hash_str.replace('=', '')
-        return os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+        if shared_name:
+            # dataset-level blanks are content-addressed: the filename IS the
+            # key, with NO image basename, so every file in the folder resolves
+            # ONE path per (dropout text, model space). The basename-free name
+            # is the sharing contract -- adding a basename prefix here would
+            # silently turn the blank back into byte-identical copies per file
+            # (docs/refactor_notes/DECISION--blank-embeds-and-dop-gating.md).
+            filename_no_ext = f'blank_{hash_str}'
+        else:
+            # per-caption embeds keep the media basename in the filename (the
+            # scheme every existing cache uses -- do not change it, keys churn)
+            filename_no_ext = f'{os.path.splitext(os.path.basename(self.path))[0]}_{hash_str}'
+        return os.path.join(te_dir, f'{filename_no_ext}.safetensors')
 
     def get_text_embedding_path(self: 'FileItemDTO', recalculate=False):
         if self._text_embedding_path is not None and not recalculate:
@@ -2578,14 +2593,17 @@ class TextEmbeddingFileItemDTOMixin:
         return dropout_caption
 
     def get_dop_blank_text_embedding_path(self: 'FileItemDTO', recalculate=False):
+        # the DOP class-side blank; shares the dataset-level scheme with the
+        # plain blank (content-addressed, one file per folder per model). If
+        # the DOP dropout text equals the dropout text this hashes to the very
+        # same shared path and the file genuinely is one entry.
         if self._dop_blank_text_embedding_path is not None and not recalculate:
             return self._dop_blank_text_embedding_path
         else:
-            # if the DOP dropout caption matches the dropout caption, this hashes to
-            # the same path as the blank embedding and the cache file is shared.
             # text_only: dropout embeds carry no control conditioning
             self._dop_blank_text_embedding_path = self._build_text_embedding_path(
-                caption_override=self.get_dop_dropout_caption(), text_only=True
+                caption_override=self.get_dop_dropout_caption(), text_only=True,
+                shared_name=True,
             )
 
         return self._dop_blank_text_embedding_path
@@ -2613,22 +2631,32 @@ class TextEmbeddingFileItemDTOMixin:
     def get_dopsd_blank_text_embedding_path(self: 'FileItemDTO', recalculate=False):
         if self._dopsd_blank_text_embedding_path is not None and not recalculate:
             return self._dopsd_blank_text_embedding_path
-        # unlike DOP, dropout embeds keep the vision reference
+        # unlike DOP, dropout embeds keep the vision reference -- and that
+        # reference IS the item's own media, so this embed is per-file by
+        # nature: it deliberately keeps the basename-prefixed name and is NOT
+        # the shared dataset blank. Do not "align" it with
+        # get_blank_text_embedding_path.
         self._dopsd_blank_text_embedding_path = self._build_text_embedding_path(
             caption_override=self.get_dopsd_dropout_caption(), dopsd_self_ref=True
         )
         return self._dopsd_blank_text_embedding_path
 
     def get_blank_text_embedding_path(self: 'FileItemDTO', recalculate=False):
+        # THE dataset-level blank: exactly one file per media folder per model
+        # (model identity is in the key via text_embedding_space_version; the
+        # filename is content-addressed with no image basename). Every item's
+        # dropout swap reads this one path, and the phase-2 cache pass writes
+        # it like any other target. Writer, reader and the completeness gate
+        # all resolve the blank HERE -- there is no per-file blank mechanism
+        # to fall back to.
+        # contract: docs/refactor_notes/DECISION--blank-embeds-and-dop-gating.md
         if self._blank_text_embedding_path is not None and not recalculate:
             return self._blank_text_embedding_path
         else:
-            # if the dropout caption matches the normal caption (and the item has no
-            # control conditioning), this hashes to the same path as the normal
-            # embedding and the cache file is shared.
             # text_only: dropout embeds carry no control conditioning
             self._blank_text_embedding_path = self._build_text_embedding_path(
-                caption_override=self.get_dropout_caption(), text_only=True
+                caption_override=self.get_dropout_caption(), text_only=True,
+                shared_name=True,
             )
 
         return self._blank_text_embedding_path
@@ -2653,6 +2681,8 @@ class TextEmbeddingFileItemDTOMixin:
                 rand = random.random()
                 if rand < self.dataset_config.caption_dropout_rate:
                     # drop the caption by using the cached blank embedding
+                    # (the dataset-level shared file -- the same path for
+                    # every item in the folder)
                     te_path = self.get_blank_text_embedding_path()
                     self._caption_was_dropped = True
             # load it from disk
@@ -2694,18 +2724,23 @@ class TextEmbeddingCachingMixin:
             if dop_path != text_embedding_path:
                 # trigger word was in the caption, cache the DOP version too
                 encode_targets.append((dop_path, file_item.caption_dop))
-        # dropout embeds are encoded as plain text (no control images)
+        # dropout embeds are encoded as plain text (no control images). The
+        # blank is the dataset-level SHARED entry (one file per media folder
+        # per model, see get_blank_text_embedding_path): planned for every
+        # item, and identical paths collapse at the write side -- the batched
+        # pass dedupes by path, the per-item loop re-checks validity -- so a
+        # folder pays exactly one blank encode. Never compare the blank path
+        # against the per-caption path to skip it: the names differ by design
+        # now, and the reader only ever reads what this planner guarantees.
         dropout_target_paths = set()
         if self.dataset_config.caption_dropout_rate > 0:
             blank_path = file_item.get_blank_text_embedding_path(recalculate=True)
-            if blank_path != text_embedding_path:
-                # cache the dropout caption embedding (blank, or trigger word only)
-                encode_targets.append((blank_path, file_item.get_dropout_caption()))
-                dropout_target_paths.add(blank_path)
+            encode_targets.append((blank_path, file_item.get_dropout_caption()))
+            dropout_target_paths.add(blank_path)
             if self.dataset_config.diff_output_preservation:
                 # cache the DOP version of the dropout caption (class only)
                 dop_blank_path = file_item.get_dop_blank_text_embedding_path(recalculate=True)
-                if dop_blank_path not in [t[0] for t in encode_targets] + [text_embedding_path]:
+                if dop_blank_path not in [t[0] for t in encode_targets]:
                     encode_targets.append((dop_blank_path, file_item.get_dop_dropout_caption()))
                     dropout_target_paths.add(dop_blank_path)
         dopsd_targets = []
@@ -2762,6 +2797,7 @@ class TextEmbeddingCachingMixin:
         if not getattr(sd, "supports_batched_text_cache", False):
             return
         pairs = []  # (path, caption)
+        seen_paths = set()
         for file_item in self.file_list:
             control_video_paths = getattr(file_item, 'control_video_paths', None) or []
             if file_item.encode_control_in_text_embeddings and (
@@ -2775,11 +2811,16 @@ class TextEmbeddingCachingMixin:
             ):
                 continue
             encode_targets, _, _ = self._caption_embed_targets(file_item)
-            pairs.extend(
-                (path, caption)
-                for path, caption in encode_targets
-                if not self._embed_target_valid(path)
-            )
+            for path, caption in encode_targets:
+                # dedupe by path: the dataset-level blanks are planned once
+                # per item but name ONE shared file (targets used to be
+                # basename-unique per item, which is why this pass never
+                # deduped; without this the shared blank would be packed and
+                # encoded once per file again)
+                if path in seen_paths or self._embed_target_valid(path):
+                    continue
+                seen_paths.add(path)
+                pairs.append((path, caption))
         if not pairs:
             return
         bpt = int(sd.text_cache_bytes_per_token())
