@@ -45,6 +45,7 @@ import sys
 import threading
 
 from .. import datasets as dsets
+from .. import markers as dmark
 from ..registry import (
     Param, ParamError, RunPaths, Suite, safe_run_component,
 )
@@ -454,6 +455,12 @@ def _parse(paths: RunPaths, params):
         con.close()
 
 
+def _moss_phases(paths, suite, full):
+    # phase fold lives with the marker machinery (markers.py); this is the
+    # suite's declaration that it wants the phased-loading summary
+    return dmark.moss_phases(paths, suite, full)
+
+
 SUITE = Suite(
     id="moss_train",
     variants=("v1",),
@@ -462,6 +469,20 @@ SUITE = Suite(
     build=_build,
     parse=_parse,
     precheck=_datasets_precheck,
+    # marker lines live in the trainer's prints (SDTrainer.py,
+    # dataloader_mixins.py, model phase code); these patterns were taken
+    # from real records, do not "prettify" them without re-checking
+    markers={
+        "te_skip": r"Skipping text encoder load",
+        "te_load": r"Loading \S+ text encoder from",
+        "te_reason": r" - text encoder needed: (?P<reason>.+)",
+        "fixed_cache": r"Loading fixed prompt embeddings from cache",
+        "fixed_cache_now": r"Caching fixed prompt embeddings",
+        "plan": (r"Batched caption cache: (?P<planned>\d+) captions "
+                 r"-> (?P<groups>\d+) groups"),
+        "vae_round": r"VAE unloaded until next sample round",
+    },
+    phases=_moss_phases,
     timeout_s=12 * 3600,  # quality runs (1400 steps at bs8 + sampling) pass 6 h
     desc="MOSS-Image training-step measurement (run.py, sqlite-structured metrics)",
 )

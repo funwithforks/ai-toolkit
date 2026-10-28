@@ -9,8 +9,12 @@
             --rm K [--delete-files]]
                               machine-local dataset registry; file
                               deletion only for tool-created rt_ folders
-  submit --suite S --variant V [--params JSON] [--note ...]
+      submit --suite S --variant V [--params JSON] [--expect JSON] [--note ...]
+                              --expect declares the run's intent; the
+                              verdict grades it at wait (markers/metrics)
   wait   RUN_ID [--timeout-s N]
+                              returns status + metrics + markers + phases
+                              + expect verdict (when one was declared)
   status RUN_ID
   cancel RUN_ID
   list   [--limit N]
@@ -66,6 +70,10 @@ def main(argv=None):
     p.add_argument("--variant", required=True)
     p.add_argument("--params", default="{}", help="JSON object of params")
     p.add_argument("--note", default="")
+    p.add_argument("--expect", default=None, help=(
+        'JSON intent, graded at wait: {"markers":{"te_skip":"present",'
+        '"plan":{"planned":"19"}},"metrics":{"loss_final":{"max":1.5}}}'
+    ))
 
     for name in ("wait", "status", "cancel", "recompute"):
         p = sub.add_parser(name)
@@ -86,6 +94,7 @@ def main(argv=None):
                     "variants": list(s.variants),
                     "timeout_s": s.timeout_s,
                     "metrics": s.metrics,
+                    "markers": s.markers,
                     "params": {
                         k: {
                             "kind": v.kind,
@@ -129,7 +138,11 @@ def main(argv=None):
             params = json.loads(a.params)
             if not isinstance(params, dict):
                 raise ParamError("--params must be a JSON object")
-            res = runner.submit(a.suite, a.variant, params, note=a.note)
+            expect = None
+            if a.expect is not None:
+                expect = json.loads(a.expect)
+            res = runner.submit(a.suite, a.variant, params, note=a.note,
+                                expect=expect)
         elif a.op == "wait":
             res = runner.wait(a.run_id, timeout_s=a.timeout_s)
         elif a.op == "status":

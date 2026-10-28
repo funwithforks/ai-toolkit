@@ -31,7 +31,8 @@ import subprocess
 import sys
 import time
 
-from .registry import RunPaths, get_suite
+from . import markers as marker_mod
+from .registry import ParamError, RunPaths, get_suite
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -91,11 +92,16 @@ def _git(*args):
 
 # ------------------------------------------------------------------ submit
 
-def submit(suite_id, variant, overrides, note=""):
+def submit(suite_id, variant, overrides, note="", expect=None):
     suite = get_suite(suite_id)
     params = suite.validate(variant, overrides or {})
     if suite.precheck is not None:
         suite.precheck(params)  # reject here, not in a doomed launch
+    if expect is not None:
+        try:
+            marker_mod.validate_expect(suite, expect)
+        except ValueError as e:
+            raise ParamError(str(e)) from None
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     run_id = f"{stamp}_{suite.id}_{variant}"
     paths = _run_dir(run_id)
@@ -136,6 +142,8 @@ def submit(suite_id, variant, overrides, note=""):
         "timeout_s": suite.timeout_s,
         "python": sys.executable,
     }
+    if expect is not None:
+        manifest["expect"] = expect
     _write_json(paths.manifest, manifest)
     emit(paths, "submitted", suite=suite.id, variant=variant, params=params)
 
@@ -158,7 +166,10 @@ def submit(suite_id, variant, overrides, note=""):
     with open(paths.pid, "w") as f:
         f.write(str(proc.pid))
     emit(paths, "supervisor_spawned", pid=proc.pid)
-    return {"run_id": run_id, "record": paths.root, "pid": proc.pid}
+    result = {"run_id": run_id, "record": paths.root, "pid": proc.pid}
+    if expect is not None:
+        result["expect"] = expect  # echo the contract the verdict will grade
+    return result
 
 
 # --------------------------------------------------------------- supervise
@@ -322,6 +333,41 @@ def classify(run_id):
         err_tail = _tail(paths.stderr) or _tail(paths.stdout)
         if err_tail:
             out["error_tail"] = err_tail
+
+    # F1: marker extraction + expectation verdict, derived from the record
+    # alone. Suites that declare nothing cost nothing. The scan runs once
+    # per call (status/wait both flow through here); the live window is
+    # bounded and finished records are small.
+    try:
+        suite = get_suite(manifest["suite"])
+    except ParamError:
+        suite = None  # record references a removed suite: metrics still serve
+    if suite is not None and (suite.markers or suite.phases):
+        full = not alive
+        hits = marker_mod.scan(paths, suite, full)
+        if hits:
+            out["markers"] = hits
+        if suite.phases is not None:
+            phases = suite.phases(paths, suite, full)
+            if phases:
+                out["phases"] = phases
+        expect = manifest.get("expect")
+        if expect is not None:
+            verdict = marker_mod.evaluate(expect, hits, out.get("metrics", {}))
+            if alive:
+                # mid-run: checks are informational only -- an absence may
+                # still fill in. PASS/FAIL is a post-expectation verdict,
+                # never a live guess.
+                verdict = {"verdict": "PENDING", "checks": verdict["checks"]}
+            out["expect"] = verdict
+            out["expect"] = verdict
+            if not alive:
+                # persist so recompute must reproduce exactly this verdict
+                _write_json(os.path.join(paths.root, "markers.json"), {
+                    "markers": hits,
+                    "phases": out.get("phases"),
+                    "expect": verdict,
+                })
     return out
 
 
@@ -398,7 +444,8 @@ def list_runs(limit=15):
 
 
 def recompute(run_id):
-    """Re-run the suite parser over the record; must match result.json."""
+    """Re-run the suite parser (and marker scan) over the record; must
+    match result.json metrics and any stored markers.json verdicts."""
     paths = _run_dir(run_id)
     manifest = _read_json(paths.manifest)
     if manifest is None:
@@ -407,12 +454,30 @@ def recompute(run_id):
     params = manifest["params"]
     metrics = suite.parse(paths, params)
     stored = (_read_json(paths.result) or {}).get("metrics")
-    return {
+    out = {
         "run_id": run_id,
         "recomputed": metrics,
         "stored": stored,
         "match": stored == metrics,
     }
+    if suite.markers or suite.phases:
+        hits = marker_mod.scan(paths, suite, full=True)
+        recomputed = {"markers": hits}
+        if suite.phases is not None:
+            recomputed["phases"] = suite.phases(paths, suite, True)
+        expect = manifest.get("expect")
+        if expect is not None:
+            recomputed["expect"] = marker_mod.evaluate(expect, hits, metrics)
+        out["markers_recomputed"] = recomputed
+        stored_mk = _read_json(os.path.join(paths.root, "markers.json"))
+        if stored_mk is not None:
+            out["markers_match"] = {
+                "markers": stored_mk.get("markers") == hits,
+                "phases": stored_mk.get("phases") == recomputed.get("phases"),
+                "expect": (stored_mk.get("expect")
+                           == recomputed.get("expect")),
+            }
+    return out
 
 
 if __name__ == "__main__":

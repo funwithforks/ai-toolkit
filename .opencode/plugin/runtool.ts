@@ -49,7 +49,8 @@ export default Plugin.define({
         name: "runtool_suites",
         description:
           "List the runtool suite registry: suite ids, variants, typed params " +
-          "(defaults/bounds), and declared metrics. Call before submit.",
+          "(defaults/bounds), declared metrics, and declared markers (the named " +
+          "log facts you can set expectations on). Call before submit.",
         input: { type: "object", properties: {}, additionalProperties: false },
         execute: wrap(dir, () => ["suites"]),
       })
@@ -60,7 +61,14 @@ export default Plugin.define({
           "launch (unknown anything = rejected, nothing starts). Returns a run_id " +
           "immediately; use runtool_wait to block until done. Params is a JSON " +
           'object string, e.g. {"dataset":"<key from datasets.json>",' +
-          '"steps":120,"warmup":20}.',
+          '"steps":120,"warmup":20}. ' +
+          "Declare the run's INTENT with expect (JSON object): marker presence " +
+          "or captured values from the suite's declared markers (see " +
+          "runtool_suites), and metric bounds. runtool_wait then returns a " +
+          "PASS/FAIL verdict with one line per check — never grep the logs to " +
+          'decide if a run did what it meant to. Example: {"markers":' +
+          '{"te_skip":"present","te_load":"absent","plan":{"planned":"19"}},' +
+          '"metrics":{"loss_final":{"max":1.5}}}.',
         input: {
           type: "object",
           properties: {
@@ -70,6 +78,13 @@ export default Plugin.define({
               type: "string",
               description: "JSON object of registered params only",
               default: "{}",
+            },
+            expect: {
+              type: "string",
+              description:
+                "JSON intent object graded at wait: markers 'present'/'absent' or " +
+                "{namedGroup: value}, metrics {min|max|eq}. Rejected at submit if " +
+                "it names undeclared markers or metrics.",
             },
             note: {
               type: "string",
@@ -88,6 +103,9 @@ export default Plugin.define({
           str(a.variant),
           "--params",
           typeof a.params === "string" ? a.params : "{}",
+          ...(typeof a.expect === "string" && a.expect.trim()
+            ? ["--expect", a.expect]
+            : []),
           "--note",
           typeof a.note === "string" ? a.note : "",
         ]),
@@ -95,10 +113,13 @@ export default Plugin.define({
       editor.add({
         name: "runtool_wait",
         description:
-          "Block until the run exits / is cancelled / times out, then return its " +
-          "status, exit code and parsed metrics. This replaces polling and " +
+          "Block until the run exits / is cancelled / times out, then return " +
+          "its verdict in the SAME response: status, exit code, metrics, " +
+          "extracted markers, phase summary, and the PASS/FAIL expect verdict " +
+          "when one was declared at submit. This replaces polling and " +
           "log-scraping; it watches the recorded pid. status is one of done, " +
-          "failed, crash (exit code attached), cancelled, timeout.",
+          "failed, crash (exit code attached), cancelled, timeout. A declared " +
+          "marker that never appeared is a named FAIL, not a shrug.",
         input: {
           type: "object",
           properties: {
@@ -121,7 +142,10 @@ export default Plugin.define({
         name: "runtool_status",
         description:
           "One-shot live check of a run without waiting: recorded-pid liveness, " +
-          "classification, latest structured progress event.",
+          "classification, latest structured progress event, plus markers " +
+          "extracted so far and the live phase summary (te/cache_plan/...). " +
+          "Mid-run the expect verdict reads PENDING: only runtool_wait renders " +
+          "the final PASS/FAIL.",
         input: {
           type: "object",
           properties: { run_id: { type: "string" } },
