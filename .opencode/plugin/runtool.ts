@@ -86,6 +86,14 @@ export default Plugin.define({
                 "{namedGroup: value}, metrics {min|max|eq}. Rejected at submit if " +
                 "it names undeclared markers or metrics.",
             },
+            config_patch: {
+              type: "string",
+              description:
+                "JSON object of dotted config paths (suite allowlist; see " +
+                "runtool_suites patchable). Loud merge: provenance echoed in " +
+                "config_resolved; conflicts with template/params reject at " +
+                "submit naming every claim.",
+            },
             note: {
               type: "string",
               description: "free-text note for the record",
@@ -105,6 +113,9 @@ export default Plugin.define({
           typeof a.params === "string" ? a.params : "{}",
           ...(typeof a.expect === "string" && a.expect.trim()
             ? ["--expect", a.expect]
+            : []),
+          ...(typeof a.config_patch === "string" && a.config_patch.trim()
+            ? ["--config-patch", a.config_patch]
             : []),
           "--note",
           typeof a.note === "string" ? a.note : "",

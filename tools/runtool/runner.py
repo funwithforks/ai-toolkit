@@ -92,11 +92,19 @@ def _git(*args):
 
 # ------------------------------------------------------------------ submit
 
-def submit(suite_id, variant, overrides, note="", expect=None):
+def submit(suite_id, variant, overrides, note="", expect=None,
+           config_patch=None):
     suite = get_suite(suite_id)
     params = suite.validate(variant, overrides or {})
+    # F2: the loud-merge layers need to know which params the submitter
+    # EXPLICITLY passed (those may override the template; a silent
+    # default may not). Record the explicit set, not just the merged one.
+    explicit = sorted(k for k in (overrides or {}) if k in suite.params)
+    if config_patch is not None and not isinstance(config_patch, dict):
+        raise ParamError("config_patch must be an object of dotted paths")
     if suite.precheck is not None:
-        suite.precheck(params)  # reject here, not in a doomed launch
+        ctx = {"overrides": explicit, "config_patch": config_patch}
+        suite.precheck(params, ctx)  # reject here, not in a doomed launch
     if expect is not None:
         try:
             marker_mod.validate_expect(suite, expect)
@@ -144,6 +152,9 @@ def submit(suite_id, variant, overrides, note="", expect=None):
     }
     if expect is not None:
         manifest["expect"] = expect
+    manifest["overrides"] = explicit
+    if config_patch is not None:
+        manifest["config_patch"] = config_patch
     _write_json(paths.manifest, manifest)
     emit(paths, "submitted", suite=suite.id, variant=variant, params=params)
 
@@ -169,6 +180,12 @@ def submit(suite_id, variant, overrides, note="", expect=None):
     result = {"run_id": run_id, "record": paths.root, "pid": proc.pid}
     if expect is not None:
         result["expect"] = expect  # echo the contract the verdict will grade
+    if suite.resolve is not None:
+        # loud merge: the layer decisions are known NOW (precheck proved
+        # the merge clean); echo them so the caller sees what the job
+        # will run without opening a file
+        result["config_resolved"] = suite.resolve(
+            params, {"overrides": explicit, "config_patch": config_patch})
     return result
 
 
