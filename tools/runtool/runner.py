@@ -102,14 +102,19 @@ def submit(suite_id, variant, overrides, note="", expect=None,
     explicit = sorted(k for k in (overrides or {}) if k in suite.params)
     if config_patch is not None and not isinstance(config_patch, dict):
         raise ParamError("config_patch must be an object of dotted paths")
+    ctx = {"overrides": explicit, "config_patch": config_patch}
     if suite.precheck is not None:
-        ctx = {"overrides": explicit, "config_patch": config_patch}
         suite.precheck(params, ctx)  # reject here, not in a doomed launch
     if expect is not None:
         try:
             marker_mod.validate_expect(suite, expect)
         except ValueError as e:
             raise ParamError(str(e)) from None
+    job_name = job_dir = None
+    if suite.reserve is not None:
+        job_name, job_dir = suite.reserve(params, ctx)
+        ctx["job_name"] = job_name
+    retention = "judged" if (params or {}).get("sample") else suite.retention
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     run_id = f"{stamp}_{suite.id}_{variant}"
     paths = _run_dir(run_id)
@@ -153,6 +158,10 @@ def submit(suite_id, variant, overrides, note="", expect=None,
     if expect is not None:
         manifest["expect"] = expect
     manifest["overrides"] = explicit
+    manifest["retention"] = retention
+    if job_name is not None:
+        manifest["job_name"] = job_name
+        manifest["job_dir"] = job_dir
     if config_patch is not None:
         manifest["config_patch"] = config_patch
     _write_json(paths.manifest, manifest)
@@ -177,15 +186,19 @@ def submit(suite_id, variant, overrides, note="", expect=None,
     with open(paths.pid, "w") as f:
         f.write(str(proc.pid))
     emit(paths, "supervisor_spawned", pid=proc.pid)
-    result = {"run_id": run_id, "record": paths.root, "pid": proc.pid}
+    result = {"run_id": run_id, "record": paths.root, "pid": proc.pid,
+              "retention": retention}
+    if job_dir is not None:
+        result["job_name"] = job_name
+        result["job_dir"] = job_dir
     if expect is not None:
         result["expect"] = expect  # echo the contract the verdict will grade
     if suite.resolve is not None:
         # loud merge: the layer decisions are known NOW (precheck proved
-        # the merge clean); echo them so the caller sees what the job
-        # will run without opening a file
-        result["config_resolved"] = suite.resolve(
-            params, {"overrides": explicit, "config_patch": config_patch})
+        # the merge clean; ctx carries the reserved versioned job_name);
+        # echo them so the caller sees what the job will run without
+        # opening a file
+        result["config_resolved"] = suite.resolve(params, ctx)
     return result
 
 
@@ -452,11 +465,18 @@ def list_runs(limit=15):
     except FileNotFoundError:
         return []
     out = []
-    for name in names[:limit]:
+    for name in names:
+        # the runs root also hosts subtrees (jobs/, datasets/, the
+        # registry file): only real run records qualify
+        if name in ("jobs", "datasets") or not os.path.isdir(
+                os.path.join(RUNS_ROOT, name)):
+            continue
         try:
             out.append(classify(name))
         except (FileNotFoundError, OSError):
             continue
+        if len(out) >= limit:
+            break
     return out
 
 

@@ -206,6 +206,31 @@ export default Plugin.define({
         ]),
       })
       editor.add({
+        name: "runtool_gc",
+        description:
+          "Reap the runtool jobs subtree: finished tool runs, orphan dirs, " +
+          "stale fixed-embed caches (regenerate on demand). Without apply: " +
+          "lists candidates with sizes/ages/reasons. apply deletes ONLY " +
+          "inside output/runtool/jobs — records are never touched, and " +
+          "judged (sample=true) runs need include_judged after the owner " +
+          "has judged them. Owner ruling: tool jobs are disposable.",
+        input: {
+          type: "object",
+          properties: {
+            days: { type: "number", description: "age threshold (default 7)" },
+            apply: { type: "boolean" },
+            include_judged: { type: "boolean" },
+          },
+          additionalProperties: false,
+        },
+        execute: wrap(dir, (a) => [
+          "gc",
+          ...(a.days != null ? ["--days", String(a.days)] : []),
+          ...(a.apply ? ["--apply"] : []),
+          ...(a.include_judged ? ["--include-judged"] : []),
+        ]),
+      })
+      editor.add({
         name: "runtool_cancel",
         description: "Signal the recorded process group of a running run (TERM then KILL).",
         input: {

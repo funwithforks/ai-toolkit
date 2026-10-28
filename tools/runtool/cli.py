@@ -23,6 +23,11 @@
   cancel RUN_ID
   list   [--limit N]
   recompute RUN_ID
+  gc [--days N] [--apply] [--include-judged]
+                              reap the jobs subtree (finished tool runs,
+                              orphans, stale embed caches); listing is
+                              always safe; --apply deletes inside jobs
+                              only (runtool records are never touched)
 """
 
 import argparse
@@ -105,6 +110,11 @@ def main(argv=None):
     p = sub.add_parser("list")
     p.add_argument("--limit", type=int, default=15)
 
+    p = sub.add_parser("gc")
+    p.add_argument("--days", type=float, default=7.0)
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--include-judged", action="store_true")
+
     a = ap.parse_args(argv)
     try:
         if a.op == "suites":
@@ -117,6 +127,7 @@ def main(argv=None):
                     "metrics": s.metrics,
                     "markers": s.markers,
                     "patchable": list(s.patchable),
+                    "retention": s.retention,
                     "params": {
                         k: {
                             "kind": v.kind,
@@ -187,6 +198,13 @@ def main(argv=None):
                 show_config=a.show_config))
         elif a.op == "cancel":
             res = runner.cancel(a.run_id)
+        elif a.op == "gc":
+            from . import gc as gc_mod
+            if a.apply:
+                res = gc_mod.apply_removal(days=a.days,
+                                           include_judged=a.include_judged)
+            else:
+                res = gc_mod.candidates(days=a.days)
         elif a.op == "recompute":
             res = runner.recompute(a.run_id)
         elif a.op == "list":
