@@ -82,7 +82,6 @@ class SDTrainer(BaseSDTrainProcess):
         #     self.scaler._unscale_grads_ = _unscale_grads_replacer
 
         self.cached_blank_embeds: Optional[PromptEmbeds] = None
-        self.cached_trigger_embeds: Optional[PromptEmbeds] = None
         self.diff_output_preservation_embeds: Optional[PromptEmbeds] = None
         # fallback class-only embeds for when the text encoder is unloaded and
         # per item DOP embeds were not cached to disk
@@ -215,8 +214,9 @@ class SDTrainer(BaseSDTrainProcess):
             ))
         if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
             targets.append(('blank', '', {}))
-            if self.trigger_word is not None:
-                targets.append(('trigger', self.trigger_word, {}))
+            # no 'trigger' kind: a trigger word never belongs in any dropout
+            # slot (owner contract 2026-10-27) -- see the dropout swap in
+            # train_single_accumulation
             if self.train_config.diff_output_preservation:
                 targets.append((
                     'dop_class',
@@ -351,8 +351,6 @@ class SDTrainer(BaseSDTrainProcess):
                 ).detach()
             elif kind == 'blank':
                 self.cached_blank_embeds = embeds
-            elif kind == 'trigger':
-                self.cached_trigger_embeds = embeds
             elif kind == 'dop_class':
                 self.cached_dop_class_embeds = embeds
                 self.diff_output_preservation_embeds = embeds
@@ -569,10 +567,6 @@ class SDTrainer(BaseSDTrainProcess):
                 self.sd.text_encoder_to(self.device_torch)
                 self.cached_blank_embeds = self.encode_static_prompt("")
                 self._save_fixed_embed('blank', '', {}, self.cached_blank_embeds)
-                if self.trigger_word is not None:
-                    self.cached_trigger_embeds = self.encode_static_prompt(self.trigger_word)
-                    self._save_fixed_embed(
-                        'trigger', self.trigger_word, {}, self.cached_trigger_embeds)
                 if self.train_config.diff_output_preservation:
                     self.cached_dop_class_embeds = self.encode_static_prompt(self.train_config.diff_output_preservation_class)
                     self.diff_output_preservation_embeds = self.cached_dop_class_embeds
@@ -2126,13 +2120,15 @@ class SDTrainer(BaseSDTrainProcess):
                                     self.device_torch, dtype=dtype
                                 )
                             else:
+                                # dropout / caption-less step: ALWAYS the
+                                # blank embed. The trigger word identifies
+                                # the trained subject; injecting it here
+                                # would mingle the conditional and
+                                # unconditional training classes (owner
+                                # contract 2026-10-27)
                                 embeds_to_use = self.cached_blank_embeds.clone().detach().to(
                                     self.device_torch, dtype=dtype
                                 )
-                                if self.cached_trigger_embeds is not None and not is_reg:
-                                    embeds_to_use = self.cached_trigger_embeds.clone().detach().to(
-                                        self.device_torch, dtype=dtype
-                                    )
                                 conditional_embeds = concat_prompt_embeds(
                                     [embeds_to_use] * noisy_latents.shape[0]
                                 )
@@ -2234,6 +2230,14 @@ class SDTrainer(BaseSDTrainProcess):
                             if self.train_config.diff_output_preservation:
                                 # datasets can have their own trigger words, replace per item
                                 def replace_trigger_with_class(prompt, file_item):
+                                    if getattr(file_item, '_caption_was_dropped', False):
+                                        # dropout means DROPPED for the regular
+                                        # pass (''), but DOP is not dropout: on
+                                        # a dropped step the regularisation
+                                        # prediction still conditions on the
+                                        # class side (owner contract
+                                        # 2026-10-27; matches cached mode)
+                                        return file_item.get_dop_dropout_caption()
                                     # inline [trigger:X class:Y] tokens were already swapped to
                                     # their trigger words in the caption, swap those back to classes
                                     pairs = getattr(file_item, '_inline_dop_pairs', None)
