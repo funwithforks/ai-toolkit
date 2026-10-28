@@ -48,27 +48,32 @@ export default Plugin.define({
       editor.add({
         name: "runtool_suites",
         description:
-          "List the runtool suite registry: suite ids, variants, typed params " +
-          "(defaults/bounds), declared metrics, and declared markers (the named " +
-          "log facts you can set expectations on). Call before submit.",
+          "The single vocabulary source: suite ids, variants, typed params " +
+          "(defaults/bounds), declared metrics, declared markers (the named " +
+          "log facts you can set expectations on), and the config_patch " +
+          "allowlist. Call before submit — never carry params in memory.",
         input: { type: "object", properties: {}, additionalProperties: false },
         execute: wrap(dir, () => ["suites"]),
       })
       editor.add({
         name: "runtool_submit",
         description:
-          "Submit a registered suite run. Validates suite/variant/params BEFORE " +
-          "launch (unknown anything = rejected, nothing starts). Returns a run_id " +
-          "immediately; use runtool_wait to block until done. Params is a JSON " +
-          'object string, e.g. {"dataset":"<key from datasets.json>",' +
-          '"steps":120,"warmup":20}. ' +
-          "Declare the run's INTENT with expect (JSON object): marker presence " +
-          "or captured values from the suite's declared markers (see " +
-          "runtool_suites), and metric bounds. runtool_wait then returns a " +
-          "PASS/FAIL verdict with one line per check — never grep the logs to " +
-          'decide if a run did what it meant to. Example: {"markers":' +
-          '{"te_skip":"present","te_load":"absent","plan":{"planned":"19"}},' +
-          '"metrics":{"loss_final":{"max":1.5}}}.',
+          "The workflow: runtool_suites -> submit -> runtool_wait. Submit " +
+          "a registered suite run and get a run_id immediately; wait " +
+          "blocks until done and returns metrics + markers + phases + " +
+          "verdict. NEVER sleep to wait for a run and NEVER shell-grep " +
+          "the record's stdout.log — if you think you need a timer, you " +
+          "needed wait. Validates suite/variant/params BEFORE launch " +
+          "(unknown anything = rejected, nothing starts). Params is a " +
+          'JSON object string, e.g. {"dataset":"<key from the datasets ' +
+          'registry>","steps":120,"warmup":20}. Declare the run\'s INTENT ' +
+          "with expect (JSON object): marker presence or captured " +
+          "values from the suite's declared markers, and metric bounds — " +
+          "wait then returns a PASS/FAIL verdict with one line per check. " +
+          'Example: {"markers":{"te_skip":"present","plan":{"planned":' +
+          '"19"}},"metrics":{"loss_final":{"max":1.5}}}. Jobs-subtree ' +
+          "runs are exclusive: while one is live, queue with after " +
+          "instead of racing it.",
         input: {
           type: "object",
           properties: {
@@ -140,8 +145,9 @@ export default Plugin.define({
           "Block until the run exits / is cancelled / times out, then return " +
           "its verdict in the SAME response: status, exit code, metrics, " +
           "extracted markers, phase summary, and the PASS/FAIL expect verdict " +
-          "when one was declared at submit. This replaces polling and " +
-          "log-scraping; it watches the recorded pid. status is one of done, " +
+          "when one was declared at submit. This is the ONLY correct way to " +
+          "wait for a run: never sleep-then-check, never grep stdout.log — " +
+          "a timer here means you needed this call. status is one of done, " +
           "failed, crash (exit code attached), cancelled, timeout. A declared " +
           "marker that never appeared is a named FAIL, not a shrug. Queued " +
           "runs count as in-flight: waiting on one also drives the queue " +
@@ -192,7 +198,10 @@ export default Plugin.define({
           "raw text (0 = whole file); grep runs YOUR regex over the full " +
           "record with line numbers (context = surrounding lines); showConfig " +
           "inlines the derived config. The sanctioned way to read a run's " +
-          "own logs — richer than shell grep and one call.",
+          "own logs — richer than shell grep and one call. If the fact you " +
+          "need is NOT a declared marker, file runtool_complain " +
+          "(missing-measurement) instead of re-grepping every future run " +
+          "for it.",
         input: {
           type: "object",
           properties: {
@@ -248,7 +257,10 @@ export default Plugin.define({
       })
       editor.add({
         name: "runtool_cancel",
-        description: "Signal the recorded process group of a running run (TERM then KILL).",
+        description:
+          "Signal the recorded process group of a running run (TERM then " +
+          "KILL). Cancelling a queued run cancels it without spawning, and " +
+          "cancels everything queued behind it.",
         input: {
           type: "object",
           properties: { run_id: { type: "string" } },
@@ -256,6 +268,64 @@ export default Plugin.define({
           additionalProperties: false,
         },
         execute: wrap(dir, (a) => ["cancel", str(a.run_id)]),
+      })
+      editor.add({
+        name: "runtool_complain",
+        description:
+          "File a complaint about the runtool tool itself. One line, cheap " +
+          "on purpose: if a runtool call made your job harder, file BEFORE " +
+          "working around it — the workaround hides the bug you just paid " +
+          "to find. Use missing-measurement when a fact you keep grepping " +
+          "for is not a declared marker; api-confusion when a call did not " +
+          "do what its text promised; misleading-output, ergonomics, " +
+          "doc-gap, other.",
+        input: {
+          type: "object",
+          properties: {
+            category: {
+              type: "string",
+              description:
+                "api-confusion | misleading-output | missing-measurement " +
+                "| ergonomics | doc-gap | other",
+            },
+            text: { type: "string", description: "what hurt, and the workaround you paid to find" },
+            run_id: { type: "string", description: "the run it happened on (optional)" },
+            cost: { type: "string", description: "what the workaround cost" },
+            agent: { type: "string", description: "who is filing" },
+          },
+          required: ["category", "text"],
+          additionalProperties: false,
+        },
+        execute: wrap(dir, (a) => [
+          "complain",
+          "--category",
+          str(a.category),
+          "--text",
+          str(a.text),
+          ...(a.run_id ? ["--run-id", str(a.run_id)] : []),
+          ...(a.cost ? ["--cost", str(a.cost)] : []),
+          ...(a.agent ? ["--agent", str(a.agent)] : []),
+        ]),
+      })
+      editor.add({
+        name: "runtool_complaints",
+        description:
+          "Read the complaint channel: newest first; stats aggregates by " +
+          "category x suite — that aggregate is the agenda for tool " +
+          "sessions.",
+        input: {
+          type: "object",
+          properties: {
+            stats: { type: "boolean" },
+            limit: { type: "number" },
+          },
+          additionalProperties: false,
+        },
+        execute: wrap(dir, (a) => [
+          "complaints",
+          ...(a.stats ? ["--stats"] : []),
+          ...(a.limit != null ? ["--limit", String(a.limit)] : []),
+        ]),
       })
     })
   },
