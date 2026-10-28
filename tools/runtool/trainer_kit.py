@@ -106,6 +106,10 @@ def base_params(**extra):
             desc="metrics window starts after this step",
         ),
         "seed": Param("int", default=42, min=0, max=2**31 - 1),
+        "kind": Param(
+            "enum", default="lora", choices=("lora", "full"),
+            desc="training kind carried in the job name",
+        ),
         "ckpt": Param(
             "bool", default=True,
             desc="train.gradient_checkpointing (recompute saves memory, "
@@ -157,16 +161,35 @@ TRAINER_MARKERS = {
 }
 
 
-def job_name(namespace):
-    """<NAMESPACE>_<dataset>_bs<batch>_<steps>[_<tag>] (owner rule: the
-    name carries the dataset key and the batch, never a real path)."""
-    def build(params):
+def job_name_base(namespace):
+    """Approved naming format (owner 2026-10-28; agent-utility is the
+    bar -- the name carries what the AGENT varied, not what the
+    template implies):
+
+      <NAMESPACE>_<kind>_<dataset>_bs<N>[_<flags>...][_purpose]_v<N>
+
+    flags are derived: nockpt (ckpt off), samp (sample on), dop (a
+    caption-dropout patch > 0), plus suite extras (e.g. novarlen).
+    purpose is the tag. The version is appended by reservation, never
+    guessed here."""
+    def build(params, ctx=None):
+        ctx = ctx or {}
         parts = [
             namespace,
+            safe_run_component(params.get("kind") or "lora"),
             safe_run_component(params["dataset"]),
             safe_run_component(f"bs{params['batch_size']}"),
-            safe_run_component(str(params["steps"])),
         ]
+        if not bool(params.get("ckpt", True)):
+            parts.append("nockpt")
+        if bool(params.get("sample", False)):
+            parts.append("samp")
+        for path, value in (ctx.get("config_patch") or {}).items():
+            if "caption_dropout_rate" in path and float(value or 0) > 0:
+                parts.append("dop")
+                break
+        for flag in (ctx.get("extra_flags") or ()):
+            parts.append(safe_run_component(flag))
         if params.get("tag"):
             parts.append(safe_run_component(params["tag"]))
         return "_".join(parts)
@@ -209,7 +232,7 @@ def patchable(prefix):
 
 
 def merge_plan(params, overrides, config_patch, name, *, prefix,
-               patchable_paths, fields=None):
+               patchable_paths, fields=None, jobs_root=None):
     """Derive the run config from base template + suite params +
     config_patch, with a provenance row for every field any layer
     touched. Raises ParamError listing EVERY unresolved conflict:
@@ -292,6 +315,18 @@ def merge_plan(params, overrides, config_patch, name, *, prefix,
     cfg["name"] = name
     prov.append({"path": "config.name", "source": "suite-policy(name)",
                  "value": name})
+    if jobs_root:
+        # F3 placement: tool jobs never land in output/ proper; one
+        # reapable subtree the mount already reads
+        for i, proc in enumerate(cfg["config"].get("process", [])):
+            old = proc.get("training_folder")
+            proc["training_folder"] = jobs_root
+            row = {"path": f"config.process[{i}].training_folder",
+                   "source": "suite-policy(job-placement)",
+                   "value": jobs_root}
+            if old is not None and old != jobs_root:
+                row["against_template"] = old
+            prov.append(row)
     if not bool(params.get("sample", False)):
         proc = cfg["config"]["process"][0]
         save = proc.setdefault("save", {})
@@ -411,25 +446,52 @@ class TrainerKit:
     """
 
     def __init__(self, *, namespace, module, prefix="config.process[0]",
-                 extra_params=None, extra_markers=None, build_env=None):
+                 extra_params=None, extra_markers=None, build_env=None,
+                 extra_flags=None, jobs_root=None):
+        from .runner import RUNS_ROOT  # no cycle: runner never imports kit
+
         self.namespace = namespace
         self.module = module
         self.prefix = prefix
         self.extra_params = extra_params or {}
         self.extra_markers = dict(extra_markers or {})
         self.build_env = build_env or (lambda p, paths: {})
-        self.job_name = job_name(namespace)
+        self.extra_flags = extra_flags or (lambda p: [])
+        self.jobs_root = jobs_root or os.path.join(RUNS_ROOT, "jobs")
+        self.job_name = job_name_base(namespace)
         self.patchable = patchable(prefix)
 
     # -- derivation (used by precheck, resolve and the harness) ----------
 
+    def _named_ctx(self, params, ctx):
+        ctx = dict(ctx or {})
+        ctx.setdefault("extra_flags", tuple(self.extra_flags(params)))
+        return ctx
+
     def plan(self, params, ctx):
-        ctx = ctx or {}
+        ctx = self._named_ctx(params, ctx)
+        name = ctx.get("job_name") or self.job_name(params, ctx)
         return merge_plan(
             params, ctx.get("overrides"), ctx.get("config_patch"),
-            self.job_name(params), prefix=self.prefix,
-            patchable_paths=self.patchable,
+            name, prefix=self.prefix, patchable_paths=self.patchable,
+            jobs_root=self.jobs_root,
         )
+
+    def reserve(self, params, ctx=None):
+        """Claim the versioned job dir (F3): creating the dir IS the
+        reservation; a same-name race bumps the version, never shares."""
+        ctx = self._named_ctx(params, ctx)
+        base = self.job_name(params, ctx)
+        os.makedirs(self.jobs_root, exist_ok=True)
+        for v in range(1, 1000):
+            name = f"{base}_v{v}"
+            d = os.path.join(self.jobs_root, name)
+            try:
+                os.mkdir(d)
+                return name, d
+            except FileExistsError:
+                continue
+        raise ParamError(f"cannot reserve a job dir for {base!r} in 999 tries")
 
     def derive_config(self, params, name, out_path, overrides=None,
                       config_patch=None):
@@ -437,7 +499,7 @@ class TrainerKit:
 
         cfg, prov = merge_plan(
             params, overrides, config_patch, name, prefix=self.prefix,
-            patchable_paths=self.patchable,
+            patchable_paths=self.patchable, jobs_root=self.jobs_root,
         )
         folders = load_map(params["dataset"])
         ds = cfg["config"]["process"][0]["datasets"]
@@ -506,7 +568,10 @@ class TrainerKit:
             manifest = json.load(f)
         params = manifest["params"]
 
-        name = self.job_name(params)
+        # name/dir were reserved in the submit process (F3); the harness
+        # uses them -- the run dir already exists, an empty dir is not a
+        # reuse trap (only optimizer.pt is)
+        name = manifest.get("job_name") or self.job_name(params)
         cfg_path = os.path.join(paths.artifacts, "config.yaml")
         cfg = self.derive_config(
             params, name, cfg_path,
@@ -517,6 +582,24 @@ class TrainerKit:
         for proc in cfg["config"].get("process", []):
             folder = proc.get("training_folder", folder)
         job_dir = os.path.join(folder, name)
+
+        # divergence guard: the submit process reserved the exact job
+        # dir; if the harness's independent derivation disagrees, the
+        # layers drifted -- fail loudly rather than write somewhere else
+        reserved = manifest.get("job_dir")
+        if reserved and os.path.realpath(reserved) != os.path.realpath(job_dir):
+            emit(paths, "job_dir_divergence", reserved=reserved,
+                 derived=job_dir)
+            with open(paths.result + ".tmp", "w") as f:
+                json.dump(
+                    {"ok": False,
+                     "error": f"job dir divergence: reserved {reserved!r} "
+                              f"but config derives {job_dir!r}; refusing "
+                              f"to run outside the reservation"},
+                    f, indent=1,
+                )
+            os.replace(paths.result + ".tmp", paths.result)
+            return 1
 
         # reuse-trap guard: a finished/partial job under this name makes
         # the trainer RESUME (optimizer.pt), i.e. a bogus fast "done" --
@@ -589,7 +672,8 @@ class TrainerKit:
 
     # -- assembly -----------------------------------------------------------
 
-    def suite(self, *, suite_id, variants, timeout_s, desc, metrics=None):
+    def suite(self, *, suite_id, variants, timeout_s, desc, metrics=None,
+              retention="disposable"):
         markers = dict(TRAINER_MARKERS)
         markers.update(self.extra_markers)
         return Suite(
@@ -601,7 +685,9 @@ class TrainerKit:
             parse=parse_metrics,
             precheck=self.precheck,
             resolve=self.resolve,
+            reserve=self.reserve,
             patchable=self.patchable,
+            retention=retention,
             markers=markers,
             phases=dmark.trainer_phases,
             timeout_s=timeout_s,

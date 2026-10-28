@@ -141,6 +141,15 @@ class Suite:
     # NOT listable -- patch-vs-param claims on the same field are the
     # silent-merge class this whole layer exists to kill.
     patchable: tuple = ()
+    # reserve(ctx) -> (job_name, job_dir); runs in the SUBMIT process
+    # after precheck passed: claims the versioned job directory (F3) so
+    # the submit response can name the exact job dir. Creating the dir
+    # IS the reservation (races lose and bump the version).
+    reserve: Callable = None
+    # "disposable" (reapable by gc) | "judged" (owner's 2026-10-24
+    # standard: quality/sample runs are judged, artifacts survive until
+    # judgment). sample=true always records judged regardless.
+    retention: str = "disposable"
     # markers: name -> regex, matched against the harness-recorded
     # stdout/stderr (see markers.py). Declared markers make the run's
     # intent checkable from the tool return instead of grep-slop.
@@ -166,6 +175,11 @@ class Suite:
             raise ParamError(f"suite {self.id!r}: unsupported done condition")
         if not self.metrics:
             raise ParamError(f"suite {self.id!r}: no metrics declared")
+        if self.retention not in ("disposable", "judged"):
+            raise ParamError(
+                f"suite {self.id!r}: retention must be 'disposable' or "
+                f"'judged', got {self.retention!r}"
+            )
         for name, pattern in (self.markers or {}).items():
             try:
                 re.compile(pattern)

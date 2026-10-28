@@ -17,9 +17,11 @@ further param appears here only once its model-level switch exists and
 is measured on THIS model (per-model rollout rule -- krea2/H3/LTX/flux3
 verdicts are not inherited, only their measurement discipline).
 
-Job naming: MOSS_<dataset>_bs<batch>_<steps>[_<tag>] (kit mechanism,
-owner rule). Dataset folder paths never live in tracked code: they
-resolve at run time from the machine-local registry (gitignored).
+Job naming (kit mechanism, approved format):
+MOSS_<kind>_<dataset>_bs<N>[_<flags>][_purpose]_v<N> -- flags derived
+(nockpt/samp/dop/novarlen), purpose is the tag, version reserved at
+submit. Dataset folder paths never live in tracked code: they resolve
+at run time from the machine-local registry (gitignored).
 """
 
 from ..registry import Param
@@ -36,6 +38,8 @@ _kit = TrainerKit(
                  "restores the legacy masked mem-efficient path for A/B",
         ),
     },
+    extra_flags=lambda params: [] if params.get("varlen", True)
+    else ["novarlen"],
     build_env=lambda params, paths: {
         # the packed-varlen model switch (flash_varlen.varlen_ok reads
         # the env; default on). A/B: varlen=false reruns the masked
