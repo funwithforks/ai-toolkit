@@ -223,12 +223,12 @@ def evaluate(expect, marker_hits, metrics):
     return {"verdict": verdict, "checks": checks}
 
 
-# ------------------------------------------------------------ moss phases
+# ------------------------------------------------------------ trainer phases
 # The phase fold for the phased-loading contract (TE gate / caption plan /
-# fixed-embed source / VAE sample rounds). Generic helpers exist so other
-# suites can write their own fold; moss is the reference.
+# fixed-embed source / VAE sample rounds) -- shared trainer prints, so any
+# trainer-kit suite gets the same summary from its marker declarations.
 
-def moss_phases(paths, suite, full):
+def trainer_phases(paths, suite, full):
     hits = scan(paths, suite, full)
     out = {}
     te = hits.get("te_skip", {})
