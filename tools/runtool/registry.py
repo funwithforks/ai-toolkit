@@ -131,6 +131,14 @@ class Suite:
     # The harness keeps its own copy of any check it guards -- precheck is
     # for rejecting at the tool call, not for trusting the caller.
     precheck: Callable = None
+    # markers: name -> regex, matched against the harness-recorded
+    # stdout/stderr (see markers.py). Declared markers make the run's
+    # intent checkable from the tool return instead of grep-slop.
+    # Default {} -- suites that declare nothing are untouched (opt-in).
+    markers: dict = field(default_factory=dict)
+    # phases(paths: RunPaths, suite, full: bool) -> dict; compact ordered
+    # phase summary folded from the marker hits (e.g. te/cache_plan).
+    phases: Callable = None
     done: str = "result.json"  # the contract value; validated below
     timeout_s: int = 3600
     desc: str = ""
@@ -148,6 +156,14 @@ class Suite:
             raise ParamError(f"suite {self.id!r}: unsupported done condition")
         if not self.metrics:
             raise ParamError(f"suite {self.id!r}: no metrics declared")
+        for name, pattern in (self.markers or {}).items():
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                raise ParamError(
+                    f"suite {self.id!r}: marker {name!r} is not a valid "
+                    f"regex: {e}"
+                )
 
     def validate(self, variant: str, overrides: dict) -> dict:
         if variant not in self.variants:
