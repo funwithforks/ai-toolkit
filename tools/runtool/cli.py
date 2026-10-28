@@ -78,6 +78,10 @@ def main(argv=None):
         'JSON intent, graded at wait: {"markers":{"te_skip":"present",'
         '"plan":{"planned":"19"}},"metrics":{"loss_final":{"max":1.5}}}'
     ))
+    p.add_argument("--config-patch", default=None, help=(
+        "JSON object of dotted config paths to override (suite allowlist "
+        'applies), e.g. {"config.process[0].train.lr": 0.0001}'
+    ))
 
     for name in ("wait", "status", "cancel", "recompute"):
         p = sub.add_parser(name)
@@ -112,6 +116,7 @@ def main(argv=None):
                     "timeout_s": s.timeout_s,
                     "metrics": s.metrics,
                     "markers": s.markers,
+                    "patchable": list(s.patchable),
                     "params": {
                         k: {
                             "kind": v.kind,
@@ -158,8 +163,13 @@ def main(argv=None):
             expect = None
             if a.expect is not None:
                 expect = json.loads(a.expect)
+            patch = None
+            if a.config_patch is not None:
+                patch = json.loads(a.config_patch)
+                if not isinstance(patch, dict):
+                    raise ParamError("--config-patch must be a JSON object")
             res = runner.submit(a.suite, a.variant, params, note=a.note,
-                                expect=expect)
+                                expect=expect, config_patch=patch)
         elif a.op == "wait":
             res = runner.wait(a.run_id, timeout_s=a.timeout_s)
         elif a.op == "status":

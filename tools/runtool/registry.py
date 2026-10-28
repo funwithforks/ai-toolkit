@@ -126,11 +126,21 @@ class Suite:
     # parse(paths: RunPaths, params: dict) -> metrics dict (must reproduce
     # result.json metrics from the record alone)
     parse: Callable = None
-    # precheck(params) -> None; runs in the SUBMIT process after validate,
-    # before anything launches. Raise ParamError to reject with teaching.
-    # The harness keeps its own copy of any check it guards -- precheck is
-    # for rejecting at the tool call, not for trusting the caller.
+    # precheck(params, ctx) -> None; runs in the SUBMIT process after
+    # validate, before anything launches. ctx = {"overrides": the params
+    # the submitter EXPLICITLY passed, "config_patch": dotted-path
+    # overrides}. Raise ParamError to reject with teaching. The harness
+    # keeps its own copy of any check it guards -- precheck is for
+    # rejecting at the tool call, not for trusting the caller.
     precheck: Callable = None
+    # resolve(params, ctx) -> small dict echoed in the submit response
+    # (e.g. the loud-merge provenance table); runs after precheck passes.
+    resolve: Callable = None
+    # config_patch allowlist: the exact dotted config paths an agent may
+    # override at submit. Paths owned by suite params are deliberately
+    # NOT listable -- patch-vs-param claims on the same field are the
+    # silent-merge class this whole layer exists to kill.
+    patchable: tuple = ()
     # markers: name -> regex, matched against the harness-recorded
     # stdout/stderr (see markers.py). Declared markers make the run's
     # intent checkable from the tool return instead of grep-slop.

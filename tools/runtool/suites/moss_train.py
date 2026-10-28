@@ -221,49 +221,192 @@ def _datasets_precheck(params):
         params["dataset"], _load_map(params["dataset"]))
 
 
-def _derive_config(params, name, out_path):
+# ---- loud-merge layers (F2): patch > explicit param > template > param
+# default; conflicts reject before launch. The template is read-only to
+# every layer; the derived config + a provenance row per touched field
+# is what the job actually runs.
+
+_TRAIN = "config.process[0].train"
+
+# param -> (config path, value-from-param). Fields listed here are
+# PARAM-OWNED: config_patch may never claim them (that would be a
+# param-vs-patch fight on one field -- the silent-merge class).
+_PARAM_FIELDS = {
+    "batch_size": (_TRAIN + ".batch_size", lambda p: int(p["batch_size"])),
+    "steps": (_TRAIN + ".steps", lambda p: int(p["steps"])),
+    "ckpt": (_TRAIN + ".gradient_checkpointing", lambda p: bool(p["ckpt"])),
+    "sample": (_TRAIN + ".disable_sampling", lambda p: not bool(p["sample"])),
+}
+_PARAM_OWNED = {path: name for name, (path, _) in _PARAM_FIELDS.items()}
+
+# the config vocabulary this suite layers over: knob name -> who owns it
+PATCHABLE = (
+    _TRAIN + ".lr",
+    _TRAIN + ".optimizer",
+    _TRAIN + ".gradient_accumulation",
+    _TRAIN + ".cache_text_embeddings",
+    _TRAIN + ".unload_text_encoder",
+    _TRAIN + ".dtype",
+    "config.process[0].sample.sample_every",
+    "config.process[0].sample.comfy",
+    "config.process[0].sample.seed",
+    "config.process[0].datasets[0].caption_dropout_rate",
+    "config.process[0].datasets[0].num_repeats",
+)
+
+
+def merge_plan(params, overrides, config_patch, name):
+    """Derive the run config from base template + suite params +
+    config_patch, with a provenance row for every field any layer
+    touched. Raises ParamError listing EVERY unresolved conflict:
+    a defaulted param disagreeing with an explicit template value
+    (the silent sample-disable incident, now structurally refused --
+    name the knob or the template edits, submit decides explicitly)."""
     import yaml
 
-    with open(params["base"]) as f:
-        cfg = yaml.safe_load(f)
-    # Owner-template rule: change ONLY name, steps, batch_size, sampling
-    # off, ckpt, save pin. Anything else requires owner sign-off.
+    from .. import dotpath
+
+    try:
+        with open(params["base"]) as f:
+            cfg = yaml.safe_load(f)
+    except FileNotFoundError:
+        raise ParamError(f"base template {params['base']!r} does not exist")
+    except yaml.YAMLError as e:
+        raise ParamError(f"base template {params['base']!r} is not valid YAML: {e}")
+
+    overrides = set(overrides or ())
+    config_patch = dict(config_patch or {})
+    prov, conflicts = [], []
+
+    # -- param layer ------------------------------------------------------
+    for pname, (path, pick) in _PARAM_FIELDS.items():
+        segs = dotpath.parse(path)
+        value = pick(params)
+        template_v = dotpath.get(cfg, segs)
+        if pname in overrides:
+            note = {"path": path, "source": "param", "value": value}
+            if template_v is not dotpath.MISSING and template_v != value:
+                note["against_template"] = template_v  # explicit: wins, logged
+            dotpath.setval(cfg, segs, value)
+            prov.append(note)
+        else:
+            if template_v is not dotpath.MISSING and template_v != value:
+                if pname == "sample":
+                    opts = (f"pass sample={bool(params['sample'])} to "
+                            f"override the template, or "
+                            f"sample={not bool(params['sample'])} to keep it")
+                else:
+                    opts = (f"pass {pname}={params.get(pname)!r} "
+                            f"explicitly to override the template")
+                conflicts.append(
+                    f"{path}: template sets {template_v!r} but suite param "
+                    f"{pname!r} (default) would set {value!r}. Defaults do "
+                    f"not silently override templates -- {opts}"
+                )
+                continue
+            dotpath.setval(cfg, segs, value)
+            prov.append({"path": path, "source": "param(default)",
+                         "value": value})
+
+    # -- patch layer -------------------------------------------------------
+    for path, value in sorted(config_patch.items()):
+        if path in _PARAM_OWNED:
+            conflicts.append(
+                f"config_patch {path!r} claims a field owned by suite "
+                f"param {_PARAM_OWNED[path]!r}; use the param, not a patch"
+            )
+            continue
+        if path not in PATCHABLE:
+            conflicts.append(
+                f"config_patch {path!r} is not patchable for this suite; "
+                f"allowed: {list(PATCHABLE)}"
+            )
+            continue
+        try:
+            segs = dotpath.parse(path)
+            before = dotpath.get(cfg, segs)
+            dotpath.setval(cfg, segs, value, allow_new=False)
+        except (ValueError, KeyError) as e:
+            conflicts.append(f"config_patch {path!r}: {e}")
+            continue
+        prov.append({"path": path, "source": "patch", "value": value,
+                     "was": None if before is dotpath.MISSING else before})
+
+    # -- suite policy pins (not layerable; owner 2026-10-24 standard) -----
     cfg["config"]["name"] = name
     cfg["name"] = name
-    proc = cfg["config"]["process"][0]
-    train = proc["train"]
-    train["batch_size"] = int(params["batch_size"])
-    train["steps"] = int(params["steps"])
-    # Sampling/save policy follows the owner's 2026-10-24 standard:
-    # measurement runs (sample=false, default) run the sample block inert
-    # (comfy remote included) and never write safetensors -- save pinned
-    # past the last step (save params live in the save: block,
-    # toolkit/config_modules.py:25). Quality runs (sample=true) keep BOTH
-    # blocks exactly as the owner template has them.
-    sample = bool(params.get("sample", False))
-    train["disable_sampling"] = not sample
-    train["gradient_checkpointing"] = bool(params["ckpt"])
-    # no model_kwargs switches yet: MOSS wires no perf knobs (per-model
-    # rollout rule); the block ships as the owner set it
-    if not sample:
+    prov.append({"path": "config.name", "source": "suite-policy(name)",
+                 "value": name})
+    if not bool(params.get("sample", False)):
+        proc = cfg["config"]["process"][0]
         save = proc.setdefault("save", {})
         save["save_every"] = int(params["steps"]) + 1
         save["max_step_saves_to_keep"] = 1
+        prov.append({"path": "config.process[0].save",
+                     "source": "suite-policy(measurement-never-saves)",
+                     "value": {"save_every": save["save_every"],
+                               "max_step_saves_to_keep": 1}})
+
+    if conflicts:
+        raise ParamError(
+            "config merge refused (nothing launched):\n  - "
+            + "\n  - ".join(conflicts)
+        )
+    return cfg, prov
+
+
+def _merge_ctx(params, ctx, name):
+    cfg, prov = merge_plan(
+        params,
+        (ctx or {}).get("overrides"),
+        (ctx or {}).get("config_patch"),
+        name,
+    )
+    return cfg, prov
+
+
+def _datasets_precheck(params, ctx=None):
+    # submit-process rejection (runner.submit -> Suite.precheck): a bad
+    # dataset or a conflicted config merge never becomes a doomed
+    # launch. The harness re-runs the same checks in _derive_config so
+    # a direct harness call cannot skip them.
+    _tool_dataset_check(
+        params["dataset"], _load_map(params["dataset"]))
+    _merge_ctx(params, ctx, _job_name(params))  # conflicts raise
+
+
+def _resolve(params, ctx=None):
+    # submit-response echo: the exact layer decisions, small and
+    # greppable, before anything launches
+    _, prov = _merge_ctx(params, ctx, _job_name(params))
+    return {"provenance": prov,
+            "config_file": "artifacts/config.yaml (written by harness)"}
+
+
+def _derive_config(params, name, out_path, overrides=None,
+                   config_patch=None):
+    import yaml
+
+    cfg, prov = merge_plan(params, overrides, config_patch, name)
+    # dataset folders resolve through the registry, then stay tool-owned
     folders = _load_map(params["dataset"])
-    ds = proc["datasets"]
+    ds = cfg["config"]["process"][0]["datasets"]
     if len(folders) != len(ds):
-        raise SystemExit(
-            f"datasets.json gives {len(folders)} folders for "
-            f"{params['dataset']!r}, template has {len(ds)} dataset entries"
+        raise ParamError(
+            f"dataset {params['dataset']!r} maps {len(folders)} folders, "
+            f"template has {len(ds)} dataset entries"
         )
     for entry, folder in zip(ds, folders):
         entry["folder_path"] = folder
     # datasets are always tool-owned (owner policy 2026-10-28). The same
-    # check runs in the submit process via SUITE.precheck; this copy guards
-    # the harness path so nothing can train on a non-tool folder
+    # check runs in the submit process via SUITE.precheck; this copy
+    # guards the harness path so nothing can train on a non-tool folder
     _tool_dataset_check(params["dataset"], folders)
     with open(out_path, "w") as f:
         yaml.safe_dump(cfg, f)
+    with open(out_path.replace("config.yaml", "config_provenance.json"),
+              "w") as f:
+        json.dump(prov, f, indent=1)
     return cfg
 
 
@@ -332,7 +475,9 @@ def main(argv=None):
 
     name = _job_name(params)
     cfg_path = os.path.join(paths.artifacts, "config.yaml")
-    cfg = _derive_config(params, name, cfg_path)
+    cfg = _derive_config(params, name, cfg_path,
+                         overrides=manifest.get("overrides"),
+                         config_patch=manifest.get("config_patch"))
     folder = "output"
     for proc in cfg["config"].get("process", []):
         folder = proc.get("training_folder", folder)
@@ -469,6 +614,8 @@ SUITE = Suite(
     build=_build,
     parse=_parse,
     precheck=_datasets_precheck,
+    resolve=_resolve,
+    patchable=PATCHABLE,
     # marker lines live in the trainer's prints (SDTrainer.py,
     # dataloader_mixins.py, model phase code); these patterns were taken
     # from real records, do not "prettify" them without re-checking
