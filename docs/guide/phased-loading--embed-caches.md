@@ -49,11 +49,13 @@ Owner: `TextEmbeddingCachingMixin` (`toolkit/dataloader_mixins.py`).
   `text_embedding_space_version`, `text_embedding_version`, plus control
   conditioning when present. Edit the caption file → different hash → the old
   entry is simply never looked at again.
-- **One item can have up to five targets** (`_caption_embed_targets`,
-  `:2484`): the caption, its DOP variant (trigger-stripped, only if the
-  trigger actually appeared), the dropout (blank/trigger-only) variant under
-  `caption_dropout_rate`, and the D-OPSD self-ref teacher variants. All share
-  the same hash scheme with different caption overrides.
+- **One item can have up to five targets** (`_caption_embed_targets`): the
+  caption, its DOP class variant (only when DOP is on and the caption carries
+  a trigger/inline identity to swap), the shared dropout blank (the empty
+  caption -- `''`, one content-addressed file per media dir per model;
+  DOP adds one shared class-side entry the same way), and the D-OPSD
+  self-ref teacher variants. Real-caption targets hash with a per-item
+  basename prefix; the shared blank/class-side entries have none.
 - **Writing**: `cache_text_embeddings()` (`:2549`) runs in phase 2 and
   encodes only targets failing `_embed_target_valid`.
 - **Consumption**: at train time the DTO loads its files with
@@ -65,9 +67,12 @@ Owner: `TextEmbeddingCachingMixin` (`toolkit/dataloader_mixins.py`).
 
 Owner: `SDTrainer` (`extensions_built_in/sd_trainer/SDTrainer.py`).
 
-Kinds (`_fixed_embed_targets`, `:202`): `unconditional` (the negative prompt),
-`blank`, `trigger`, `dop_class`, and one `sample_pos_N`/`sample_neg_N` pair
-per sample prompt. Each target is `(kind, text, flags)`.
+Kinds (`_fixed_embed_targets`): `unconditional` (the negative prompt),
+`blank`, `dop_class`, and one `sample_pos_N`/`sample_neg_N` pair
+per sample prompt. Each target is `(kind, text, flags)`. There is
+deliberately NO `trigger` kind: a trigger word never belongs in a
+dropout slot (owner contract 2026-10-27; see
+`docs/refactor_notes/DECISION--blank-embeds-and-dop-gating.md`).
 
 - **Path scheme** (`_fixed_embed_cache_path`, `:248`):
   `<training_folder>/.prompt_embed_cache/<md5(model|space)[:12]>/<kind>_<md5(kind|model|space|text|flags)[:16]>.safetensors`

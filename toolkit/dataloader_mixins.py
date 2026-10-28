@@ -581,12 +581,19 @@ class CaptionProcessingDTOMixin:
             raw_caption = self.raw_caption
         if raw_caption is None:
             raw_caption = ''
-        # handle dropout
+        # handle dropout (live mode -- cached mode swaps embeds in
+        # load_prompt_embedding). Either way, dropout means DROPPED: the text
+        # is '' and nothing is injected into it (owner contract
+        # 2026-10-27). Record the decision so this batch's DOP regularisation
+        # side can condition on the class instead -- DOP is not dropout.
+        if not short_caption:
+            self._caption_was_dropped = False
         if self.dataset_config.caption_dropout_rate > 0 and not short_caption and not self.dataset_config.cache_text_embeddings:
             # get a random float form 0 to 1
             rand = random.random()
             if rand < self.dataset_config.caption_dropout_rate:
                 # drop the caption
+                self._caption_was_dropped = True
                 return ''
 
         # tag-style token ops (dropout / shuffle) split on commas; anything else keeps the
@@ -2555,52 +2562,44 @@ class TextEmbeddingFileItemDTOMixin:
         return self._dop_text_embedding_path
 
     def get_dropout_caption(self: 'FileItemDTO'):
-        # CONTRACT (docs/refactor_notes/DECISION--blank-embeds-and-dop-gating.md):
-        # inline [trigger:X class:Y] tokens are INERT unless
-        # diff_output_preservation is on. With DOP off, every item's dropout
-        # text is the plain blank/trigger-only form regardless of inline
-        # tokens. Do not widen the DOP condition below based on this method's
-        # name -- the inline branch exists for the DOP trigger/class pairing.
-        pairs = getattr(self, '_inline_dop_pairs', None)
-        if (pairs is not None and not self.is_reg
-                and self.dataset_config.diff_output_preservation):
-            # DOP on: inline items carry their own identities. do not add the
-            # config trigger on top, that would inject a different character's
-            # name
-            return ' '.join(dict.fromkeys([t for t, c in pairs]))
-        if self.trigger_word is not None and not self.is_reg:
-            # when encoding live, dropped captions still get the trigger word
-            # injected downstream (add_if_not_present when not a reg image),
-            # so match that here
-            return inject_trigger_into_prompt('', trigger=self.trigger_word, add_if_not_present=True)
+        # Dropout means DROPPED: the text is '' for every item, always
+        # (owner contract 2026-10-27). No trigger word, no inline-token
+        # join, no class -- inserting any text into the dropout slot stops
+        # being dropout and lies about the unconditional training class the
+        # trigger identifies. DOP is a separate mechanism (see
+        # get_dop_dropout_caption) and is NOT dropout.
         return ''
 
     def get_dop_dropout_caption(self: 'FileItemDTO'):
-        # Only reachable under DOP: every caller gates on
-        # dataset_config.diff_output_preservation before asking. See
-        # get_dropout_caption for the inline-token contract.
-        # live encoding replaces the trigger word with the preservation class on the
-        # dropped caption (class only), so the cached DOP dropout caption must match
+        # DOP is not dropout: this is the CLASS side of the DOP pair, the
+        # text the regularisation (prior) prediction is conditioned on.
+        # Only reachable under DOP -- every caller gates on
+        # dataset_config.diff_output_preservation before asking.
+        # Multiple inline classes form a serial-comma list ('a, b and c') --
+        # grammatical at any tag count (owner contract 2026-10-27).
         pairs = getattr(self, '_inline_dop_pairs', None)
         if pairs is not None and not self.is_reg:
-            # dropped DOP caption: the inline classes only
-            return ' '.join(dict.fromkeys([c for t, c in pairs]))
-        dropout_caption = self.get_dropout_caption()
-        if self.trigger_word is not None:
-            return dropout_caption.replace(
-                self.trigger_word, self.dataset_config.diff_output_preservation_class
-            )
-        return dropout_caption
+            classes = list(dict.fromkeys([c for t, c in pairs]))
+            if len(classes) > 2:
+                return ', '.join(classes[:-1]) + ' and ' + classes[-1]
+            return ' and '.join(classes)
+        # config-trigger datasets condition on the bare preservation class;
+        # a caption with neither inline tokens nor a trigger drops to the
+        # blank, which aliases onto the shared '' entry
+        if self.trigger_word is not None and not self.is_reg:
+            return self.dataset_config.diff_output_preservation_class
+        return ''
 
     def get_dop_blank_text_embedding_path(self: 'FileItemDTO', recalculate=False):
-        # the DOP class-side blank; shares the dataset-level scheme with the
-        # plain blank (content-addressed, one file per folder per model). If
-        # the DOP dropout text equals the dropout text this hashes to the very
-        # same shared path and the file genuinely is one entry.
+        # The DOP CLASS-side entry (see get_dop_dropout_caption): what the
+        # regularisation prediction conditions on when the caption is dropped
+        # on a DOP step. Shares the dataset-level scheme with the blank
+        # (content-addressed, one file per folder per model); triggerless
+        # tokenless files hash onto the '' blank and dedupe onto it.
         if self._dop_blank_text_embedding_path is not None and not recalculate:
             return self._dop_blank_text_embedding_path
         else:
-            # text_only: dropout embeds carry no control conditioning
+            # text_only: these embeds carry no control conditioning
             self._dop_blank_text_embedding_path = self._build_text_embedding_path(
                 caption_override=self.get_dop_dropout_caption(), text_only=True,
                 shared_name=True,
@@ -2620,8 +2619,17 @@ class TextEmbeddingFileItemDTOMixin:
         return self._dopsd_text_embedding_path
 
     def get_dopsd_dropout_caption(self: 'FileItemDTO'):
-        # dropout caption with the trigger word swapped for the self-reference token
-        dropout_caption = self.get_dropout_caption()
+        # D-OPSD-INTERNAL teacher dropout text (owner: leave D-OPSD as it is).
+        # This is NOT the dataset caption dropout -- dataset dropout is always
+        # '' by contract (get_dropout_caption) and must never route here, and
+        # this derivation must never route there. Do not "align" the two.
+        pairs = getattr(self, '_inline_dop_pairs', None)
+        if pairs is not None and not self.is_reg:
+            dropout_caption = ' '.join(dict.fromkeys([t for t, c in pairs]))
+        elif self.trigger_word is not None and not self.is_reg:
+            dropout_caption = inject_trigger_into_prompt('', trigger=self.trigger_word, add_if_not_present=True)
+        else:
+            dropout_caption = ''
         if self.trigger_word is not None:
             return dropout_caption.replace(
                 self.trigger_word, self.get_dopsd_ref_token()
@@ -2690,8 +2698,10 @@ class TextEmbeddingFileItemDTOMixin:
             self._loaded_text_embedding_path = te_path
         if self.dataset_config.diff_output_preservation and self.dop_prompt_embeds is None:
             if self._caption_was_dropped:
-                # match live encoding, which builds the DOP caption from the
-                # dropped caption (trigger word replaced with the class)
+                # DOP is not dropout: a dropped caption still conditions the
+                # regularisation prediction on the class side (matches the
+                # live path, which routes _caption_was_dropped items through
+                # get_dop_dropout_caption)
                 dop_path = self.get_dop_blank_text_embedding_path()
             else:
                 dop_path = self.get_dop_text_embedding_path()
@@ -2724,21 +2734,24 @@ class TextEmbeddingCachingMixin:
             if dop_path != text_embedding_path:
                 # trigger word was in the caption, cache the DOP version too
                 encode_targets.append((dop_path, file_item.caption_dop))
-        # dropout embeds are encoded as plain text (no control images). The
-        # blank is the dataset-level SHARED entry (one file per media folder
-        # per model, see get_blank_text_embedding_path): planned for every
-        # item, and identical paths collapse at the write side -- the batched
-        # pass dedupes by path, the per-item loop re-checks validity -- so a
-        # folder pays exactly one blank encode. Never compare the blank path
-        # against the per-caption path to skip it: the names differ by design
-        # now, and the reader only ever reads what this planner guarantees.
+        # Dropout embeds are plain text (no control images). The blank is the
+        # embed of '' -- dropout means DROPPED (owner contract 2026-10-27):
+        # nothing is injected into a dropped caption. It is the dataset-level
+        # SHARED entry (one file per media folder per model, see
+        # get_blank_text_embedding_path), planned for every item; identical
+        # paths collapse at the write side (batch pass dedupes by path, the
+        # per-item loop re-checks validity), so a folder pays exactly one
+        # blank encode. DOP is a separate mechanism: it adds the CLASS-side
+        # entry the regularisation prediction conditions on when the caption
+        # is dropped; triggerless tokenless files hash that onto '' and dedupe
+        # onto the blank.
         dropout_target_paths = set()
         if self.dataset_config.caption_dropout_rate > 0:
             blank_path = file_item.get_blank_text_embedding_path(recalculate=True)
             encode_targets.append((blank_path, file_item.get_dropout_caption()))
             dropout_target_paths.add(blank_path)
             if self.dataset_config.diff_output_preservation:
-                # cache the DOP version of the dropout caption (class only)
+                # the DOP class side (see get_dop_dropout_caption)
                 dop_blank_path = file_item.get_dop_blank_text_embedding_path(recalculate=True)
                 if dop_blank_path not in [t[0] for t in encode_targets]:
                     encode_targets.append((dop_blank_path, file_item.get_dop_dropout_caption()))
