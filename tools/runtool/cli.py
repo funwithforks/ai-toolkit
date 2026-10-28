@@ -1,6 +1,14 @@
 """JSON CLI for runtool. Every subcommand prints one JSON object.
 
   suites                      registry (params, bounds, metrics)
+  config-schema [--section S] [--key K] [--class C]
+                              config vocabulary derived from the real
+                              config code (summary | section | one key)
+  datasets [--list | --add K --folder P... | --create K
+            (--synthetic N | --from-key K2 | --from-path P) |
+            --rm K [--delete-files]]
+                              machine-local dataset registry; file
+                              deletion only for tool-created rt_ folders
   submit --suite S --variant V [--params JSON] [--note ...]
   wait   RUN_ID [--timeout-s N]
   status RUN_ID
@@ -13,7 +21,7 @@ import argparse
 import json
 import sys
 
-from . import runner
+from . import datasets, runner, schema
 from .registry import ParamError, registry
 
 
@@ -22,6 +30,36 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="op", required=True)
 
     sub.add_parser("suites")
+
+    p = sub.add_parser("config-schema")
+    p.add_argument("--section", default=None,
+                   help="config section, e.g. train, model, datasets[]")
+    p.add_argument("--key", default=None, help="one key, within --section")
+    p.add_argument("--class", dest="cls", default=None,
+                   help="config class name (overrides --section)")
+
+    p = sub.add_parser("datasets")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--show-paths", action="store_true",
+                   help="include folder paths (owner-side; kept out of "
+                        "default agent-facing output)")
+    p.add_argument("--add", default=None, metavar="KEY",
+                   help="register existing folders under a key")
+    p.add_argument("--folder", action="append", default=None,
+                   help="folder for --add (repeatable)")
+    p.add_argument("--tool-created", action="store_true",
+                   help="mark an --add entry as tool-owned (deletable)")
+    p.add_argument("--create", default=None, metavar="KEY",
+                   help="create a tool dataset (rt_-prefixed folder)")
+    p.add_argument("--from-key", default=None)
+    p.add_argument("--from-path", default=None)
+    p.add_argument("--synthetic", type=int, default=0,
+                   help="N synthetic solid-colour images+captions")
+    p.add_argument("--size", type=int, default=512)
+    p.add_argument("--copy-cache", action="store_true",
+                   help="with a copy source, also carry TE/latent caches")
+    p.add_argument("--rm", default=None, metavar="KEY")
+    p.add_argument("--delete-files", action="store_true")
 
     p = sub.add_parser("submit")
     p.add_argument("--suite", required=True)
@@ -65,7 +103,29 @@ def main(argv=None):
             }
             print(json.dumps(out, indent=1))
             return 0
-        if a.op == "submit":
+        if a.op == "datasets":
+            if a.rm:
+                res = datasets.rm(a.rm, delete_files=a.delete_files)
+            elif a.create:
+                res = datasets.create(
+                    a.create, from_key=a.from_key, from_path=a.from_path,
+                    synthetic=a.synthetic, size=a.size,
+                    copy_cache=a.copy_cache)
+            elif a.add:
+                if not a.folder:
+                    raise ParamError("--add needs at least one --folder")
+                res = datasets.add(a.add, a.folder,
+                                   tool_created=a.tool_created)
+            else:
+                res = {"registry": datasets.REGISTRY_PATH,
+                       "datasets": datasets.list_entries(
+                           show_paths=a.show_paths)}
+        elif a.op == "config-schema":
+            res = schema.query(section=a.section, key=a.key, cls=a.cls)
+            if isinstance(res, dict) and "error" in res:
+                print(json.dumps({**res, "type": "rejected"}, indent=1))
+                return 2
+        elif a.op == "submit":
             params = json.loads(a.params)
             if not isinstance(params, dict):
                 raise ParamError("--params must be a JSON object")

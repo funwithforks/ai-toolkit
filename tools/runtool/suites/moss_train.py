@@ -44,7 +44,10 @@ import sqlite3
 import sys
 import threading
 
-from ..registry import Param, RunPaths, Suite, safe_run_component
+from .. import datasets as dsets
+from ..registry import (
+    Param, ParamError, RunPaths, Suite, safe_run_component,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET_MAP = os.environ.get(
@@ -170,13 +173,51 @@ def _build(params, paths: RunPaths):
 # ------------------------------------------------------------- harness
 
 def _load_map(dataset):
-    with open(DATASET_MAP) as f:
-        data = json.load(f)
+    try:
+        with open(DATASET_MAP) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise ParamError(
+            f"dataset registry {DATASET_MAP} does not exist; register "
+            f"folders with 'runtool datasets --add KEY --folder PATH' or "
+            f"create a tool dataset with 'runtool datasets --create KEY "
+            f"--synthetic N'"
+        )
     if dataset not in data:
-        raise SystemExit(
-            f"dataset {dataset!r} not in {DATASET_MAP}; add the folder list"
+        raise ParamError(
+            f"dataset {dataset!r} not in the registry; "
+            f"keys: {sorted(data)}"
         )
     return data[dataset]["folders"]
+
+
+def _tool_dataset_check(dataset, folders):
+    # datasets are always tool-owned (owner policy 2026-10-28): every tool
+    # run trains against a synthetic or COPIED rt_-prefixed folder, never a
+    # registered real dataset folder -- real folders stay read-only to the
+    # tool (copy source via 'datasets --create --from-key' is the one use).
+    # The refusal names only the KEY: a real folder's basename must never
+    # reach agent-facing output, errors included.
+    root = os.path.realpath(dsets.DATASETS_ROOT) + os.sep
+    for folder in folders:
+        rp = os.path.realpath(folder)
+        if not (rp.startswith(root)
+                and os.path.basename(rp).startswith(dsets.TOOL_PREFIX)):
+            raise ParamError(
+                f"dataset '{dataset}' points outside the tool dataset "
+                f"namespace; make a tool dataset with 'runtool datasets "
+                f"--create K --synthetic N' (synthetic) or '--create K "
+                f"--from-key {dataset}' (copy, caches optional via "
+                f"--copy-cache)"
+            )
+
+
+def _datasets_precheck(params):
+    # submit-process rejection (runner.submit -> Suite.precheck): a bad
+    # dataset never becomes a doomed launch. The harness re-runs the same
+    # check in _derive_config so a direct harness call cannot skip it.
+    _tool_dataset_check(
+        params["dataset"], _load_map(params["dataset"]))
 
 
 def _derive_config(params, name, out_path):
@@ -216,6 +257,10 @@ def _derive_config(params, name, out_path):
         )
     for entry, folder in zip(ds, folders):
         entry["folder_path"] = folder
+    # datasets are always tool-owned (owner policy 2026-10-28). The same
+    # check runs in the submit process via SUITE.precheck; this copy guards
+    # the harness path so nothing can train on a non-tool folder
+    _tool_dataset_check(params["dataset"], folders)
     with open(out_path, "w") as f:
         yaml.safe_dump(cfg, f)
     return cfg
@@ -416,6 +461,7 @@ SUITE = Suite(
     metrics=METRICS,
     build=_build,
     parse=_parse,
+    precheck=_datasets_precheck,
     timeout_s=12 * 3600,  # quality runs (1400 steps at bs8 + sampling) pass 6 h
     desc="MOSS-Image training-step measurement (run.py, sqlite-structured metrics)",
 )
