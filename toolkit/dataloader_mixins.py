@@ -457,6 +457,48 @@ class BucketsMixin:
                 f'budget.')
 
 
+# ---------------------------------------------------------------------------
+# Caption-slot texts -- ONE home (owner contract 2026-10-27;
+# docs/refactor_notes/DECISION--blank-embeds-and-dop-gating.md). The dataset
+# DTO, the on-disk cache planner/reader, and SDTrainer's fixed-prompt cache
+# all take these texts from HERE; nothing re-derives them from raw config.
+#   BLANK / dropout : ALWAYS ''. Putting text into a dropout caption (the
+#       trigger word, a class, a token join) is no longer dropout -- it lies
+#       about the unconditional training class (owner: "inserting text into
+#       dropout means it is no longer dropout and it is lying").
+#   DOP             : NOT dropout. Pair for real captions is built by
+#       load_caption (trigger-resolved + class-resolved, in place). These
+#       two cover the caption-less sides: the class side of a DROPPED
+#       caption, and the trainer's fixed prior fallback.
+# D-OPSD keeps its own fenced teacher text (get_dopsd_dropout_caption); do
+# not route it through this contract, and never route this through it.
+# ---------------------------------------------------------------------------
+
+BLANK_CAPTION_TEXT = ''
+
+
+def dop_dropout_class_text(inline_pairs, trigger_word, class_name, is_reg=False):
+    # Class side of a DROPPED caption on a DOP step: inline classes as a
+    # serial-comma list ('a, b and c' -- grammatical at any tag count),
+    # config-trigger datasets as the bare preservation class, everything
+    # else '' (which aliases onto the shared blank).
+    if inline_pairs is not None and not is_reg:
+        classes = list(dict.fromkeys([c for t, c in inline_pairs]))
+        if len(classes) > 2:
+            return ', '.join(classes[:-1]) + ' and ' + classes[-1]
+        return ' and '.join(classes)
+    if trigger_word is not None and not is_reg:
+        return class_name
+    return ''
+
+
+def dop_prior_fallback_text(class_name):
+    # The trainer's fixed-cache 'dop_class' prior: conditions on the bare
+    # preservation class when no per-item class-side embed exists (live
+    # mode). Fixed prompt, not a dropout slot.
+    return class_name
+
+
 class CaptionProcessingDTOMixin:
     def __init__(self: 'FileItemDTO', *args, **kwargs):
         if hasattr(super(), '__init__'):
@@ -2562,33 +2604,25 @@ class TextEmbeddingFileItemDTOMixin:
         return self._dop_text_embedding_path
 
     def get_dropout_caption(self: 'FileItemDTO'):
-        # Dropout means DROPPED: the text is '' for every item, always
-        # (owner contract 2026-10-27). No trigger word, no inline-token
-        # join, no class -- inserting any text into the dropout slot stops
-        # being dropout and lies about the unconditional training class the
-        # trigger identifies. DOP is a separate mechanism (see
-        # get_dop_dropout_caption) and is NOT dropout.
-        return ''
+        # Dropout means DROPPED: the text is BLANK_CAPTION_TEXT ('') for
+        # every item, always -- the contract block at the top of this module
+        # and docs/refactor_notes/DECISION--blank-embeds-and-dop-gating.md.
+        # Do not parameterise this by trigger, class, or inline tokens;
+        # DOP is a separate mechanism (get_dop_dropout_caption).
+        return BLANK_CAPTION_TEXT
 
     def get_dop_dropout_caption(self: 'FileItemDTO'):
-        # DOP is not dropout: this is the CLASS side of the DOP pair, the
-        # text the regularisation (prior) prediction is conditioned on.
+        # DOP is not dropout: class side of the pair when the caption is
+        # dropped. Derivation lives in the module-level contract block; the
+        # trainer's fixed prior uses dop_prior_fallback_text.
         # Only reachable under DOP -- every caller gates on
         # dataset_config.diff_output_preservation before asking.
-        # Multiple inline classes form a serial-comma list ('a, b and c') --
-        # grammatical at any tag count (owner contract 2026-10-27).
-        pairs = getattr(self, '_inline_dop_pairs', None)
-        if pairs is not None and not self.is_reg:
-            classes = list(dict.fromkeys([c for t, c in pairs]))
-            if len(classes) > 2:
-                return ', '.join(classes[:-1]) + ' and ' + classes[-1]
-            return ' and '.join(classes)
-        # config-trigger datasets condition on the bare preservation class;
-        # a caption with neither inline tokens nor a trigger drops to the
-        # blank, which aliases onto the shared '' entry
-        if self.trigger_word is not None and not self.is_reg:
-            return self.dataset_config.diff_output_preservation_class
-        return ''
+        return dop_dropout_class_text(
+            getattr(self, '_inline_dop_pairs', None),
+            self.trigger_word,
+            self.dataset_config.diff_output_preservation_class,
+            self.is_reg,
+        )
 
     def get_dop_blank_text_embedding_path(self: 'FileItemDTO', recalculate=False):
         # The DOP CLASS-side entry (see get_dop_dropout_caption): what the

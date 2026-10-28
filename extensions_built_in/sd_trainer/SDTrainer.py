@@ -17,6 +17,9 @@ from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.config_modules import GenerateImageConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
+from toolkit.dataloader_mixins import (
+    BLANK_CAPTION_TEXT, dop_prior_fallback_text,
+)  # caption-slot contract home -- see toolkit/dataloader_mixins module header
 from toolkit.dto import DTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
 from toolkit.image_utils import show_tensors, show_latents
@@ -213,14 +216,17 @@ class SDTrainer(BaseSDTrainProcess):
                 {'long_prompts': self.do_long_prompts},
             ))
         if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
-            targets.append(('blank', '', {}))
+            # texts come from the caption-slot contract home (module header
+            # of toolkit/dataloader_mixins), not from local literals
+            targets.append(('blank', BLANK_CAPTION_TEXT, {}))
             # no 'trigger' kind: a trigger word never belongs in any dropout
             # slot (owner contract 2026-10-27) -- see the dropout swap in
             # train_single_accumulation
             if self.train_config.diff_output_preservation:
                 targets.append((
                     'dop_class',
-                    self.train_config.diff_output_preservation_class,
+                    dop_prior_fallback_text(
+                        self.train_config.diff_output_preservation_class),
                     {},
                 ))
             if (
@@ -565,13 +571,15 @@ class SDTrainer(BaseSDTrainProcess):
                     raise ValueError("Cannot unload text encoder if training text encoder")
                 # cache embeddings
                 self.sd.text_encoder_to(self.device_torch)
-                self.cached_blank_embeds = self.encode_static_prompt("")
-                self._save_fixed_embed('blank', '', {}, self.cached_blank_embeds)
+                self.cached_blank_embeds = self.encode_static_prompt(BLANK_CAPTION_TEXT)
+                self._save_fixed_embed('blank', BLANK_CAPTION_TEXT, {}, self.cached_blank_embeds)
                 if self.train_config.diff_output_preservation:
-                    self.cached_dop_class_embeds = self.encode_static_prompt(self.train_config.diff_output_preservation_class)
+                    dop_class_text = dop_prior_fallback_text(
+                        self.train_config.diff_output_preservation_class)
+                    self.cached_dop_class_embeds = self.encode_static_prompt(dop_class_text)
                     self.diff_output_preservation_embeds = self.cached_dop_class_embeds
                     self._save_fixed_embed(
-                        'dop_class', self.train_config.diff_output_preservation_class,
+                        'dop_class', dop_class_text,
                         {}, self.cached_dop_class_embeds)
                 
                 self.cache_sample_prompts()
