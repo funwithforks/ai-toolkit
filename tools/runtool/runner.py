@@ -92,81 +92,81 @@ def _git(*args):
 
 # ------------------------------------------------------------------ submit
 
-def submit(suite_id, variant, overrides, note="", expect=None,
-           config_patch=None):
-    suite = get_suite(suite_id)
-    params = suite.validate(variant, overrides or {})
-    # F2: the loud-merge layers need to know which params the submitter
-    # EXPLICITLY passed (those may override the template; a silent
-    # default may not). Record the explicit set, not just the merged one.
-    explicit = sorted(k for k in (overrides or {}) if k in suite.params)
-    if config_patch is not None and not isinstance(config_patch, dict):
-        raise ParamError("config_patch must be an object of dotted paths")
-    ctx = {"overrides": explicit, "config_patch": config_patch}
-    if suite.precheck is not None:
-        suite.precheck(params, ctx)  # reject here, not in a doomed launch
-    if expect is not None:
-        try:
-            marker_mod.validate_expect(suite, expect)
-        except ValueError as e:
-            raise ParamError(str(e)) from None
-    job_name = job_dir = None
-    if suite.reserve is not None:
-        job_name, job_dir = suite.reserve(params, ctx)
-        ctx["job_name"] = job_name
-    retention = "judged" if (params or {}).get("sample") else suite.retention
-    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-    run_id = f"{stamp}_{suite.id}_{variant}"
+def _all_record_ids():
+    try:
+        names = sorted(os.listdir(RUNS_ROOT))
+    except FileNotFoundError:
+        return []
+    return [n for n in names
+            if n not in ("jobs", "datasets")
+            and os.path.isdir(os.path.join(RUNS_ROOT, n))]
+
+
+def _live_state(run_id):
+    """Cheap liveness triage WITHOUT classify's side effects:
+    'running' | 'queued' | 'finished'. Only used by the exclusivity
+    guard and the queue cap."""
     paths = _run_dir(run_id)
-    base = run_id
-    n = 1
-    while os.path.exists(paths.root):  # same-second collision guard
-        n += 1
-        run_id = f"{base}_{n}"
-        paths = _run_dir(run_id)
-    os.makedirs(paths.artifacts, exist_ok=True)
+    manifest = _read_json(paths.manifest)
+    if manifest is None:
+        return "finished"
+    if os.path.exists(paths.pid):
+        if os.path.exists(paths.result) or os.path.exists(paths.exit_code) \
+                and not _pid_alive(paths, manifest):
+            # exited: final status doesn't matter, it's not live
+            return "finished"
+        return "running" if _pid_alive(paths, manifest) else "finished"
+    if os.path.exists(paths.cancel):
+        return "finished"
+    if manifest.get("after") and not os.path.exists(paths.result):
+        return "queued"
+    return "finished"
 
-    argv, env_over = suite.build(params, paths)
-    env = dict(os.environ)
-    env.update({k: str(v) for k, v in env_over.items()})
 
-    patch = _git("diff", "HEAD")
-    if patch:
-        with open(paths.patch, "w") as f:
-            f.write(patch)
+def _live_job_runs():
+    """Live runs in the jobs-subtree (F3-era, have job_dir) — exactly
+    what the exclusivity guard and queue cap count."""
+    out = []
+    for rid in _all_record_ids():
+        manifest = _read_json(_run_dir(rid).manifest)
+        if manifest is None or not manifest.get("job_dir"):
+            continue
+        st = _live_state(rid)
+        if st in ("running", "queued"):
+            out.append({"run_id": rid, "state": st,
+                        "job_name": manifest.get("job_name", rid)})
+    return out
 
-    manifest = {
-        "run_id": run_id,
-        "suite": suite.id,
-        "variant": variant,
-        "params": params,
-        "note": note,
-        "argv": argv,
-        "env": {k: v for k, v in env_over.items()},
-        "cwd": REPO_ROOT,
-        "record": paths.root,
-        "git": {
-            "head": _git("rev-parse", "--short", "HEAD").strip(),
-            "branch": _git("rev-parse", "--abbrev-ref", "HEAD").strip(),
-            "dirty_tracked": bool(patch),
-            "porcelain": _git("status", "--porcelain").strip().splitlines()[:200],
-        },
-        "submitted_at": _now(),
-        "timeout_s": suite.timeout_s,
-        "python": sys.executable,
-    }
-    if expect is not None:
-        manifest["expect"] = expect
-    manifest["overrides"] = explicit
-    manifest["retention"] = retention
-    if job_name is not None:
-        manifest["job_name"] = job_name
-        manifest["job_dir"] = job_dir
-    if config_patch is not None:
-        manifest["config_patch"] = config_patch
-    _write_json(paths.manifest, manifest)
-    emit(paths, "submitted", suite=suite.id, variant=variant, params=params)
 
+_SUBMIT_LOCK_TIMEOUT_S = 120
+
+
+def _acquire_submit_lock():
+    """Serialise exclusivity-check + spawn so two same-instant submits
+    cannot both pass the guard. Stale locks (holder died mid-submit)
+    are stealable after a window."""
+    lock = os.path.join(RUNS_ROOT, ".submit.lock")
+    os.makedirs(RUNS_ROOT, exist_ok=True)
+    deadline = time.time() + 10
+    while True:
+        try:
+            os.mkdir(lock)
+            return lock
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock) > _SUBMIT_LOCK_TIMEOUT_S:
+                    os.rmdir(lock)
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.time() > deadline:
+                raise ParamError(
+                    "another submit is in flight and the submit lock did "
+                    f"not clear in 10s ({lock}); check `runtool list`")
+            time.sleep(0.1)
+
+
+def _spawn_supervisor(run_id, paths):
     sup = [
         sys.executable,
         "-m", "tools.runtool.runner",
@@ -185,9 +185,143 @@ def submit(suite_id, variant, overrides, note="", expect=None,
         )
     with open(paths.pid, "w") as f:
         f.write(str(proc.pid))
-    emit(paths, "supervisor_spawned", pid=proc.pid)
-    result = {"run_id": run_id, "record": paths.root, "pid": proc.pid,
-              "retention": retention}
+    return proc
+
+
+def submit(suite_id, variant, overrides, note="", expect=None,
+           config_patch=None, after=None):
+    suite = get_suite(suite_id)
+    params = suite.validate(variant, overrides or {})
+    # F2: the loud-merge layers need to know which params the submitter
+    # EXPLICITLY passed (those may override the template; a silent
+    # default may not). Record the explicit set, not just the merged one.
+    explicit = sorted(k for k in (overrides or {}) if k in suite.params)
+    if config_patch is not None and not isinstance(config_patch, dict):
+        raise ParamError("config_patch must be an object of dotted paths")
+    ctx = {"overrides": explicit, "config_patch": config_patch}
+    if suite.precheck is not None:
+        suite.precheck(params, ctx)  # reject here, not in a doomed launch
+    if expect is not None:
+        try:
+            marker_mod.validate_expect(suite, expect)
+        except ValueError as e:
+            raise ParamError(str(e)) from None
+    # F6: exclusivity + queue. A jobs-subtree run reserves a dir and
+    # measures timing/memory that only means something on a quiet GPU;
+    # a second live one poisons both sets of numbers. --after queues
+    # behind the holder (small chains, cap 3) instead of refusing.
+    jobs_subtree = suite.reserve is not None
+    if after is not None:
+        if not jobs_subtree:
+            raise ParamError("after is only valid for suites that "
+                             "reserve job dirs")
+        if not os.path.isdir(os.path.join(RUNS_ROOT, after)):
+            raise ParamError(f"after: no run record for {after!r}")
+        if _live_state(after) == "finished":
+            raise ParamError(
+                f"after: {after!r} is not live (already finished) — "
+                "submit without --after to run directly")
+    retention = "judged" if (params or {}).get("sample") else suite.retention
+    # The guard runs BEFORE any reservation (a refusal leaves no record
+    # and no claimed job dir); the lock spans check -> spawn so two
+    # same-instant submits cannot both pass it.
+    lock = _acquire_submit_lock() if jobs_subtree else None
+    try:
+        queued = after is not None
+        job_name = job_dir = None
+        if jobs_subtree:
+            live = _live_job_runs()
+            if queued:
+                if len(live) + 1 > 3:
+                    holders = ", ".join(
+                        f"{r['run_id']} ({r['state']})" for r in live)
+                    raise ParamError(
+                        f"queue is full (max 3 live) — {holders}. "
+                        "Wait for one to finish.")
+            elif live:
+                holders = ", ".join(
+                    f"{r['run_id']} ({r['state']}, {r['job_name']})"
+                    for r in live)
+                raise ParamError(
+                    f"the jobs subtree is busy: {holders}. Two live "
+                    "jobs-subtree runs poison each other's timing and "
+                    "memory numbers. Queue behind one with "
+                    "after=<run_id>, or cancel it first.")
+            # only now claim the dir: a refusal must not burn a version
+            job_name, job_dir = suite.reserve(params, ctx)
+            ctx["job_name"] = job_name
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        run_id = f"{stamp}_{suite.id}_{variant}"
+        paths = _run_dir(run_id)
+        base = run_id
+        n = 1
+        while os.path.exists(paths.root):  # same-second collision guard
+            n += 1
+            run_id = f"{base}_{n}"
+            paths = _run_dir(run_id)
+        os.makedirs(paths.artifacts, exist_ok=True)
+
+        argv, env_over = suite.build(params, paths)
+        env = dict(os.environ)
+        env.update({k: str(v) for k, v in env_over.items()})
+
+        patch = _git("diff", "HEAD")
+        if patch:
+            with open(paths.patch, "w") as f:
+                f.write(patch)
+
+        manifest = {
+            "run_id": run_id,
+            "suite": suite.id,
+            "variant": variant,
+            "params": params,
+            "note": note,
+            "argv": argv,
+            "env": {k: v for k, v in env_over.items()},
+            "cwd": REPO_ROOT,
+            "record": paths.root,
+            "git": {
+                "head": _git("rev-parse", "--short", "HEAD").strip(),
+                "branch": _git("rev-parse", "--abbrev-ref", "HEAD").strip(),
+                "dirty_tracked": bool(patch),
+                "porcelain": _git("status", "--porcelain").strip().splitlines()[:200],
+            },
+            "submitted_at": _now(),
+            "timeout_s": suite.timeout_s,
+            "python": sys.executable,
+        }
+        if expect is not None:
+            manifest["expect"] = expect
+        manifest["overrides"] = explicit
+        manifest["retention"] = retention
+        if job_name is not None:
+            manifest["job_name"] = job_name
+            manifest["job_dir"] = job_dir
+        if config_patch is not None:
+            manifest["config_patch"] = config_patch
+        if after is not None:
+            manifest["after"] = after
+        _write_json(paths.manifest, manifest)
+        emit(paths, "submitted", suite=suite.id, variant=variant,
+             params=params, after=after)
+
+        proc = None
+        if not queued:
+            proc = _spawn_supervisor(run_id, paths)
+    finally:
+        if lock is not None:
+            try:
+                os.rmdir(lock)
+            except OSError:
+                pass
+
+    result = {"run_id": run_id, "record": paths.root, "pid": None,
+              "retention": retention,
+              "status": "queued" if queued else "running"}
+    if after is not None:
+        result["after"] = after
+    if proc is not None:
+        result["pid"] = proc.pid
     if job_dir is not None:
         result["job_name"] = job_name
         result["job_dir"] = job_dir
@@ -279,6 +413,56 @@ def _attach_start_mark(paths, manifest):
 
 # -------------------------------------------------------------- classify
 
+def _start_queued(paths, manifest):
+    """Queue pump (F6): start a queued run once its predecessor reaches
+    a non-blocking terminal state. Called from classify(), so ANY
+    status/wait/list call advances the queue -- no daemon process.
+    Returns 'started' | 'waiting' | 'cancelled' | 'failed'."""
+    after = manifest["after"]
+    if os.path.exists(paths.cancel):
+        return "cancelled"
+    try:
+        pred = classify(after)["status"]
+    except FileNotFoundError:
+        pred = "gone"
+    if pred == "cancelled":
+        # cancellation propagates down the chain (spec F6)
+        with open(paths.cancel, "w") as f:
+            f.write(str(_now()))
+        emit(paths, "cancel_propagated", after=after)
+        return "cancelled"
+    if pred == "gone":
+        with open(paths.exit_code, "w") as f:
+            f.write("1")
+        with open(paths.result + ".tmp", "w") as f:
+            json.dump({"ok": False,
+                       "error": f"queued predecessor {after!r} record is "
+                                "gone; refusing to start unattended"}, f)
+        os.replace(paths.result + ".tmp", paths.result)
+        emit(paths, "queued_predecessor_gone", after=after)
+        return "failed"
+    if pred in ("running", "queued"):
+        return "waiting"
+    # predecessor finished (done/failed/crash): the chain must not
+    # stall on a failed link -- start now. Claim atomically so two
+    # concurrent pumps cannot double-spawn.
+    claim = os.path.join(paths.root, ".start_claim")
+    try:
+        os.mkdir(claim)
+    except FileExistsError:
+        if os.path.exists(paths.pid):
+            return "started"
+        if time.time() - os.path.getmtime(claim) > 120:
+            # a previous claimer died before spawning: retire its claim
+            os.replace(claim, claim + f".dead.{int(time.time())}")
+            os.mkdir(claim)
+        else:
+            return "waiting"
+    proc = _spawn_supervisor(manifest["run_id"], paths)
+    emit(paths, "queued_start", after=after, pid=proc.pid)
+    return "started"
+
+
 def _tail(path, n_lines=12):
     try:
         with open(path, "rb") as f:
@@ -297,6 +481,11 @@ def classify(run_id):
     if manifest is None:
         raise FileNotFoundError(f"no run record for {run_id!r} under {RUNS_ROOT}")
     manifest = _attach_start_mark(paths, manifest)
+    # F6 pump: an unstarted queued run advances on any status touch
+    queued_hold = False
+    if manifest.get("after") and not os.path.exists(paths.pid):
+        if _start_queued(paths, manifest) == "waiting":
+            queued_hold = True
     result = _read_json(paths.result)
     exit_code = None
     if os.path.exists(paths.exit_code):
@@ -328,7 +517,9 @@ def classify(run_id):
     except FileNotFoundError:
         pass
 
-    if alive:
+    if queued_hold:
+        status = "queued"
+    elif alive:
         status = "running"
     elif cancelled:
         status = "cancelled"
@@ -372,7 +563,8 @@ def classify(run_id):
         suite = get_suite(manifest["suite"])
     except ParamError:
         suite = None  # record references a removed suite: metrics still serve
-    if suite is not None and (suite.markers or suite.phases):
+    if suite is not None and (suite.markers or suite.phases) \
+            and status != "queued":
         full = not alive
         hits = marker_mod.scan(paths, suite, full)
         if hits:
@@ -419,7 +611,7 @@ def wait(run_id, timeout_s=None, poll_s=0.75):
     deadline = _now() + timeout_s
     while True:
         st = classify(run_id)
-        if st["status"] != "running":
+        if st["status"] not in ("running", "queued"):
             return st
         if _now() >= deadline:
             st["status"] = "timeout"
@@ -433,6 +625,11 @@ def wait(run_id, timeout_s=None, poll_s=0.75):
 def cancel(run_id, grace_s=8.0):
     paths = _run_dir(run_id)
     st = classify(run_id)
+    if st["status"] == "queued":
+        with open(paths.cancel, "w") as f:
+            f.write(str(_now()))
+        emit(paths, "cancel_requested", queued=True)
+        return classify(run_id)
     if st["status"] != "running":
         return {"run_id": run_id, "status": st["status"], "detail": "not running"}
     with open(paths.cancel, "w") as f:
@@ -489,6 +686,12 @@ def recompute(run_id):
         raise FileNotFoundError(run_id)
     suite = get_suite(manifest["suite"])
     params = manifest["params"]
+    if not os.path.exists(paths.result):
+        # never started (cancelled in queue) or died before writing:
+        # there is no result to reproduce -- say so, don't traceback
+        return {"run_id": run_id, "match": None,
+                "detail": "no result.json: the run never produced a "
+                          "result (cancelled before start?)"}
     metrics = suite.parse(paths, params)
     stored = (_read_json(paths.result) or {}).get("metrics")
     out = {

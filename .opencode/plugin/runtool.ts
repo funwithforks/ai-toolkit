@@ -99,6 +99,16 @@ export default Plugin.define({
               description: "free-text note for the record",
               default: "",
             },
+            after: {
+              type: "string",
+              description:
+                "Queue behind this run_id instead of running now: starts " +
+                "when the predecessor finishes (done/failed/crash all " +
+                "start it; a cancelled predecessor cancels the chain). " +
+                "Jobs-subtree runs are EXCLUSIVE — while any is live a " +
+                "plain submit is refused with the holder named; queue " +
+                "with after instead (max 3 live).",
+            },
           },
           required: ["suite", "variant"],
           additionalProperties: false,
@@ -117,6 +127,9 @@ export default Plugin.define({
           ...(typeof a.config_patch === "string" && a.config_patch.trim()
             ? ["--config-patch", a.config_patch]
             : []),
+          ...(typeof a.after === "string" && a.after.trim()
+            ? ["--after", a.after]
+            : []),
           "--note",
           typeof a.note === "string" ? a.note : "",
         ]),
@@ -130,7 +143,10 @@ export default Plugin.define({
           "when one was declared at submit. This replaces polling and " +
           "log-scraping; it watches the recorded pid. status is one of done, " +
           "failed, crash (exit code attached), cancelled, timeout. A declared " +
-          "marker that never appeared is a named FAIL, not a shrug.",
+          "marker that never appeared is a named FAIL, not a shrug. Queued " +
+          "runs count as in-flight: waiting on one also drives the queue " +
+          "forward and returns when the run itself finishes (queue time " +
+          "counts toward timeout_s).",
         input: {
           type: "object",
           properties: {

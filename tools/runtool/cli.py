@@ -87,6 +87,10 @@ def main(argv=None):
         "JSON object of dotted config paths to override (suite allowlist "
         'applies), e.g. {"config.process[0].train.lr": 0.0001}'
     ))
+    p.add_argument("--after", default=None, help=(
+        "queue behind this run_id (serial comparison chains, max 3 live); "
+        "plain submits are refused while any jobs-subtree run is live"
+    ))
 
     for name in ("wait", "status", "cancel", "recompute"):
         p = sub.add_parser(name)
@@ -180,7 +184,8 @@ def main(argv=None):
                 if not isinstance(patch, dict):
                     raise ParamError("--config-patch must be a JSON object")
             res = runner.submit(a.suite, a.variant, params, note=a.note,
-                                expect=expect, config_patch=patch)
+                                expect=expect, config_patch=patch,
+                                after=a.after)
         elif a.op == "wait":
             res = runner.wait(a.run_id, timeout_s=a.timeout_s)
         elif a.op == "status":
