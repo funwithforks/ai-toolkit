@@ -521,8 +521,12 @@ class CaptionProcessingDTOMixin:
         self._inline_dop_caption = None
         if self._inline_dop_pairs is not None:
             # swap the inline tokens after all caption processing so both variants
-            # keep identical token order. Normal caption takes the trigger word,
-            # the DOP variant takes the class.
+            # keep identical token order. The normal caption ALWAYS takes the
+            # trigger word -- this resolution is not DOP-gated: the
+            # trigger-resolved caption is the one and only embed when DOP is
+            # off. The class-swapped variant feeds the DOP branch below and
+            # nothing else.
+            # contract: docs/refactor_notes/DECISION--blank-embeds-and-dop-gating.md
             self.caption = apply_inline_dop(processed_caption, use_class=False)
             self._inline_dop_caption = apply_inline_dop(processed_caption, use_class=True)
         else:
@@ -532,7 +536,10 @@ class CaptionProcessingDTOMixin:
             if self._inline_dop_pairs is not None:
                 self.caption_short = apply_inline_dop(self.caption_short, use_class=False)
         if self.dataset_config.diff_output_preservation:
-            # replace this dataset's trigger word with the preservation class.
+            # DOP GATE: the class-side caption exists ONLY here. Inline tokens
+            # are inert and no class embed is produced anywhere unless DOP is
+            # on (contract: docs/refactor_notes/DECISION--blank-embeds-and-dop-gating.md).
+            # Replace this dataset's trigger word with the preservation class.
             # do it on the final caption so token order matches the normal caption
             # (if the caption has inline tokens, start from the class-swapped variant)
             self.caption_dop = self._inline_dop_caption if self._inline_dop_caption is not None else self.caption
@@ -2533,18 +2540,30 @@ class TextEmbeddingFileItemDTOMixin:
         return self._dop_text_embedding_path
 
     def get_dropout_caption(self: 'FileItemDTO'):
-        # when encoding live, dropped captions still get the trigger word injected
-        # downstream (add_if_not_present when not a reg image), so match that here
+        # CONTRACT (docs/refactor_notes/DECISION--blank-embeds-and-dop-gating.md):
+        # inline [trigger:X class:Y] tokens are INERT unless
+        # diff_output_preservation is on. With DOP off, every item's dropout
+        # text is the plain blank/trigger-only form regardless of inline
+        # tokens. Do not widen the DOP condition below based on this method's
+        # name -- the inline branch exists for the DOP trigger/class pairing.
         pairs = getattr(self, '_inline_dop_pairs', None)
-        if pairs is not None and not self.is_reg:
-            # inline items carry their own identities. do not add the config
-            # trigger on top, that would inject a different character's name
+        if (pairs is not None and not self.is_reg
+                and self.dataset_config.diff_output_preservation):
+            # DOP on: inline items carry their own identities. do not add the
+            # config trigger on top, that would inject a different character's
+            # name
             return ' '.join(dict.fromkeys([t for t, c in pairs]))
         if self.trigger_word is not None and not self.is_reg:
+            # when encoding live, dropped captions still get the trigger word
+            # injected downstream (add_if_not_present when not a reg image),
+            # so match that here
             return inject_trigger_into_prompt('', trigger=self.trigger_word, add_if_not_present=True)
         return ''
 
     def get_dop_dropout_caption(self: 'FileItemDTO'):
+        # Only reachable under DOP: every caller gates on
+        # dataset_config.diff_output_preservation before asking. See
+        # get_dropout_caption for the inline-token contract.
         # live encoding replaces the trigger word with the preservation class on the
         # dropped caption (class only), so the cached DOP dropout caption must match
         pairs = getattr(self, '_inline_dop_pairs', None)
