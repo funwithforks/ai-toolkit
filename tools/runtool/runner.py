@@ -612,10 +612,16 @@ def wait(run_id, timeout_s=None, poll_s=0.75):
     while True:
         st = classify(run_id)
         if st["status"] not in ("running", "queued"):
+            if st["status"] in ("crash", "failed", "timeout"):
+                # the moment of pain is where the channel gets used
+                from .complain import complaint_hint
+                st["you_may_file"] = complaint_hint(run_id)
             return st
         if _now() >= deadline:
             st["status"] = "timeout"
             emit(_run_dir(run_id), "wait_timeout", timeout_s=timeout_s)
+            from .complain import complaint_hint
+            st["you_may_file"] = complaint_hint(run_id)
             return st
         time.sleep(poll_s)
 

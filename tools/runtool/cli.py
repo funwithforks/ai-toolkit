@@ -28,6 +28,12 @@
                               orphans, stale embed caches); listing is
                               always safe; --apply deletes inside jobs
                               only (runtool records are never touched)
+  complain --category C --text T [--run-id R] [--cost TEXT] [--agent N]
+                              file a complaint about the tool itself;
+                              cheap on purpose -- file before working
+                              around a tool gap
+  complaints [--stats]        read the channel; --stats aggregates by
+                              category x suite (the tool-session agenda)
 """
 
 import argparse
@@ -118,6 +124,21 @@ def main(argv=None):
     p.add_argument("--days", type=float, default=7.0)
     p.add_argument("--apply", action="store_true")
     p.add_argument("--include-judged", action="store_true")
+
+    p = sub.add_parser("complain", help="file a complaint about the tool")
+    p.add_argument("--run-id", default=None)
+    p.add_argument("--category", required=True,
+                   help="api-confusion | misleading-output | "
+                        "missing-measurement | ergonomics | doc-gap | other")
+    p.add_argument("--text", required=True)
+    p.add_argument("--cost", default=None,
+                   help="what the workaround cost (time, wrong conclusion)")
+    p.add_argument("--agent", default=None, help="who filed it")
+
+    p = sub.add_parser("complaints", help="read the complaint channel")
+    p.add_argument("--stats", action="store_true",
+                   help="aggregate by category x suite (the tool agenda)")
+    p.add_argument("--limit", type=int, default=20)
 
     a = ap.parse_args(argv)
     try:
@@ -210,6 +231,14 @@ def main(argv=None):
                                            include_judged=a.include_judged)
             else:
                 res = gc_mod.candidates(days=a.days)
+        elif a.op == "complain":
+            from . import complain as complain_mod
+            res = complain_mod.file_complaint(
+                a.text, a.category, run_id=a.run_id, cost=a.cost,
+                agent=a.agent)
+        elif a.op == "complaints":
+            from . import complain as complain_mod
+            res = complain_mod.complaints(stats=a.stats, limit=a.limit)
         elif a.op == "recompute":
             res = runner.recompute(a.run_id)
         elif a.op == "list":
