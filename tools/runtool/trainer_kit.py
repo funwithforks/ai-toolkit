@@ -1,0 +1,609 @@
+"""trainer_kit: the generic machinery every ai-toolkit trainer suite shares.
+
+Owner ruling (2026-10-28): pull the generic items out of suites. The
+option of sampling is generic; the run.py harness, the loss_log.db
+metrics, the loud merge over the trainer config layout, the dataset
+guards, the watchers, the reuse-trap and the measurement-never-saves
+cleanup are generic. A suite module keeps ONLY what is specific to the
+model it supports: namespace, model switches/params/env, model-specific
+markers, timeout, description.
+
+moss_train is the reference consumer (and for now the only one; the
+older suites keep their private copies until they are migrated after
+the tool settles -- no backward-compat obligation to them here).
+
+Config layout assumption (the ai-toolkit trainer schema): a job config
+of config.process[N].{train,save,sample,datasets, model}, the process
+entry addressed by `prefix` (default config.process[0]).
+
+Harness contract (generic main): manifest -> derive (loud merge) ->
+reuse-trap guard -> run.py -> db snapshot -> measurement cleanup ->
+result.json. The suite module's __main__ is one call: kit.main(argv).
+"""
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import threading
+
+from . import datasets as dsets
+from . import dotpath
+from . import markers as dmark
+from .registry import Param, ParamError, RunPaths, Suite, safe_run_component
+
+# ---------------------------------------------------------------- datasets
+
+def dataset_keys():
+    """Dataset keys offered to the caller, from the local registry at
+    import time (empty when unconfigured; registry is machine-local)."""
+    try:
+        return tuple(dsets._load())
+    except ParamError:
+        return ()
+
+
+def load_map(dataset):
+    try:
+        data = dsets._load()
+    except FileNotFoundError:
+        raise ParamError(
+            f"dataset registry {dsets.REGISTRY_PATH} does not exist; register "
+            f"folders with 'runtool datasets --add KEY --folder PATH' or "
+            f"create a tool dataset with 'runtool datasets --create KEY "
+            f"--synthetic N'"
+        )
+    if dataset not in data:
+        raise ParamError(f"dataset {dataset!r} not in the registry; "
+                         f"keys: {sorted(data)}")
+    return data[dataset]["folders"]
+
+
+def tool_dataset_check(dataset, folders):
+    # datasets are always tool-owned (owner policy 2026-10-28): every tool
+    # run trains against a synthetic or COPIED rt_-prefixed folder, never a
+    # registered real dataset folder -- real folders stay read-only to the
+    # tool (copy source via 'datasets --create --from-key' is the one use).
+    # The refusal names only the KEY: a real folder's basename must never
+    # reach agent-facing output, errors included.
+    root = os.path.realpath(dsets.DATASETS_ROOT) + os.sep
+    for folder in folders:
+        rp = os.path.realpath(folder)
+        if not (rp.startswith(root)
+                and os.path.basename(rp).startswith(dsets.TOOL_PREFIX)):
+            raise ParamError(
+                f"dataset '{dataset}' points outside the tool dataset "
+                f"namespace; make a tool dataset with 'runtool datasets "
+                f"--create K --synthetic N' (synthetic) or '--create K "
+                f"--from-key {dataset}' (copy, caches optional via "
+                f"--copy-cache)"
+            )
+
+
+# ------------------------------------------------------------------ params
+
+def base_params(**extra):
+    """Params every trainer suite carries. Model switches are extras."""
+    p = {
+        "base": Param(
+            "str", required=True,
+            desc="path to the base config (owner template, stored verbatim)",
+        ),
+        "dataset": Param(
+            "enum", required=True, choices=dataset_keys(),
+            desc="dataset key (names the job; maps to folders in the "
+                 "machine-local registry)",
+        ),
+        "steps": Param("int", default=60, min=10, max=5000),
+        "batch_size": Param(
+            "int", default=1, min=1, max=32,
+            desc="train batch; fit is machine-dependent, high values are "
+                 "deliberate fit probes",
+        ),
+        "warmup": Param(
+            "int", default=20, min=0, max=2000,
+            desc="metrics window starts after this step",
+        ),
+        "seed": Param("int", default=42, min=0, max=2**31 - 1),
+        "ckpt": Param(
+            "bool", default=True,
+            desc="train.gradient_checkpointing (recompute saves memory, "
+                 "costs time)",
+        ),
+        "sample": Param(
+            "bool", default=False,
+            desc="keep the owner template's sampling block LIVE (quality "
+                 "runs). Default false = sampling inert, the measurement-"
+                 "run standard; also unlocks the template's save block",
+        ),
+        "tag": Param("str", default="", desc="extra job-name tag"),
+        "prof_start": Param(
+            "int", default=None, min=5, max=5000,
+            desc="enable the SDTrainer profiler window (no-stack) starting "
+                 "at this step; artifacts land in record/artifacts/prof/",
+        ),
+        "prof_active": Param(
+            "int", default=2, min=1, max=3,
+            desc="profiler window length in steps (hard cap 3; stack "
+                 "profiling is deliberately not exposed -- host-OOM rule)",
+        ),
+    }
+    p.update(extra)
+    return p
+
+
+METRICS = {
+    "step_ms_window": "mean ms/step over (warmup, last]",
+    "step_ms_last100": "mean ms/step over the final <=100 steps",
+    "loss_final": "last logged total loss",
+    "loss_mean_last10": "mean total loss over the last 10 logged steps",
+    "steps_done": "last logged step",
+    "wall_s": "db wall-time span first->last step",
+}
+
+# marker lines the SHARED trainer code prints (SDTrainer.py,
+# dataloader_mixins.py); patterns were taken from real records -- do not
+# "prettify" them without re-checking. Model-specific markers are extras.
+TRAINER_MARKERS = {
+    "te_skip": r"Skipping text encoder load",
+    "te_load": r"Loading \S+ text encoder from",
+    "te_reason": r" - text encoder needed: (?P<reason>.+)",
+    "fixed_cache": r"Loading fixed prompt embeddings from cache",
+    "fixed_cache_now": r"Caching fixed prompt embeddings",
+    "plan": (r"Batched caption cache: (?P<planned>\d+) captions "
+             r"-> (?P<groups>\d+) groups"),
+    "vae_round": r"VAE unloaded until next sample round",
+}
+
+
+def job_name(namespace):
+    """<NAMESPACE>_<dataset>_bs<batch>_<steps>[_<tag>] (owner rule: the
+    name carries the dataset key and the batch, never a real path)."""
+    def build(params):
+        parts = [
+            namespace,
+            safe_run_component(params["dataset"]),
+            safe_run_component(f"bs{params['batch_size']}"),
+            safe_run_component(str(params["steps"])),
+        ]
+        if params.get("tag"):
+            parts.append(safe_run_component(params["tag"]))
+        return "_".join(parts)
+    return build
+
+
+# ------------------------------------------------------------- loud merge
+
+def param_fields(prefix):
+    """params that own trainer-config fields (the ai-toolkit layout).
+    Fields listed here are PARAM-OWNED: config_patch may never claim
+    them -- patch-vs-param claims on one field are impossible by
+    construction."""
+    train = f"{prefix}.train"
+    return {
+        "batch_size": (train + ".batch_size", lambda p: int(p["batch_size"])),
+        "steps": (train + ".steps", lambda p: int(p["steps"])),
+        "ckpt": (train + ".gradient_checkpointing", lambda p: bool(p["ckpt"])),
+        "sample": (train + ".disable_sampling", lambda p: not bool(p["sample"])),
+    }
+
+
+def patchable(prefix):
+    """the config vocabulary every trainer suite exposes to
+    config_patch: knobs no suite param owns"""
+    train = f"{prefix}.train"
+    return (
+        train + ".lr",
+        train + ".optimizer",
+        train + ".gradient_accumulation",
+        train + ".cache_text_embeddings",
+        train + ".unload_text_encoder",
+        train + ".dtype",
+        f"{prefix}.sample.sample_every",
+        f"{prefix}.sample.comfy",
+        f"{prefix}.sample.seed",
+        f"{prefix}.datasets[0].caption_dropout_rate",
+        f"{prefix}.datasets[0].num_repeats",
+    )
+
+
+def merge_plan(params, overrides, config_patch, name, *, prefix,
+               patchable_paths, fields=None):
+    """Derive the run config from base template + suite params +
+    config_patch, with a provenance row for every field any layer
+    touched. Raises ParamError listing EVERY unresolved conflict:
+    a defaulted param disagreeing with an explicit template value is
+    refused -- the silent sample-disable incident is structurally
+    impossible. Explicit params win over templates and are logged."""
+    import yaml
+
+    try:
+        with open(params["base"]) as f:
+            cfg = yaml.safe_load(f)
+    except FileNotFoundError:
+        raise ParamError(f"base template {params['base']!r} does not exist")
+    except yaml.YAMLError as e:
+        raise ParamError(
+            f"base template {params['base']!r} is not valid YAML: {e}")
+
+    fields = fields or param_fields(prefix)
+    owned = {path: pname for pname, (path, _) in fields.items()}
+    overrides = set(overrides or ())
+    config_patch = dict(config_patch or {})
+    prov, conflicts = [], []
+
+    # -- param layer ------------------------------------------------------
+    for pname, (path, pick) in fields.items():
+        segs = dotpath.parse(path)
+        value = pick(params)
+        template_v = dotpath.get(cfg, segs)
+        if pname in overrides:
+            note = {"path": path, "source": "param", "value": value}
+            if template_v is not dotpath.MISSING and template_v != value:
+                note["against_template"] = template_v
+            dotpath.setval(cfg, segs, value)
+            prov.append(note)
+        else:
+            if template_v is not dotpath.MISSING and template_v != value:
+                if pname == "sample":
+                    opts = (f"pass sample={bool(params['sample'])} to "
+                            f"override the template, or "
+                            f"sample={not bool(params['sample'])} to keep it")
+                else:
+                    opts = (f"pass {pname}={params.get(pname)!r} "
+                            f"explicitly to override the template")
+                conflicts.append(
+                    f"{path}: template sets {template_v!r} but suite param "
+                    f"{pname!r} (default) would set {value!r}. Defaults do "
+                    f"not silently override templates -- {opts}"
+                )
+                continue
+            dotpath.setval(cfg, segs, value)
+            prov.append({"path": path, "source": "param(default)",
+                         "value": value})
+
+    # -- patch layer -------------------------------------------------------
+    for path, value in sorted(config_patch.items()):
+        if path in owned:
+            conflicts.append(
+                f"config_patch {path!r} claims a field owned by suite "
+                f"param {owned[path]!r}; use the param, not a patch"
+            )
+            continue
+        if path not in patchable_paths:
+            conflicts.append(
+                f"config_patch {path!r} is not patchable for this suite; "
+                f"allowed: {list(patchable_paths)}"
+            )
+            continue
+        try:
+            segs = dotpath.parse(path)
+            before = dotpath.get(cfg, segs)
+            dotpath.setval(cfg, segs, value, allow_new=False)
+        except (ValueError, KeyError) as e:
+            conflicts.append(f"config_patch {path!r}: {e}")
+            continue
+        prov.append({"path": path, "source": "patch", "value": value,
+                     "was": None if before is dotpath.MISSING else before})
+
+    # -- suite policy pins (not layerable; owner 2026-10-24 standard) -----
+    cfg["config"]["name"] = name
+    cfg["name"] = name
+    prov.append({"path": "config.name", "source": "suite-policy(name)",
+                 "value": name})
+    if not bool(params.get("sample", False)):
+        proc = cfg["config"]["process"][0]
+        save = proc.setdefault("save", {})
+        save["save_every"] = int(params["steps"]) + 1
+        save["max_step_saves_to_keep"] = 1
+        prov.append({"path": f"{prefix}.save",
+                     "source": "suite-policy(measurement-never-saves)",
+                     "value": {"save_every": save["save_every"],
+                               "max_step_saves_to_keep": 1}})
+
+    if conflicts:
+        raise ParamError(
+            "config merge refused (nothing launched):\n  - "
+            + "\n  - ".join(conflicts)
+        )
+    return cfg, prov
+
+
+# -------------------------------------------------------------- harness
+
+def watch_db(job_dir, paths: RunPaths, stop: threading.Event):
+    db = os.path.join(job_dir, "loss_log.db")
+    while not stop.wait(20.0):
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+            row = con.execute("select max(step) from steps").fetchone()
+            con.close()
+            if row and row[0]:
+                from .runner import emit
+
+                emit(paths, "progress", step=row[0])
+        except Exception:
+            pass  # db not created / mid-transaction; retry next tick
+
+
+def watch_mem(paths: RunPaths, stop: threading.Event, interval=1.0):
+    """1 Hz used-mem sampler (nvidia-smi, external = zero in-process
+    cost). Emits peak plus a compact summary to events.jsonl on exit."""
+    peak = 0
+    samples = []
+    while not stop.wait(interval):
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.used",
+                 "--format=csv,noheader,nounits"],
+                text=True,
+            )
+            used = max(int(x) for x in out.split())
+        except Exception:
+            continue
+        if used > peak:
+            peak = used
+        samples.append(used)
+        if len(samples) >= 5 and len(samples) % 30 == 0:
+            from .runner import emit
+
+            emit(paths, "mem", used=used, peak=peak)
+    if samples:
+        from .runner import emit
+
+        tail = samples[-60:]
+        emit(
+            paths, "mem_summary", peak=peak,
+            tail_median=sorted(tail)[len(tail) // 2], tail_max=max(tail),
+        )
+
+
+def parse_metrics(paths: RunPaths, params):
+    """All metrics from the job's loss_log.db (steps.wall_time +
+    loss/loss); prefers the record's own snapshot (recompute contract:
+    reproducible from the record alone)."""
+    db = os.path.join(paths.artifacts, "metrics.db")
+    if not os.path.exists(db):
+        with open(paths.result) as f:
+            job_dir = json.load(f).get("job_dir")
+        db = os.path.join(job_dir, "loss_log.db")
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        wall = dict(con.execute("select step, wall_time from steps"))
+        w = int(params["warmup"])
+        last = max(wall) if wall else 0
+
+        def win(a, b):
+            if a in wall and b in wall and b > a:
+                return round((wall[b] - wall[a]) / (b - a) * 1000, 1)
+            return None
+
+        first = min(wall) if wall else 0
+        losses = con.execute(
+            "select step, value_real from metrics where key='loss/loss' "
+            "and value_real is not null order by step"
+        ).fetchall()
+        return {
+            "step_ms_window": win(w, last),
+            "step_ms_last100": win(max(w, last - 100), last),
+            "loss_final": losses[-1][1] if losses else None,
+            "loss_mean_last10": (
+                round(sum(v for _, v in losses[-10:]) / min(10, len(losses)), 5)
+                if losses else None
+            ),
+            "steps_done": last,
+            "wall_s": round(wall[last] - wall[first], 1) if wall else None,
+        }
+    finally:
+        con.close()
+
+
+class TrainerKit:
+    """Per-suite wiring: pass the model-specific bits, get the suite.
+
+    namespace   job-name namespace (e.g. "MOSS")
+    module      harness module path (python -m <module> --run-dir DIR)
+    prefix      config path to the process entry ("config.process[0]")
+    extra_params     model switches added to base_params
+    extra_markers    model-specific markers added to TRAINER_MARKERS
+    build_env(params, paths) -> env additions (model switches etc.)
+    """
+
+    def __init__(self, *, namespace, module, prefix="config.process[0]",
+                 extra_params=None, extra_markers=None, build_env=None):
+        self.namespace = namespace
+        self.module = module
+        self.prefix = prefix
+        self.extra_params = extra_params or {}
+        self.extra_markers = dict(extra_markers or {})
+        self.build_env = build_env or (lambda p, paths: {})
+        self.job_name = job_name(namespace)
+        self.patchable = patchable(prefix)
+
+    # -- derivation (used by precheck, resolve and the harness) ----------
+
+    def plan(self, params, ctx):
+        ctx = ctx or {}
+        return merge_plan(
+            params, ctx.get("overrides"), ctx.get("config_patch"),
+            self.job_name(params), prefix=self.prefix,
+            patchable_paths=self.patchable,
+        )
+
+    def derive_config(self, params, name, out_path, overrides=None,
+                      config_patch=None):
+        import yaml
+
+        cfg, prov = merge_plan(
+            params, overrides, config_patch, name, prefix=self.prefix,
+            patchable_paths=self.patchable,
+        )
+        folders = load_map(params["dataset"])
+        ds = cfg["config"]["process"][0]["datasets"]
+        if len(folders) != len(ds):
+            raise ParamError(
+                f"dataset {params['dataset']!r} maps {len(folders)} folders, "
+                f"template has {len(ds)} dataset entries"
+            )
+        for entry, folder in zip(ds, folders):
+            entry["folder_path"] = folder
+        # the same check runs in the submit process via SUITE.precheck;
+        # this copy guards the harness path so nothing can train on a
+        # non-tool folder
+        tool_dataset_check(params["dataset"], folders)
+        with open(out_path, "w") as f:
+            yaml.safe_dump(cfg, f)
+        with open(out_path.replace("config.yaml", "config_provenance.json"),
+                  "w") as f:
+            json.dump(prov, f, indent=1)
+        return cfg
+
+    # -- submit-process hooks ---------------------------------------------
+
+    def precheck(self, params, ctx=None):
+        # bad dataset or conflicted merge never becomes a doomed launch;
+        # the harness re-runs the same code so a direct call can't skip
+        tool_dataset_check(params["dataset"], load_map(params["dataset"]))
+        self.plan(params, ctx)
+
+    def resolve(self, params, ctx=None):
+        _, prov = self.plan(params, ctx)
+        return {"provenance": prov,
+                "config_file": "artifacts/config.yaml (written by harness)"}
+
+    # -- launch ------------------------------------------------------------
+
+    def build(self, params, paths: RunPaths):
+        argv = [sys.executable, "-m", self.module, "--run-dir", paths.root]
+        env = {"SEED": params["seed"], "AITK_STEP_TIME": "1"}
+        if params.get("prof_start") is not None:
+            # the SDTrainer profiler window (no-stack); AITK_PROF_STACK is
+            # never set (host OOM incident rule: stacks not exposed)
+            prof_dir = os.path.join(paths.artifacts, "prof")
+            env["AITK_PROF_DIR"] = prof_dir
+            env["AITK_PROF_START"] = params["prof_start"]
+            env["AITK_PROF_ACTIVE"] = params["prof_active"]
+            os.makedirs(prof_dir, exist_ok=True)
+        env.update({k: v for k, v in self.build_env(params, paths).items()})
+        return argv, env
+
+    # -- harness ------------------------------------------------------------
+
+    def main(self, argv=None):
+        import argparse
+
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--run-dir", required=True)
+        args = ap.parse_args(argv)
+
+        sys.path.insert(0, os.environ.get("RUNTOOL_REPO", os.getcwd()))
+        from .runner import emit
+
+        paths = RunPaths(run_id=os.path.basename(args.run_dir),
+                        root=args.run_dir)
+        with open(paths.manifest) as f:
+            manifest = json.load(f)
+        params = manifest["params"]
+
+        name = self.job_name(params)
+        cfg_path = os.path.join(paths.artifacts, "config.yaml")
+        cfg = self.derive_config(
+            params, name, cfg_path,
+            overrides=manifest.get("overrides"),
+            config_patch=manifest.get("config_patch"),
+        )
+        folder = "output"
+        for proc in cfg["config"].get("process", []):
+            folder = proc.get("training_folder", folder)
+        job_dir = os.path.join(folder, name)
+
+        # reuse-trap guard: a finished/partial job under this name makes
+        # the trainer RESUME (optimizer.pt), i.e. a bogus fast "done" --
+        # fail the record loudly instead
+        if os.path.exists(os.path.join(job_dir, "optimizer.pt")):
+            emit(paths, "reuse_trap", job=name, job_dir=job_dir)
+            with open(paths.result + ".tmp", "w") as f:
+                json.dump(
+                    {"ok": False,
+                     "error": f"reuse trap: {job_dir} holds a previous run "
+                              f"(optimizer.pt); the trainer would resume it. "
+                              f"Delete the job dir or change the tag."},
+                    f, indent=1,
+                )
+            os.replace(paths.result + ".tmp", paths.result)
+            emit(paths, "stage_failed", rc=1, reason="reuse_trap")
+            return 1
+
+        emit(paths, "harness_start", job=name, job_dir=job_dir, cfg=cfg_path)
+
+        log_path = os.path.join(paths.artifacts, "run.log")
+        stop = threading.Event()
+        threading.Thread(target=watch_db, args=(job_dir, paths, stop),
+                         daemon=True).start()
+        threading.Thread(target=watch_mem, args=(paths, stop),
+                         daemon=True).start()
+
+        rc = subprocess.call(
+            [sys.executable, "run.py", cfg_path, "--log", log_path],
+            cwd=manifest["cwd"],
+        )
+        stop.set()
+        if rc != 0:
+            emit(paths, "stage_failed", rc=rc)
+            return rc
+
+        # snapshot the structured source into the record so metrics are
+        # recomputable from the record alone (contract)
+        src_db = os.path.join(job_dir, "loss_log.db")
+        if os.path.exists(src_db):
+            import shutil
+
+            shutil.copy2(src_db, os.path.join(paths.artifacts, "metrics.db"))
+
+        # measurement runs must leave no weights on disk (owner hard disk
+        # rule): the toolkit's end-of-training save is UNCONDITIONAL, so
+        # the harness deletes what it just made. Metrics live in the db
+        # snapshot; quality runs (sample=true) keep their saves because
+        # the saves ARE the deliverable.
+        removed = []
+        if not params.get("sample", False) and os.path.isdir(job_dir):
+            for fname in sorted(os.listdir(job_dir)):
+                if fname.endswith(".safetensors") or fname == "optimizer.pt":
+                    os.remove(os.path.join(job_dir, fname))
+                    removed.append(fname)
+            if removed:
+                emit(paths, "artifact_cleanup", removed=removed)
+
+        metrics = parse_metrics(paths, params)
+        with open(paths.result + ".tmp", "w") as f:
+            json.dump(
+                {"ok": True, "metrics": metrics, "job_name": name,
+                 "job_dir": job_dir,
+                 "metric_source": "steps.wall_time (db) + loss/loss"},
+                f, indent=1,
+            )
+        os.replace(paths.result + ".tmp", paths.result)
+        emit(paths, "harness_done", metrics=metrics)
+        return 0
+
+    # -- assembly -----------------------------------------------------------
+
+    def suite(self, *, suite_id, variants, timeout_s, desc, metrics=None):
+        markers = dict(TRAINER_MARKERS)
+        markers.update(self.extra_markers)
+        return Suite(
+            id=suite_id,
+            variants=variants,
+            params=base_params(**self.extra_params),
+            metrics=metrics or METRICS,
+            build=self.build,
+            parse=parse_metrics,
+            precheck=self.precheck,
+            resolve=self.resolve,
+            patchable=self.patchable,
+            markers=markers,
+            phases=dmark.trainer_phases,
+            timeout_s=timeout_s,
+            desc=desc,
+        )
