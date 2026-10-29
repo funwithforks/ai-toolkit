@@ -20,7 +20,6 @@ import torch
 import yaml
 from safetensors.torch import load_file, save_file
 
-from diffusers import AutoencoderKL
 from transformers import AutoTokenizer, AutoModel
 
 from toolkit.accelerator import unwrap_model
@@ -35,6 +34,9 @@ from toolkit.samplers.custom_flowmatch_sampler import (
 
 from .src.model import ExampleTransformer2DModel
 from .src.pipeline import ExamplePipeline, pad_prompt_embeds
+
+# registers the example vae_id (the vae class and its load live in src/vae.py)
+from . import example_vae_id  # noqa: F401
 
 
 # Config for the training/sampling noise scheduler. ai-toolkit's flow-matching
@@ -57,6 +59,13 @@ class ExampleModel(PhasedLoadMixin, BaseModel):
 
     # short name used in the phased-load status prints
     display_name = "Example"
+
+    # The vae is owned by its id, not by this class: PhasedLoadMixin.load_vae
+    # resolves construction through the registered entry
+    # (``example_vae_id.py``), and encode/decode are methods on the vae itself
+    # (``src/vae.py``). A model that declares an id keeps no vae code, which is
+    # what makes one cached latent valid for every model on the id.
+    vae_id = "example"
 
     # ALL NEW MODELS should set this to False. ``BaseModel`` defaults it to True
     # only for backwards-compatibility with already-released LoKr checkpoints; the
@@ -140,10 +149,12 @@ class ExampleModel(PhasedLoadMixin, BaseModel):
     #   self.noise_scheduler from get_train_scheduler()
     #   self.pipeline        anything generate_single_image can use
     #
-    # Expected layout (diffusers-style folder):
+    # Where each component comes from:
     #   <name_or_path>/transformer/model.safetensors
     #   <name_or_path>/text_encoder/  + /tokenizer/  (transformers format)
-    #   <name_or_path>/vae/           (diffusers AutoencoderKL)
+    #   vae: NOT from this folder. It is the named comfy single file the vae
+    #     class declares (src/vae.py), resolved through the comfy door and kept
+    #     in MODELS_PATH/vae/ -- see the vae_id comment on the class above.
 
     def _load_transformer(self):
         """Build the transformer (the custom model from src/) and return it.
@@ -191,16 +202,9 @@ class ExampleModel(PhasedLoadMixin, BaseModel):
         flush()
         return tokenizer, text_encoder, {}
 
-    def _load_vae(self):
-        """Load the VAE and return it. The mixin places it per model_config."""
-        self.print_and_status_update("Loading VAE")
-        vae = AutoencoderKL.from_pretrained(
-            self.model_config.name_or_path, subfolder="vae"
-        )
-        vae.eval()
-        vae.requires_grad_(False)
-        flush()
-        return vae
+    # load_vae: PhasedLoadMixin dispatches through the registered example
+    # vae_id entry (example_vae_id.py) -- the vae class decides its own file
+    # candidates and streams them to the vae device at shipped precision.
 
     def _build_pipeline(self):
         return ExamplePipeline(self)
@@ -400,55 +404,12 @@ class ExampleModel(PhasedLoadMixin, BaseModel):
     # ------------------------------------------------------------------
     # VAE encode / decode
     # ------------------------------------------------------------------
-    # BaseModel.encode_images / decode_latents already handle a diffusers
-    # AutoencoderKL (scaling_factor / shift_factor) and would work unchanged
-    # for this model. They are overridden here anyway to document the
-    # contract, since custom VAEs (or latent normalization, patchified
-    # latents, video VAEs...) usually need it.
-
-    def encode_images(self, image_list: List[torch.Tensor], device=None, dtype=None):
-        """Pixels -> latents. Used for latent caching and for control images.
-
-        in:  image_list  list of (3, H, W) tensors -- or a (B, 3, H, W) batch --
-                         with values in [-1, 1], already crop/bucket-sized
-        out: (B, C, h, w) latents, normalized the way the transformer expects
-             (for AutoencoderKL: (z - shift_factor) * scaling_factor)
-        """
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(self.vae_device_torch)
-
-        if isinstance(image_list, list):
-            images = torch.stack(image_list, dim=0)
-        else:
-            images = image_list
-        images = images.to(device, dtype=dtype)
-
-        latents = self.vae.encode(images).latent_dist.sample()
-        shift = self.vae.config["shift_factor"] or 0
-        latents = (latents - shift) * self.vae.config["scaling_factor"]
-        return latents.to(device, dtype=dtype)
-
-    def decode_latents(self, latents: torch.Tensor, device=None, dtype=None):
-        """Latents -> pixels. Used when rendering previews.
-
-        in:  (B, C, h, w) latents in the normalized space encode_images produces
-        out: (B, 3, H, W) images in [-1, 1]
-        """
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(self.vae_device_torch)
-
-        latents = latents.to(device, dtype=dtype)
-        shift = self.vae.config["shift_factor"] or 0
-        latents = latents / self.vae.config["scaling_factor"] + shift
-        return self.vae.decode(latents).sample
+    # Both are the example vae's own methods (src/vae.py), reached through
+    # PhasedLoadMixin.encode_images / decode_latents, which supply residency
+    # only. There is no example-side encode to keep in step with them: a vae
+    # with unusual latents (normalization, patchified, video frames) writes
+    # them on its own class, where every model declaring the id shares one
+    # implementation and one cached latent format.
 
     # ------------------------------------------------------------------
     # Saving / bookkeeping
