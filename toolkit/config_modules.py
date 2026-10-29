@@ -414,6 +414,21 @@ class TrainConfig:
         self.sdp = kwargs.get('sdp', False)
         # see https://huggingface.co/docs/diffusers/main/optimization/attention_backends#available-backends for options
         self.attention_backend: str = kwargs.get('attention_backend', 'native')  # native, flash, _flash_3_hub, _flash_3, 
+        # Lifecycle phase selection: 1=vae+latent caching, 2=text embedding
+        # caching, 3=training (transformer). Default runs the full normal
+        # order [1, 2, 3]; the order is always the fixed lifecycle 1->2->3
+        # (phase boundaries are the iron-rule contracts, never reordered).
+        # Skipping a phase is only legal when no selected phase downstream
+        # still needs its work -- the requirement checks in
+        # BaseSDTrainProcess.run() refuse loudly.
+        phases_in = kwargs.get('phases', [1, 2, 3])
+        if isinstance(phases_in, int):
+            phases_in = [phases_in]
+        self.phases = sorted({int(p) for p in phases_in})
+        if not self.phases or any(p not in (1, 2, 3) for p in self.phases):
+            raise ValueError(
+                f"phases must be a non-empty subset of [1, 2, 3], got {phases_in!r}"
+            )
         self.train_unet = kwargs.get('train_unet', True)
         self.train_text_encoder = kwargs.get('train_text_encoder', False)
         self.train_refiner = kwargs.get('train_refiner', True)
