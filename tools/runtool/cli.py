@@ -22,6 +22,14 @@
                               (0 = whole file), caller regex over the record
   cancel RUN_ID
   list   [--limit N]
+  search [--suite S] [--status ST] [--dataset K] [--tag T] [--note TEXT]
+         [--metric NAME<OP>NUM]... [--marker M]... [--no-marker M]...
+         [--param K=V]... [--expect PASS|FAIL] [--since DAYS] [--variant V]
+         [--jobs] [--limit N]
+                              query the history over record JSON (fast,
+                              read-only -- never starts queued runs);
+                              --jobs lists the job dirs that exist with
+                              owner run, size, age
   recompute RUN_ID
   gc [--days N] [--apply] [--include-judged]
                               reap the jobs subtree (finished tool runs,
@@ -119,6 +127,34 @@ def main(argv=None):
 
     p = sub.add_parser("list")
     p.add_argument("--limit", type=int, default=15)
+
+    p = sub.add_parser("search", help="query the run history (read-only)")
+    p.add_argument("--suite", default=None)
+    p.add_argument("--variant", default=None)
+    p.add_argument("--status", default=None,
+                   help="done | failed | crash | cancelled | running | "
+                        "queued")
+    p.add_argument("--dataset", default=None, help="dataset key")
+    p.add_argument("--tag", default=None, help="substring of the tag param")
+    p.add_argument("--note", default=None, help="substring of the note")
+    p.add_argument("--metric", action="append", metavar="NAME<OP>NUM",
+                   help='repeatable, e.g. "loss_final<0.31" '
+                        '"steps_done>=18" (ops: < <= == > >=)')
+    p.add_argument("--marker", action="append",
+                   help="repeatable: marker must be FOUND (persisted)")
+    p.add_argument("--no-marker", action="append",
+                   help="repeatable: marker must be ABSENT")
+    p.add_argument("--param", action="append", metavar="K=V",
+                   help="repeatable exact param match, e.g. "
+                        "cutlass_bwd=off (switches are params)")
+    p.add_argument("--expect", choices=("PASS", "FAIL"),
+                   help="persisted expect verdict")
+    p.add_argument("--since", type=float, default=None, metavar="DAYS",
+                   help="only records newer than N days")
+    p.add_argument("--jobs", action="store_true",
+                   help="instead of records: the job dirs that exist "
+                        "(owner, run status, size, age)")
+    p.add_argument("--limit", type=int, default=25)
 
     p = sub.add_parser("gc")
     p.add_argument("--days", type=float, default=7.0)
@@ -243,6 +279,17 @@ def main(argv=None):
             res = runner.recompute(a.run_id)
         elif a.op == "list":
             res = {"runs": runner.list_runs(a.limit)}
+        elif a.op == "search":
+            from . import search as search_mod
+            if a.jobs:
+                res = search_mod.jobs()
+            else:
+                res = search_mod.search(
+                    suite=a.suite, variant=a.variant, status=a.status,
+                    dataset=a.dataset, tag=a.tag, note=a.note,
+                    metric=a.metric, marker=a.marker,
+                    no_marker=a.no_marker, param=a.param, expect=a.expect,
+                    since=a.since, limit=a.limit)
         print(json.dumps(res, indent=1, default=str))
         status = res.get("status") if isinstance(res, dict) else None
         return 0 if status not in ("crash", "failed", "timeout") else 1
