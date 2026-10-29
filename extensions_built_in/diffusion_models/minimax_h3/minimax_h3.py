@@ -71,7 +71,6 @@ from .src import packing
 packing_video_exts = [".mp4", ".avi", ".mov", ".webm", ".mkv", ".wmv", ".m4v", ".flv"]
 from .src.audio_vae import MiniMaxH3AudioVAE
 from .src.packing import (
-    KEYFRAME_ENCODE_SEED,
     KEYFRAME_NOISE_AUG_T,
     build_packed_sequence,
     pack_audio_latents,
@@ -1655,13 +1654,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             .transpose(0, 1)
             .reshape(1, 3, len(frames), ph, pw)
         )
-        generator = torch.Generator(device="cpu").manual_seed(KEYFRAME_ENCODE_SEED)
-        latents = self.video_vae.encode(
-            pixels.to(self.vae.device, self.video_vae.dtype),
-            sample=True,
-            generator=generator,
-            fp16_round=True,
-        )
+        latents = self.encode_keyframe_latents(pixels)
         # soundtrack rides clean when the clip has one (same test as the TE label)
         audio_rows = None
         try:
