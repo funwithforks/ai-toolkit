@@ -57,9 +57,10 @@ selected consumes them, the run exits cleanly at the boundary with a printed
 `phases=[...] complete` line (after the phase-1 iron-rule free, or before
 `load_transformer`). Phase 1 and phase 2 share nothing (separate cache dirs,
 separate version knobs, separate gates), so `[1]`-only and `[2]`-only runs
-are independent dataset-prep jobs. The vae_id cache-tag pin applies at model
-construction precisely so a `[2]`-only run still hashes the right tag into
-latent cache filenames ([loader conventions](./phased-loading--loader-conventions.md) §5).
+are independent dataset-prep jobs. Registry models hash their `vae_id` into
+latent cache filenames from the class attribute alone, so a `[2]`-only run
+still evaluates latent completeness correctly
+([loader conventions](./phased-loading--loader-conventions.md) §5).
 
 ## Sampling rounds (sample())
 

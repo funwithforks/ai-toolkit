@@ -1,21 +1,18 @@
 """minimax_h3 vae_id: the video + audio VAE bundle behind one id.
 
-Registration side of the H3 bundle (loads, placement policy, cache-tag
-pin). The encode/decode primitives stay on the model until the encode
+Registration side of the H3 bundle (load + the ``bundle`` flag). The
+encode/decode primitives stay on the model until the encode
 migration; until then ``encode_images``/``decode_latents`` stay None and
 the model methods are the call surface.
 
 The load callable is the model's former ``_load_vaes`` body, verbatim:
 each member streams straight onto the vae device through the comfy door
 (component candidate metadata lives on the component classes), and the
-shipped precisions (video fp16, audio fp32) survive placement because
-the bundle pins ``keep_shipped`` -- the mixin's placement step only
-moves it.
+shipped precisions (video fp16, audio fp32) survive because the vendored
+loaders take no dtype at all -- the mixin's placement step only moves.
 
-``latent_space_version`` is the explicit cache tag the model used to pin
-in its own ``__init__``; from the id it applies at construction, so runs
-that never load the vae (phases without 1) still hash the same tag into
-cache filenames.
+Cache identity is the ``vae_id`` itself: files hash the id, so every
+model declaring the same id shares the same latents -- no version knob.
 """
 
 from toolkit.basic import flush
@@ -48,9 +45,8 @@ register_vae_entry(
         vae_id="minimax_h3",
         components={"video_vae": MiniMaxH3VideoVAE, "audio_vae": MiniMaxH3AudioVAE},
         load=_load_minimax_h3_vae,
-        # members ship at mixed precisions on purpose
-        dtype_policy="keep_shipped",
+        # members keep their shipped precisions (fp16 video / fp32 audio):
+        # the loaders take no dtype, and placement only moves
         bundle=True,
-        latent_space_version="minimax_h3_v1",
     )
 )
