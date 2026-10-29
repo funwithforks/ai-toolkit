@@ -1,6 +1,8 @@
 import os
 from toolkit.basic import flush
 
+from .vae_registry import get_vae_entry
+
 
 class PhasedLoadMixin:
     """Phased loading contract shared by training-capable models.
@@ -31,6 +33,16 @@ class PhasedLoadMixin:
     """
 
     display_name = "model"
+    # set to a registered vae_id (toolkit/models/vae_registry.py) to route
+    # the vae load through the registry; None keeps the model's own _load_vae
+    vae_id = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # fail at construction, not at first encode: a declared id that
+        # was never registered is a wiring bug, not a runtime condition
+        if self.vae_id is not None:
+            get_vae_entry(self.vae_id)
 
     @staticmethod
     def select_comfy_candidates(component, candidates, model_kwargs):
@@ -110,7 +122,29 @@ class PhasedLoadMixin:
         pass
 
     def load_vae(self):
-        """Load the vae and place it per model_config."""
+        """Load the vae and place it per model_config.
+
+        A class that declares ``vae_id`` resolves through the registry: the
+        id's module owns candidate resolution, streaming, and its per-member
+        dtype policy, so the placement here only moves (``keep_shipped`` --
+        shipped precisions survive verbatim) or moves and casts
+        (``as_configured``). Classes without an id are untouched."""
+        vae_id = getattr(self, "vae_id", None)
+        if vae_id is not None:
+            entry = get_vae_entry(vae_id)
+            vae = entry.load(self)
+            if entry.dtype_policy == "keep_shipped":
+                vae.to(self.vae_device_torch)
+            else:
+                vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
+            if entry.latent_space_version is not None and getattr(
+                self, "latent_space_version", None
+            ) is None:
+                # explicit cache-tag pin (the arch-name fallback coincidence
+                # is not a pin); model_config still outranks it upstream
+                self.latent_space_version = entry.latent_space_version
+            self.vae = vae
+            return
         vae = self._load_vae()
         vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
         self.vae = vae
