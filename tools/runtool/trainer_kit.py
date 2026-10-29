@@ -434,6 +434,11 @@ def watch_mem(paths: RunPaths, stop: threading.Event, interval=1.0):
     rss_peak = 0
     samples = []
     while not stop.wait(interval):
+        # host RSS first, unconditionally: reading /proc is in-process
+        # and practically free, so its 1 Hz rate must not depend on the
+        # external nvidia-smi call succeeding this tick
+        rss = _tree_rss_mb()
+        rss_peak = max(rss_peak, rss)
         try:
             out = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=memory.used",
@@ -443,24 +448,27 @@ def watch_mem(paths: RunPaths, stop: threading.Event, interval=1.0):
             used = max(int(x) for x in out.split())
         except Exception:
             continue
-        rss = _tree_rss_mb()
         peak = max(peak, used)
-        rss_peak = max(rss_peak, rss)
         samples.append(used)
         if len(samples) >= 5 and len(samples) % 30 == 0:
             from .runner import emit
 
             emit(paths, "mem", used=used, peak=peak, rss=rss,
                  rss_peak=rss_peak)
-    if samples:
+    if samples or rss_peak:
+        # RSS alone still earns a summary: an nvidia-smi outage must not
+        # silently discard a whole run's host-memory evidence (a failure
+        # that looks costless is still broken)
         from .runner import emit
 
-        tail = samples[-60:]
-        emit(
-            paths, "mem_summary", peak=peak,
-            tail_median=sorted(tail)[len(tail) // 2], tail_max=max(tail),
-            rss_peak=rss_peak,
-        )
+        fields = {"rss_peak": rss_peak}
+        if samples:
+            tail = samples[-60:]
+            fields.update(
+                peak=peak,
+                tail_median=sorted(tail)[len(tail) // 2], tail_max=max(tail),
+            )
+        emit(paths, "mem_summary", **fields)
 
 
 @tag_metrics("steps.wall_time (db) + loss/loss")
