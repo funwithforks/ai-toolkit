@@ -233,7 +233,7 @@ identity only proves the move itself changed nothing.
 | vae_id registry + entry shape | `toolkit/models/vae_registry.py` |
 | Registry dispatch + construction-time validation | `phased_load.py` `PhasedLoadMixin.__init__` / `load_vae` / `encode_images` / `decode_latents` |
 | Cache identity = vae_id (loud refusal without one) | `data_loader.py` (latent cache keying) |
-| Reference vae_id migration (bundle, vendored loaders, kill-list) | `minimax_h3/minimax_h3_vae_id.py`, commit `c578d205` |
+| Reference vae_id migration (bundle, vendored loaders, entry-owned encode/decode, kill-list) | `minimax_h3/minimax_h3_vae_id.py` |
 | Reference single-vae migration (vendored loader + vendored config, entry-owned encode/decode) | `toolkit/models/v2/vae/qwen_image.py` (the `qwen_image` id; krea2 declares it) |
 | Lifecycle phase selection (`phases`) | `config_modules.py` `TrainConfig.phases`; guards/exits in `BaseSDTrainProcess.run()` |
 | Lazy reader, per-key placement | `weight_source.py:25` `:90` |
