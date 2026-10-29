@@ -172,20 +172,26 @@ def create(key, from_key=None, from_path=None, synthetic=0,
     try:
         if synthetic > 0:
             copied = _synthesize(dst, synthetic, size)
+            folders = [dst]
         else:
-            for s in srcs:
+            # multi-folder sources KEEP their folder structure: for
+            # multi-media models the folders ARE the semantics (image
+            # set vs video set wire to different template entries, in
+            # registry order). Subfolders are neutral (folder_N), never
+            # the source names.
+            folders = []
+            for i, s in enumerate(srcs):
                 if not os.path.isdir(s):
                     raise ParamError("source folder does not exist")
-                copied += _copy_tree(s, dst, copy_cache)
-            # multi-folder sources collapse into ONE folder: the copy is
-            # the union (suites take a folder list per dataset entry; a
-            # tool dataset is one folder, which keeps naming simple)
+                sub = os.path.join(dst, f"folder_{i}")
+                copied += _copy_tree(s, sub, copy_cache)
+                folders.append(sub)
     except Exception:
         shutil.rmtree(dst, ignore_errors=True)
         raise
 
     data[key] = {
-        "folders": [dst],
+        "folders": folders,
         "created_by": "runtool",
         "created_at": round(time.time(), 1),
         "files": copied,
