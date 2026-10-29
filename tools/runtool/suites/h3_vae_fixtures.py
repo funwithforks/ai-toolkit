@@ -24,12 +24,17 @@ refuses the two runs when they share a dataset key -- same-folder arms
 overwrite each other's cache files (identical hashes for same-semantics
 encodes) and a compare of the directory would grade an overwrite.
 
-Arms are the pipeline seam the vae_id registry opens: old_path is real
-today (the current per-model encode path); registry_path is a forward
-declaration that FAILS LOUDLY at harness start until the single-load-path
-door exists (never a silent fall back to old_path). stage=A grades
-byte-identity (structure-only moves); stage=B grades the quality regime
-(diffs recorded, explained within ceiling, dB, the owner's watch).
+Arms are the pipeline seam the vae_id registry opens, gated against the
+model's MIGRATION STATE (declaring vae_id opts a model into registry
+dispatch; H3 still overrides load_vae, so it is pre-migration):
+old_path grades real today, and REFUSES once the model migrates (the
+label could not name a path that no longer runs -- the pre-migration
+baseline lives in the seeded pre-migration records compare reads);
+registry_path FAILS LOUDLY until the model migrates (never a silent fall
+back to old_path). stage=A grades cache identity (structure-only moves;
+identity law = tensor bits + meta values, see SPEC); stage=B grades the
+quality regime (diffs recorded, explained within ceiling, dB, the
+owner's watch).
 stranded_refused is declared as vocabulary for the fork-side meta
 tripwire (bumped-version caches refused at open) -- the print is the
 refactor session's half of the increment.
