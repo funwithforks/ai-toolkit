@@ -228,11 +228,10 @@ def _encode(args):
     from toolkit.config_modules import ModelConfig
     from toolkit.util.get_model import get_model_class
 
-    if args.arm != "old_path":
-        print(f"arm not implemented: {args.arm!r} -- no vae_id registry in "
-              f"the tree yet (single-load-path door is Stage A/B work). "
-              f"Failing loudly per spec; old_path was NOT substituted.",
-              flush=True)
+    if args.arm not in ("old_path", "registry_path"):
+        print(f"arm not implemented: {args.arm!r} (vocabulary is "
+              f"old_path|registry_path). Failing loudly; nothing else was "
+              f"substituted.", flush=True)
         return 1
 
     with open(args.config) as f:
@@ -243,6 +242,30 @@ def _encode(args):
     import extensions_built_in.diffusion_models  # registers AI_TOOLKIT_MODELS
     mc = ModelConfig(**proc["model"])
     ModelClass = get_model_class(mc)
+    # ARM vs MIGRATION STATE (vae_id registry, landed as the fork's Stage-A
+    # increment): a model opts into registry dispatch by declaring the class
+    # attribute vae_id; H3 still overrides load_vae (unmigrated). The label
+    # may never lie about what a run graded: registry_path on an unmigrated
+    # model would grade old_path under a false label, and old_path on a
+    # migrated model could not be the path it names (that pre-migration
+    # comparison lives in the pre-migration RECORDS, which compare mode
+    # reads). Both refusals are printed with the true reason.
+    migrated = getattr(ModelClass, "vae_id", None) is not None
+    print(f"arm={args.arm} migration_state={'migrated' if migrated else 'pre_migration'}",
+          flush=True)
+    if args.arm == "registry_path" and not migrated:
+        print(f"fixt unexplained diff: arm refusal -- {ModelClass.__name__} "
+              f"declares no vae_id; registry exists but this model still "
+              f"overrides load_vae. registry_path would grade old_path "
+              f"under a false label; nothing was substituted", flush=True)
+        return 1
+    if args.arm == "old_path" and migrated:
+        print(f"fixt unexplained diff: arm refusal -- {ModelClass.__name__} "
+              f"is migrated (vae_id declared); the pre-registry path no "
+              f"longer exists on this tree. The pre-migration baseline is "
+              f"the seeded pre-migration records; compare mode reads them",
+              flush=True)
+        return 1
     # dtype REQUIRED from config, no default: a defaulted dtype would make
     # this arm's bytes differ from a real training run for a reason with
     # no name. The string passes through exactly like
