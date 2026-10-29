@@ -380,10 +380,35 @@ def _proc_start_ticks(pid):
 _SUBMIT_MARK_KEY = "_submit_start_ticks"
 
 
+def _proc_state(pid):
+    """/proc state char (S/R/D/Z/...), or None when the pid is gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return fields[0]
+    except (FileNotFoundError, IndexError, ValueError):
+        return None
+
+
 def _pid_alive(paths, manifest):
     try:
         pid = int(open(paths.pid).read().strip())
     except (FileNotFoundError, ValueError):
+        return False
+    state = _proc_state(pid)
+    if state == "Z":
+        # A zombie has EXITED: its /proc entry lingers only because nobody
+        # reaped it. The queue pump (F6) spawns inside whichever process
+        # first touches the queued run -- a wait/status loop can therefore
+        # own the child -- and the loop never waitpid's. Treating the
+        # zombie as alive self-locks that process (only it can reap; only
+        # it can exit; it waits for itself). A zombie is dead, and where
+        # we hold the fatherhood we reap so /proc clears too.
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass  # not our child: its reaper (or init, after its parent
+            # exits) will clear it; the run is classified terminal either way
         return False
     ticks = _proc_start_ticks(pid)
     if ticks is None:
