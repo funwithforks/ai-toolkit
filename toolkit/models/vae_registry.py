@@ -6,9 +6,12 @@ construction and placement from the registered entry instead of the model's
 own ``_load_vae`` body. Models that declare no id are untouched -- the
 default-off rule for shared loading code.
 
-Each id owns a module pair (loader + encode/decode primitives); the entry
-below is that pair's shape. Component candidate metadata stays where it
-lives today -- on the component classes as ``aitk_comfy_repo`` /
+Each id owns one vae object: its module carries the file resolution and the
+load (the entry below), and the encode/decode live as methods on the vae
+class itself -- the object answers for its own math and its own precision,
+so there is no per-model encode path to keep in step and nothing
+encode/decode-shaped on the entry. Component candidate metadata stays where
+it lives today -- on the component classes as ``aitk_comfy_repo`` /
 ``aitk_comfy_weight_names`` -- so the registry registers candidates through
 class references and NEVER paths; file resolution stays the comfy door
 (toolkit.models.v2.resolver: explicit <component>_path override > local
@@ -33,7 +36,7 @@ not at first encode -- see PhasedLoadMixin.__init__.
 """
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Type
+from typing import Callable, Dict, Type
 
 @dataclass(frozen=True)
 class VaeEntry:
@@ -45,11 +48,6 @@ class VaeEntry:
     # at shipped precision. Placement upstream only moves it -- no cast exists
     load: Callable[[object], object]
     bundle: bool = False
-    # encode/decode primitives (module-pair half); until an id migrates its
-    # encode path these stay None and the model's own methods are the call
-    # surface
-    encode_images: Optional[Callable] = None
-    decode_latents: Optional[Callable] = None
 
 
 _REGISTRY: Dict[str, VaeEntry] = {}

@@ -96,11 +96,10 @@ from .src.text_encoder import (
 )
 from .src.transformer import MiniMaxH3Transformer, MiniMaxH3TransformerParams
 from .src.vae import MiniMaxH3VideoVAE
-from .minimax_h3_vae_id import (
-    decode_audio_latents as vae_decode_audio_latents,
-    encode_audio_latents as vae_encode_audio_latents,
-    encode_keyframe_latents as vae_encode_keyframe_latents,
-)
+
+# registers the minimax_h3 vae_id entry (its load imports this module's
+# bundle lazily, so importing it here is safe and side-effect-free)
+from . import minimax_h3_vae_id  # noqa: F401
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -168,6 +167,8 @@ class MiniMaxH3VaeBundle(torch.nn.Module):
         super().__init__()
         self.video_vae = video_vae
         self.audio_vae = audio_vae
+        # one trim notice per load, not per batch
+        self._warned_frame_trim = False
 
     @property
     def device(self):
@@ -185,6 +186,86 @@ class MiniMaxH3VaeBundle(torch.nn.Module):
 
     def disable_gradient_checkpointing(self):
         self.enable_gradient_checkpointing(False)
+
+    # -- the vae does the vae work ------------------------------------------------
+    # encode/decode for everything this id covers. Device and precision come
+    # from the members' own shipped parameters, which is what makes one cached
+    # latent valid for every model declaring this id, and what stops a job
+    # config from rounding the latents. device/dtype say where the CALLER
+    # wants the result; they never change how it is computed. Residency (the
+    # cpu->vae-device move, and the staged-sampling borrow) is the holder's.
+
+    @torch.no_grad()
+    def encode_images(self, image_list, device=None, dtype=None):
+        """Images (C, H, W) or videos (T, C, H, W) in [-1, 1] -> normalized
+        video latents (B, 24, t, h, w). Video frame counts are trimmed down
+        to the VAE's 17n+5 grid when needed."""
+        if self.video_vae is None:
+            raise RuntimeError("minimax_h3 vae: image encode needs the video vae")
+        items = []
+        for image in image_list:
+            if image.ndim == 3:
+                items.append(image.unsqueeze(1))  # (C, 1, H, W)
+            elif image.ndim == 4:
+                items.append(image.permute(1, 0, 2, 3))  # (C, T, H, W)
+            else:
+                raise ValueError(f"Invalid image shape: {image.shape}")
+
+        num_frames = items[0].shape[1]
+        if num_frames > 1:
+            aligned = packing.align_num_frames_down(num_frames)
+            if aligned != num_frames and not self._warned_frame_trim:
+                print(
+                    f"MiniMax-H3: trimming {num_frames}-frame clips to {aligned} "
+                    f"frames (the video VAE needs 17n+5: 5, 22, 39, 56, ...). Set "
+                    f"the dataset num_frames accordingly to avoid wasted decode."
+                )
+                self._warned_frame_trim = True
+            items = [it[:, :aligned] for it in items]
+
+        batch = torch.stack(items).to(self.device, dtype=self.video_vae.dtype)
+        latents = self.video_vae.encode(batch, sample=True)
+        return latents if device is None and dtype is None else latents.to(device, dtype=dtype)
+
+    def decode_latents(self, latents, device=None, dtype=None):
+        # differentiable: pixel-space losses backprop through the video VAE
+        if self.video_vae is None:
+            raise RuntimeError("minimax_h3 vae: decode needs the video vae")
+        video = self.video_vae.decode(latents.to(self.video_vae.device, self.video_vae.dtype))
+        return video if device is None and dtype is None else video.to(device, dtype=dtype)
+
+    @torch.no_grad()
+    def encode_keyframe_latents(self, frames):
+        """(B, 3, 1, H, W) in [-1, 1] -> normalized latents (B, 24, 1, h, w), with
+        the released conditioning recipe: seeded posterior sample (seed 42,
+        independent of the request seed) rounded to fp16 before normalization.
+        Returned fp32 -- this is the conditioning reference, not a cache entry."""
+        if self.video_vae is None:
+            raise RuntimeError("minimax_h3 vae: keyframe encode needs the video vae")
+        generator = torch.Generator(device="cpu").manual_seed(packing.KEYFRAME_ENCODE_SEED)
+        return self.video_vae.encode(
+            frames.to(self.video_vae.device, self.video_vae.dtype),
+            sample=True,
+            generator=generator,
+            fp16_round=True,
+        ).float()
+
+    def decode_audio_latents(self, latents):
+        # differentiable, like decode_latents
+        """(B, 32, T) normalized -> waveform (B, 1, T*800) at 32 kHz."""
+        if self.audio_vae is None:
+            raise RuntimeError("minimax_h3 vae: audio decode needs the audio vae")
+        if self.audio_vae.device == torch.device("cpu"):
+            self.audio_vae.to(self.device)
+        return self.audio_vae.decode(latents.to(self.audio_vae.device, torch.float32))
+
+    def encode_audio_latents(self, waveform):
+        """Waveform (C, samples) fp32 at 32 kHz -> the mono vae's latents
+        (2C, 32, T): each stereo channel rides as its own batch item."""
+        if self.audio_vae is None:
+            raise RuntimeError("minimax_h3 vae: audio encode needs the audio vae")
+        waveform = waveform.to(self.audio_vae.device, torch.float32)
+        return self.audio_vae.encode(waveform.unsqueeze(1))
 
 
 class MinimaxH3Model(PhasedLoadMixin, BaseModel):
@@ -219,7 +300,6 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         self.encode_control_in_text_embeddings = True
 
         self.processor = None  # Qwen3VLProcessor
-        self._warned_frame_trim = False
         # video-ref presentation context: dataset config while caching training
         # embeds; the sample's frame cap while encoding sample prompts
         self._ref_video_dataset_config = None
@@ -868,10 +948,10 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
     # ------------------------------------------------------------------
     # VAE encode / decode
     # ------------------------------------------------------------------
-    # encode_images and decode_latents ARE the minimax_h3 vae_id entry's
-    # primitives (minimax_h3_vae_id.py), reached through
-    # PhasedLoadMixin.encode_images/decode_latents. What stays here is only
-    # the residency dance the phased contract requires of the holder.
+    # encode_images/decode_latents dispatch to the MiniMaxH3VaeBundle's own
+    # methods through PhasedLoadMixin (the bundle is the minimax_h3 vae_id's
+    # object). What stays here is only the residency dance the phased
+    # contract requires of the holder.
 
     @torch.no_grad()
     def encode_keyframe_latents(self, frames: torch.Tensor) -> torch.Tensor:
@@ -884,7 +964,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             self.load_vae()
         if self.vae.device == torch.device("cpu"):
             self.vae.to(self.vae_device_torch)
-        latents = vae_encode_keyframe_latents(self, frames)
+        latents = self.vae.encode_keyframe_latents(frames)
         if loaded_here:
             self.vae = None
             flush()
@@ -893,7 +973,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
     def decode_audio_latents(self, latents: torch.Tensor):
         """(B, 32, T) normalized -> waveform (B, 1, T*800) at 32 kHz.
         Differentiable: audio losses backprop through the audio VAE."""
-        return vae_decode_audio_latents(self, latents)
+        return self.vae.decode_audio_latents(latents)
 
     @property
     def audio_sample_rate(self) -> int:
@@ -936,7 +1016,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                     waveform, sample_rate, packing.AUDIO_SAMPLE_RATE
                 )
             # the mono VAE sees each stereo channel as its own batch item
-            z = vae_encode_audio_latents(self, waveform)  # (2, 32, T)
+            z = self.vae.encode_audio_latents(waveform)  # (2, 32, T)
             packed.append(pack_audio_latents(z.unsqueeze(0)))  # (1, 2*T, 32)
 
         max_len = max(p.shape[1] for p in packed)

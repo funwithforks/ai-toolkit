@@ -1,12 +1,17 @@
 """The BFL-style Flux2 KL autoencoder (32ch latents, 2x2 pixel-shuffle
 packing to 128ch), shared by the flux2 family and ideogram4.
 
-flux2 loads the raw BFL ae.safetensors layout and uses encode/decode (with the
-BatchNorm running-stats latent normalization); ideogram4 loads diffusers-format
-checkpoints via convert_diffusers_state_dict and drives encoder/decoder
-directly with its own patchify + latent-norm tables. The two models pack the
-128 latent channels in different orders — the packing/normalization stays
-per-model.
+This module is also the ``flux2`` vae_id contract (registration at the
+bottom): the comfy file resolution, the vendored no-dtype loader, and the
+class's own ``encode_images`` / ``decode_latents``. Models join by declaring
+``vae_id = "flux2"`` and carry no vae code of their own.
+
+This vae loads the raw BFL ae.safetensors layout and uses encode/decode (with
+the BatchNorm running-stats latent normalization); ideogram4 loads
+diffusers-format checkpoints via convert_diffusers_state_dict and drives
+encoder/decoder directly with its own patchify + latent-norm tables. The two
+models pack the 128 latent channels in different orders — the
+packing/normalization stays per-model.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import torch.utils.checkpoint as ckpt
 from einops import rearrange
 from torch import Tensor, nn
 
+from ...vae_registry import VaeEntry, register_vae_entry
 from .._mixin import OstrisModelMixin
 
 
@@ -357,6 +363,24 @@ class Decoder(nn.Module):
 
 
 class AutoEncoder(nn.Module, OstrisModelMixin):
+    # ---- comfy weight sources (the flux2 vae_id's file resolution) ----
+    # One physical file, one download source. The comfy repos of the models
+    # that use this vae publish it byte-identical (sha256 868fe7b3...), so a
+    # non-gated one is the default source and the job's own repo never has to
+    # carry it. Chosen over the flux3 package repo's copy of the same name
+    # because that one is not byte-identical to the file we train on (and is
+    # gated); FLUX.2's own BFL/Comfy-Org repos are gated too.
+    aitk_subfolder = "vae"
+    aitk_comfy_repo = "Comfy-Org/MOSS-Image"
+    # every standard name_or_path of a model on this vae maps to the same
+    # properly-named file; a job naming any of them fetches one shared vae
+    aitk_comfy_weight_names = {
+        "black-forest-labs/flux-3-image-klein-comfy": ["vae/flux2-vae.safetensors"],
+        "Comfy-Org/Fibo-2.0": ["vae/flux2-vae.safetensors"],
+        "Comfy-Org/MOSS-Image": ["vae/flux2-vae.safetensors"],
+        "OpenMOSS-Team/MOSS-Image-Base": ["vae/flux2-vae.safetensors"],
+    }
+
     @classmethod
     def aitk_config_from_state_dict(cls, state_dict):
         # small decoder builds report 96ch at the first decoder block
@@ -423,6 +447,52 @@ class AutoEncoder(nn.Module, OstrisModelMixin):
         self.encoder.enable_gradient_checkpointing()
         self.decoder.enable_gradient_checkpointing()
 
+    @classmethod
+    def load_to_device(cls, file_path: str, device) -> "AutoEncoder":
+        """Stream a comfy-layout checkpoint onto ``device`` at the precision
+        it ships in (the file's own mix, fp32 for the shipped flux2 vae).
+
+        Vendored on the minimax_h3 / qwen_image pattern: the shell is built
+        with meta parameters, tensors materialize on the device one at a time
+        (peak ram is the largest tensor, never the model), and the load is
+        ``strict=True`` so a wrong file dies here instead of leaving part of
+        the network at its initialization. There is no dtype argument: the
+        upstream "cast the vae to the job's dtype" step is what rounds the
+        latents, so this path cannot ask for it.
+        """
+        import time
+        from accelerate import init_empty_weights
+        from toolkit.util.weight_source import WeightSource
+
+        t0 = time.perf_counter()
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        with init_empty_weights(include_buffers=False):
+            model = cls(cls._params_from_checkpoint(file_path))
+        state = WeightSource.open(file_path).materialize(dev)
+        model.load_state_dict(state, strict=True, assign=True)
+        del state
+        # the meta shell leaves non-persistent buffers at their init device;
+        # parameters are already resident so this only relocates those
+        model.to(dev)
+        model.eval().requires_grad_(False)
+        print(
+            f"[load-timing] flux2 AutoEncoder: streamed to {dev} "
+            f"{time.perf_counter() - t0:.1f}s"
+        )
+        return model
+
+    @staticmethod
+    def _params_from_checkpoint(file_path: str):
+        """The file decides the architecture, from its header alone (no weight
+        read): small-decoder builds report 96ch at the first decoder block."""
+        from safetensors import safe_open
+
+        with safe_open(file_path, framework="pt") as f:
+            width = f.get_slice("decoder.up.0.block.0.conv1.bias").get_shape()[0]
+        return AutoEncoderSmallDecoderParams() if width == 96 else AutoEncoderParams()
+
     def normalize(self, z):
         self.bn.eval()
         return self.bn(z)
@@ -456,6 +526,29 @@ class AutoEncoder(nn.Module, OstrisModelMixin):
         )
         dec = self.decoder(z)
         return dec
+
+    # -- the vae does the vae work ------------------------------------------------
+    # These are what phase 1 caches and what sampling decodes, so they belong to
+    # the vae rather than to any model: device and precision come from this
+    # module's own parameters, which is what makes one cached latent valid for
+    # every model that declares this id, and what stops a job config from
+    # rounding the latents. device/dtype say where the CALLER wants the result;
+    # they never change how it is computed. Residency is the holder's job.
+
+    @torch.no_grad()
+    def encode_images(self, image_list, device=None, dtype=None) -> Tensor:
+        """Images (C, H, W) in [-1, 1], or a stacked batch -> normalized latents
+        (B, 128, H/16, W/16): encode(), i.e. 2x2-packed + BatchNorm normalized,
+        the exact form the DiT consumes."""
+        batch = torch.stack([img.to(self.device, dtype=self.dtype) for img in image_list])
+        z = self.encode(batch)
+        return z if device is None and dtype is None else z.to(device, dtype=dtype)
+
+    @torch.no_grad()
+    def decode_latents(self, latents: Tensor, device=None, dtype=None) -> Tensor:
+        """Normalized latents (B, 128, h, w) -> images in [-1, 1]."""
+        images = self.decode(latents.to(self.device, dtype=self.dtype))
+        return images if device is None and dtype is None else images.to(device, dtype=dtype)
 
 
 _NUM_RESOLUTIONS = 4
@@ -546,3 +639,33 @@ def _rewrite_diffusers_key(key: str) -> str | None:
         return key
 
     return None
+
+
+# ----------------------------------------------------------------------
+# the flux2 vae_id contract: file resolution + load
+# ----------------------------------------------------------------------
+
+
+def _load_flux2_vae(model):
+    """Resolve the properly-named comfy file through the generic door (the
+    ``vae_path`` model_kwargs override short-circuits it) and stream it onto
+    the vae device at the precision it ships in. Candidate names and the
+    download source are declared on the class, so no model carries vae file
+    knowledge and no job's own repo has to ship the vae.
+
+    One file, one build: the ``flux2-vae_small.safetensors`` sibling in the
+    same repo is a decode-only build (identical encoder, narrowed decoder)
+    and is deliberately not a candidate -- resolution is by exact filename,
+    so it can never be picked up here."""
+    path = model._resolve_comfy_file("vae", AutoEncoder)
+    model.print_and_status_update(f"Loading image VAE from {path}")
+    return AutoEncoder.load_to_device(path, model.vae_device_torch)
+
+
+register_vae_entry(
+    VaeEntry(
+        vae_id="flux2",
+        components={"vae": AutoEncoder},
+        load=_load_flux2_vae,
+    )
+)

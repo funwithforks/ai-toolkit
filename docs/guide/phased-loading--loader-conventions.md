@@ -145,9 +145,9 @@ in the file never catches:
 `toolkit/models/vae_registry.py` + the dispatch in
 `PhasedLoadMixin.load_vae` (`toolkit/models/phased_load.py`). A model opts
 in by declaring the class attribute `vae_id`; the registry maps that id to
-the entry that owns the vae — file resolution, load, and behavior — instead
-of the model's own `load_vae`/`_load_vae` body. Models that declare no id
-are untouched (the only sense in which this is
+the entry that owns the vae's file resolution and load — instead of the
+model's own `load_vae`/`_load_vae` body. Models that declare no id are
+untouched (the only sense in which this is
 opt-in: a model that declares one gets NO vae loading of its own left).
 
 **Entry shape** (`VaeEntry`, frozen dataclass): `vae_id`; `components`
@@ -155,10 +155,21 @@ opt-in: a model that declares one gets NO vae loading of its own left).
 a path); `load(model)` (resolves candidates through `_resolve_comfy_file`,
 streams to `model.vae_device_torch`, returns the module or bundle);
 `bundle` (multiple sub-vae members behind one `self.vae` handle — members
-may be None under staged sampling); `encode_images` / `decode_latents` (the
-vae's behavior: when filled, `PhasedLoadMixin.encode_images`/`decode_latents`
-run them — their output is exactly what the latent cache stores; until
-filled, the model's own methods are the call surface).
+may be None under staged sampling). The entry carries *data only* — no
+behavior fields.
+
+**The vae does the vae.** `encode_images` / `decode_latents` are methods on
+the vae class (or on the bundle, which delegates to its members), defined in
+the vae's own module — not module functions taking a model, and never a
+per-model copy. `PhasedLoadMixin.encode_images`/`decode_latents` forward to
+`self.vae` and contribute residency only (the cpu → `vae_device_torch`
+move). Their output is exactly what the latent cache stores. This is what
+makes caching model-independent: device and arithmetic come from the vae's
+own parameters, so one cached latent is valid for every model declaring the
+id, a job's dtype cannot round the latents on the way into the cache, and
+there is no per-model encode path that can depart. The `device`/`dtype`
+arguments say where the *caller* wants the result; they never change how it
+is computed.
 
 **Precision is not a policy.** A vae is loaded at the precision it ships in.
 The entry's loader takes no `dtype` argument, and `load_vae`'s placement step
@@ -192,7 +203,9 @@ reference):
    `load`, `register_vae_entry(VaeEntry(...))`. Import it from the
    extension's `__init__.py`.
 2. Declare `vae_id` on the model class; remove its `load_vae` override /
-   `_load_vae` body (and `_load_vae`-era constants), any vae entries in a
+   `_load_vae` body (and `_load_vae`-era constants), the model's own
+   `encode_images`/`decode_latents` (they move onto the vae class or bundle,
+   where any other model on the id can use them), any vae entries in a
    model-level `COMFY_FILES`-style table, and any in-body
    `latent_space_version` assignment (identity is the id; there is no
    version to set).
@@ -200,7 +213,7 @@ reference):
    registration/construction — do not soften these into warnings.
 
 **A vae-keyed cache holds the vae's output, nothing else.** What is
-written under a `vae_id` is exactly what the entry's encode returns --
+written under a `vae_id` is exactly what the vae's own encode returns --
 never a model's derived post-transform (models with deterministic
 per-step layers on latents must recompute at batch time from the shared
 latents, or keep their derived tensors in a separate model-keyed cache of
@@ -233,8 +246,9 @@ identity only proves the move itself changed nothing.
 | vae_id registry + entry shape | `toolkit/models/vae_registry.py` |
 | Registry dispatch + construction-time validation | `phased_load.py` `PhasedLoadMixin.__init__` / `load_vae` / `encode_images` / `decode_latents` |
 | Cache identity = vae_id (loud refusal without one) | `data_loader.py` (latent cache keying) |
-| Reference vae_id migration (bundle, vendored loaders, entry-owned encode/decode, kill-list) | `minimax_h3/minimax_h3_vae_id.py` |
-| Reference single-vae migration (vendored loader + vendored config, entry-owned encode/decode) | `toolkit/models/v2/vae/qwen_image.py` (the `qwen_image` id; krea2 declares it) |
+| Reference vae_id migration (bundle, vendored loaders, encode/decode as bundle methods, kill-list) | `minimax_h3/minimax_h3_vae_id.py` + `MiniMaxH3VaeBundle` in `minimax_h3.py` |
+| Reference single-vae migration (vendored loader + vendored config, encode/decode as vae methods) | `toolkit/models/v2/vae/qwen_image.py` (the `qwen_image` id; krea2 declares it) |
+| Reference shared-file id (one physical file, three declaring models) | `toolkit/models/v2/vae/flux2_kl.py` (the `flux2` id; flux3, fibo2, moss_image declare it) |
 | Lifecycle phase selection (`phases`) | `config_modules.py` `TrainConfig.phases`; guards/exits in `BaseSDTrainProcess.run()` |
 | Lazy reader, per-key placement | `weight_source.py:25` `:90` |
 | Stream-to-meta-shell reference | `ltx2.py:1609` `_stream_load`, `:1593` `_remap_file_key` |

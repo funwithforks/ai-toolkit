@@ -3,9 +3,10 @@
   - DiT: 42-block single-stream transformer, 3072 wide, 128 latent channels
     (``src/transformer.py``, Comfy-Org/MOSS-Image key layout)
   - VAE: FLUX.2, 2x2 packed and BatchNorm normalized -- the shared toolkit BFL
-    ``AutoEncoder`` (``toolkit/models/v2/vae/flux2_kl``), not a moss copy. The
-    shared comfy flux2-vae file (full decoder) replaces the vendor's
-    small-decoder copy by default.
+    ``AutoEncoder`` (``toolkit/models/v2/vae/flux2_kl``), not a moss copy. It
+    is reached through the ``flux2`` vae_id entry, which owns the load and the
+    encode/decode; the shared comfy flux2-vae file (full decoder) replaces the
+    vendor's small-decoder copy by default.
   - text: Qwen3.5-9B final-normed last hidden state of the chat-templated
     prompt (thinking on, generation prompt appended), one unpadded forward per
     prompt; stored per item as (L, 4096) in an ``AdvancedPromptEmbeds``.
@@ -13,9 +14,9 @@
 This is the phased-loading, text-to-image import. The training process caches
 target latents in phase 1 and prompt embeds in phase 2, so the VAE and text
 encoder are never resident during training (see
-docs/guide/phased-loading--component-phases.md). ``vae.encode`` already returns
-the packed, BatchNorm-normalized latents the DiT consumes -- the latent itself
-is the phase-1 cache artifact; every further transform of it lives behind
+docs/guide/phased-loading--component-phases.md). The flux2 vae's own encode
+returns the packed, BatchNorm-normalized latents the DiT consumes -- the
+latent itself is the phase-1 cache artifact; every further transform of it lives behind
 LoRA-targetable transformer weights, so there is no output-cache opportunity
 here. Likewise the cache stays pre-refiner: the DiT's 2-block text refiner is
 LoRA-targetable conditioning, and caching a trainable module's output is the
@@ -51,8 +52,6 @@ import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
-from safetensors import safe_open
-from safetensors.torch import load_file
 from transformers import Qwen2Tokenizer
 
 from toolkit.accelerator import unwrap_model
@@ -63,8 +62,6 @@ from toolkit.models.base_model import BaseModel
 from toolkit.network_mixins import set_multiplier_rows
 from toolkit.ragged import is_ragged
 from toolkit.models.phased_load import PhasedLoadMixin
-from toolkit.models.v2.resolver import resolve_comfy_file
-from toolkit.models.v2.vae.flux2_kl import AutoEncoder, convert_diffusers_state_dict
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
@@ -92,12 +89,12 @@ if TYPE_CHECKING:
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 DEFAULT_REPO = VENDOR_BASE_REPO
-# the shared FLUX.2 packed AE in the comfy layout (same file the flux2 family
-# and fibo2 resolve), loaded by the shared v2 class
-VAE_FILE = "vae/flux2-vae.safetensors"
-# a local vendor checkpoint dir carries its own (small-decoder, diffusers
-# layout) copy under this name
-VENDOR_VAE_FILE = "vae/diffusion_pytorch_model.safetensors"
+# The VAE is the shared flux2 vae_id entry (toolkit/models/v2/vae/flux2_kl.py):
+# file resolution, load, encode and decode all live there. The vendor
+# checkpoint's vae/diffusion_pytorch_model copy is the same vae under a
+# different key layout (240 of 251 names differ from this class's tree) and
+# the vendor repo ships no vae/flux2-vae.safetensors at all, so that file is
+# no longer a load candidate: the shared comfy file is the vae.
 
 scheduler_config = {
     "num_train_timesteps": 1000,
@@ -116,6 +113,8 @@ def _is_hub_repo(path: str) -> bool:
 class MossImageModel(PhasedLoadMixin, BaseModel):
     arch = "moss_image"
     display_name = "MOSS-Image"
+    # the shared FLUX.2 packed AE; load/encode/decode are owned by that entry
+    vae_id = "flux2"
 
     def __init__(
         self,
@@ -238,47 +237,6 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
         if tokenizer.chat_template is None or len(tokenizer) < 1000:
             raise ValueError(f"incomplete MOSS-Image tokenizer from {source}")
         return tokenizer
-
-    def _load_vae(self) -> AutoEncoder:
-        # The FLUX.2 packed AE: the shared v2 class (toolkit/models/v2/vae/
-        # flux2_kl), not a moss copy. Phase-1 component: it caches latents
-        # (encode() output is already packed + BN-normalized, the exact form
-        # the DiT consumes), is unloaded at the phase boundary, and sampling
-        # rounds reload it through this hook.
-        self.print_and_status_update("Loading image VAE")
-        base = self.model_config.name_or_path or DEFAULT_REPO
-        vae_path = self.model_config.model_kwargs.get("vae_path", None)
-        if vae_path is None and os.path.isfile(os.path.join(base, VENDOR_VAE_FILE)):
-            # a local vendor checkpoint dir carries its own copy (diffusers
-            # layout, small decoder); it wins over the shared comfy file
-            vae_path = os.path.join(base, VENDOR_VAE_FILE)
-        if vae_path is None:
-            # generic resolver door: downloads come from the package repo
-            # (which ships flux2-vae.safetensors), local comfy-layout files and
-            # a local checkpoint dir win first
-            vae_path = resolve_comfy_file(
-                VAE_FILE,
-                COMFY_REPO,
-                override_path=self.model_config.model_kwargs.get("vae_path", None),
-                extra_roots=[base] if os.path.isdir(base) else None,
-                hf_token=HF_TOKEN,
-                status_fn=self.print_and_status_update,
-            )
-        with safe_open(vae_path, framework="pt") as f:
-            diffusers_layout = any(k.startswith("encoder.down_blocks.") for k in f.keys())
-        if diffusers_layout:
-            # the vendor copy (the BFL weights rounded to bf16): convert first
-            state_dict = convert_diffusers_state_dict(load_file(vae_path))
-            vae = AutoEncoder.load_from_state_dict(state_dict, self.vae_torch_dtype)
-        else:
-            vae = AutoEncoder.load_model(
-                vae_path,
-                dtype=self.vae_torch_dtype,
-                aitk_device=None if self.model_config.low_vram else self.vae_device_torch,
-            )
-        vae.eval()
-        vae.requires_grad_(False)
-        return vae
 
     def _build_pipeline(self):
         # the phased mixin drives load_transformer/load_text_encoder/load_vae
@@ -636,30 +594,14 @@ class MossImageModel(PhasedLoadMixin, BaseModel):
     # ------------------------------------------------------------------
     # VAE encode / decode
     # ------------------------------------------------------------------
-    @torch.no_grad()
-    def encode_images(self, image_list, device=None, dtype=None):
-        """Images (C, H, W) in [-1, 1] -> normalized latents (B, 128, H/16, W/16)."""
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(device)
-        batch = torch.stack(
-            [img.to(device, dtype=self.vae.dtype) for img in image_list]
-        )
-        return self.vae.encode(batch).to(device, dtype=dtype)
-
-    @torch.no_grad()
-    def decode_latents(self, latents: torch.Tensor, device=None, dtype=None):
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(device)
-        images = self.vae.decode(latents.to(device, self.vae.dtype))
-        return images.to(device, dtype)
+    # Both are the flux2 vae's own methods (toolkit/models/v2/vae/flux2_kl.py),
+    # reached through PhasedLoadMixin. moss_image no longer carries a second
+    # vae path: the vendor checkpoint's own ``vae/diffusion_pytorch_model``
+    # copy used to win whenever name_or_path was a local vendor dir, and it
+    # could not load -- its keys are a different layout (240 of 251 names
+    # differ from this class's tree), so the strict load died on the key diff
+    # instead of training on the shared, named vae. The comfy
+    # vae/flux2-vae.safetensors is the vae.
 
     # ------------------------------------------------------------------
     # Saving / bookkeeping
