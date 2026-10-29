@@ -42,7 +42,16 @@ class PhasedLoadMixin:
         # fail at construction, not at first encode: a declared id that
         # was never registered is a wiring bug, not a runtime condition
         if self.vae_id is not None:
-            get_vae_entry(self.vae_id)
+            entry = get_vae_entry(self.vae_id)
+            # Apply the id's cache-tag pin HERE, not at load time: a
+            # skipped-phase-1 run never loads the vae but still hashes the
+            # tag into cache filenames when it checks latent completeness.
+            # (model_config.latent_space_version still outranks it upstream
+            # in get_latent_space_version.)
+            if entry.latent_space_version is not None and getattr(
+                self, "latent_space_version", None
+            ) is None:
+                self.latent_space_version = entry.latent_space_version
 
     @staticmethod
     def select_comfy_candidates(component, candidates, model_kwargs):
@@ -137,12 +146,6 @@ class PhasedLoadMixin:
                 vae.to(self.vae_device_torch)
             else:
                 vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
-            if entry.latent_space_version is not None and getattr(
-                self, "latent_space_version", None
-            ) is None:
-                # explicit cache-tag pin (the arch-name fallback coincidence
-                # is not a pin); model_config still outranks it upstream
-                self.latent_space_version = entry.latent_space_version
             self.vae = vae
             return
         vae = self._load_vae()

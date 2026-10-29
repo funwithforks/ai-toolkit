@@ -118,8 +118,8 @@ COMFY_FILES = {
     "dit_ref2va": "diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors",
     "dit_ref2va_pruned": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
     "text_encoder": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-    "video_vae": "vae/minimax_h3_video_vae_fp16.safetensors",
-    "audio_vae": "vae/minimax_h3_audio_vae_fp32.safetensors",
+    # the vae files are resolved through the component classes' own
+    # aitk_comfy metadata, owned by the minimax_h3 vae_id entry
     "dit_fasth3": "diffusion_models/fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors",
 }
 # FastH3 8-Step V2 (FastVideo DMD2 + VSA distill) comfy repack: DiT plus the
@@ -190,6 +190,8 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
     # hub repo for missing files when name_or_path isn't an org/repo id
     comfy_repo = COMFY_REPO
     use_old_lokr_format = False
+    # vae construction/placement owned by the registry (minimax_h3_vae_id)
+    vae_id = "minimax_h3"
 
     def __init__(
         self,
@@ -218,7 +220,8 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         # embeds; the sample's frame cap while encoding sample prompts
         self._ref_video_dataset_config = None
         self._sample_ref_max_frames = None
-        self.latent_space_version = "minimax_h3_v1"
+        # latent cache tag is pinned by the vae_id entry (minimax_h3_vae_id),
+        # applied by PhasedLoadMixin at construction
         # caption token cap (vision blocks are never truncated); the released
         # stack has no limit — set 0 to disable
         self.max_text_length = int(
@@ -759,18 +762,6 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         flush()
         return tokenizer, text_encoder, {'processor': processor}
 
-    def _load_vaes(self) -> MiniMaxH3VaeBundle:
-        self.print_and_status_update("Loading video VAE")
-        video_vae = MiniMaxH3VideoVAE.load_to_device(
-            self._resolve_comfy_file("video_vae", MiniMaxH3VideoVAE), self.vae_device_torch
-        )
-        self.print_and_status_update("Loading audio VAE")
-        audio_vae = MiniMaxH3AudioVAE.load_to_device(
-            self._resolve_comfy_file("audio_vae", MiniMaxH3AudioVAE), self.vae_device_torch
-        )
-        flush()
-        return MiniMaxH3VaeBundle(video_vae, audio_vae)
-
     display_name = "MiniMax-H3"
 
     # sampling decodes through the vae only after every prompt in the round
@@ -788,12 +779,9 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             # already nvfp4/int8 quantized; aitk_post_load skips quantize_te
             text_encoder.aitk_is_quantized = True
 
-    def load_vae(self):
-        # the bundle holds the video and audio VAEs together; the audio VAE
-        # is needed alongside the video VAE for dataset audio caching
-        vae_bundle = self._load_vaes()
-        vae_bundle.to(self.vae_device_torch)
-        self.vae = vae_bundle
+    # load_vae: PhasedLoadMixin dispatches through the registered
+    # minimax_h3 vae_id entry (minimax_h3_vae_id.py) -- the bundle is
+    # assembled and placed there, shipped dtypes kept.
 
     def _build_pipeline(self):
         return MiniMaxH3Pipeline(self)
