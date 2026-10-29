@@ -250,4 +250,10 @@ def trainer_phases(paths, suite, full):
     rounds = count(paths, suite, "vae_round", full)
     if rounds:
         out["vae_sample_rounds"] = rounds
+    vs = hits.get("vae_skip", {})
+    if vs.get("found"):
+        # every latent already on disk: the VAE was never loaded (the
+        # latent cache was KEPT and used); no skip line means the VAE
+        # loaded -- encoding happened or a frozen gate clause forced it
+        out["latent"] = "cache"
     return out

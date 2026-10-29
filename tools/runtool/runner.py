@@ -717,11 +717,25 @@ def recompute(run_id):
         out["markers_recomputed"] = recomputed
         stored_mk = _read_json(os.path.join(paths.root, "markers.json"))
         if stored_mk is not None:
+            # The marker SET evolves (new markers are declarations added
+            # later); a record must still reproduce what was extracted
+            # FOR IT. Compare every stored key; markers the record could
+            # not have stored are reported as additions, never as a
+            # mismatch.
+            stored_markers = stored_mk.get("markers") or {}
+            stored_phases = stored_mk.get("phases") or {}
             out["markers_match"] = {
-                "markers": stored_mk.get("markers") == hits,
-                "phases": stored_mk.get("phases") == recomputed.get("phases"),
+                "markers": all(stored_markers.get(k) == hits.get(k)
+                               for k in stored_markers),
+                "phases": all(stored_phases.get(k) == recomputed.get(
+                    "phases", {}).get(k) for k in stored_phases),
                 "expect": (stored_mk.get("expect")
                            == recomputed.get("expect")),
+                "added_since_record": {
+                    "markers": sorted(set(hits) - set(stored_markers)),
+                    "phases": sorted(set(recomputed.get("phases") or {})
+                                     - set(stored_phases)),
+                },
             }
     return out
 

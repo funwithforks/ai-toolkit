@@ -170,6 +170,12 @@ TRAINER_MARKERS = {
     "te_reason": r" - text encoder needed: (?P<reason>.+)",
     "fixed_cache": r"Loading fixed prompt embeddings from cache",
     "fixed_cache_now": r"Caching fixed prompt embeddings",
+    # latent-cache-kept fact (owner law 2026-10-28: a phased-loading
+    # implementation must be TESTED to have kept the caches): the phase-1
+    # gate prints this only when every latent already exists on disk and
+    # the VAE is never loaded. Cold runs never show it; warm runs do.
+    # (BaseSDTrainProcess.py:2157; verified pattern from real records.)
+    "vae_skip": r"Skipping VAE load",
     "plan": (r"Batched caption cache: (?P<planned>\d+) captions "
              r"-> (?P<groups>\d+) groups"),
     "vae_round": r"VAE unloaded until next sample round",
