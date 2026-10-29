@@ -231,6 +231,57 @@ export default Plugin.define({
         ]),
       })
       editor.add({
+        name: "runtool_search",
+        description:
+          "Query the run history over record JSON — the sanctioned way to " +
+          "find previous jobs (what agents grep for out of habit). Filters: " +
+          "suite, status, dataset key, tag/note substring, metric bounds " +
+          "(metric=\"loss_final<0.31\"), param/switch values " +
+          "(param=\"cutlass_bwd=off\" — matches records from every era), " +
+          "marker found/absent, persisted expect verdict, since-days. " +
+          "Newest first, compact rows (run_id, status, verdict, job name, " +
+          "headline metrics); full detail via status/inspect on a row. " +
+          "jobs=true instead answers which job dirs EXIST: owner run, run " +
+          "status, size, age. Read-only — never starts queued runs.",
+        input: {
+          type: "object",
+          properties: {
+            suite: { type: "string" },
+            variant: { type: "string" },
+            status: { type: "string" },
+            dataset: { type: "string" },
+            tag: { type: "string" },
+            note: { type: "string" },
+            metric: { type: "string", description: 'e.g. "loss_final<0.31" or "steps_done>=18"' },
+            param: { type: "string", description: 'exact param, e.g. "cutlass_bwd=off"' },
+            marker: { type: "string", description: "marker must be found" },
+            no_marker: { type: "string", description: "marker must be absent" },
+            expect: { type: "string", enum: ["PASS", "FAIL"] },
+            since: { type: "number", description: "days" },
+            jobs: { type: "boolean" },
+            limit: { type: "number" },
+          },
+          additionalProperties: false,
+        },
+        execute: wrap(dir, (a) => [
+          "search",
+          ...(a.jobs ? ["--jobs"] : []),
+          ...(a.suite ? ["--suite", str(a.suite)] : []),
+          ...(a.variant ? ["--variant", str(a.variant)] : []),
+          ...(a.status ? ["--status", str(a.status)] : []),
+          ...(a.dataset ? ["--dataset", str(a.dataset)] : []),
+          ...(a.tag ? ["--tag", str(a.tag)] : []),
+          ...(a.note ? ["--note", str(a.note)] : []),
+          ...(a.metric ? ["--metric", str(a.metric)] : []),
+          ...(a.param ? ["--param", str(a.param)] : []),
+          ...(a.marker ? ["--marker", str(a.marker)] : []),
+          ...(a.no_marker ? ["--no-marker", str(a.no_marker)] : []),
+          ...(a.expect ? ["--expect", str(a.expect)] : []),
+          ...(a.since != null ? ["--since", String(a.since)] : []),
+          ...(a.limit != null ? ["--limit", String(a.limit)] : []),
+        ]),
+      })
+      editor.add({
         name: "runtool_gc",
         description:
           "Reap the runtool jobs subtree: finished tool runs, orphan dirs, " +
