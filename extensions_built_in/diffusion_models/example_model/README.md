@@ -45,7 +45,9 @@ Minimal config YAML to train it:
 model:
   arch: "example"
   name_or_path: "/path/to/weights"   # folder with transformer/, text_encoder/,
-                                     # tokenizer/, vae/
+                                     # tokenizer/. The vae is not in this folder:
+                                     # it is the named comfy file the vae class
+                                     # declares, under MODELS_PATH/vae/
   quantize: true        # optional: qfloat8 the transformer
   quantize_te: true     # optional: qfloat8 the text encoder
 train:
@@ -226,9 +228,10 @@ Worked implementations to copy: `../ideogram4/src/transformer.py`
 
 ### Video model (t2v)
 - Batches arrive as `(B, frames, 3, H, W)`; latents as
-  `(B, C, frames_latent, h, w)`. Override `encode_images`/`decode_latents`
-  for your video VAE (temporal compression means
-  `frames_latent = (frames - 1) // 4 + 1` for most VAEs).
+  `(B, C, frames_latent, h, w)`. Write `encode_images`/`decode_latents` on
+  your **vae class** (`src/vae.py`) for a video VAE (temporal compression means
+  `frames_latent = (frames - 1) // 4 + 1` for most VAEs) — the model declares
+  the `vae_id` and holds no encode code of its own.
 - `gen_config.num_frames` drives previews; return a **list of PIL frames**
   from `generate_single_image` and the harness saves a video.
 - Reference: `../wan22/wan22_5b_model.py` and `../ltx2/`.
