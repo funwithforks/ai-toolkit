@@ -550,6 +550,9 @@ def classify(run_id):
         out["metrics"] = result.get("metrics", {})
         if not result.get("ok") and result.get("error"):
             out["error"] = result["error"]
+    j = _last_judgment(paths)
+    if j:
+        out["judgment"] = j
     if status in ("crash", "failed") and "error" not in out:
         err_tail = _tail(paths.stderr) or _tail(paths.stdout)
         if err_tail:
@@ -681,6 +684,50 @@ def list_runs(limit=15):
         if len(out) >= limit:
             break
     return out
+
+
+VERDICTS = ("PASS", "FAIL", "MIXED", "INCONCLUSIVE")
+
+
+def _last_judgment(paths):
+    """The most recent owner judgment attached to a record, or None."""
+    try:
+        with open(paths.judgments) as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    except FileNotFoundError:
+        return None
+    if not lines:
+        return None
+    try:
+        return json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return {"raw": lines[-1][-200:]}
+
+
+def judge(run_id, verdict=None, note=None):
+    """Attach the owner's human reading of a run -- the concat watch, the
+    listen, the blind sample A/B -- to the record itself. The expect
+    verdict is the machine's declared intent; this is the human gate.
+    They are separate fields and never overwrite each other.
+
+    Append-only (judgments.jsonl, events.jsonl shape): a correction
+    appends rather than replaces, the history stays in the record, and
+    runs that never produced a result.json (cancelled chain tails) are
+    still judgeable -- the verdict must attach to whichever record the
+    verdict is ABOUT."""
+    if verdict is None and not note:
+        raise ParamError("judge needs --verdict and/or --note")
+    if verdict is not None and verdict not in VERDICTS:
+        raise ParamError(f"--verdict must be one of {VERDICTS}")
+    paths = _run_dir(run_id)
+    if not os.path.exists(paths.manifest):
+        raise FileNotFoundError(f"no run record for {run_id!r} under {RUNS_ROOT}")
+    entry = {"at": _now(), "verdict": verdict}
+    if note:
+        entry["note"] = note
+    with open(paths.judgments, "a") as f:
+        f.write(json.dumps(entry, default=str) + "\n")
+    return {"run_id": run_id, "judgment": entry}
 
 
 def recompute(run_id):
