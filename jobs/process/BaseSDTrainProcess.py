@@ -2150,18 +2150,36 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # validation item forces a vae load. Known and accepted for now;
         # changing it while validation is untested breaks component loading.
         # Paired clause on the TE gate: SDTrainer.needs_text_encoder_load.
-        if vae_load_needed:
+        _phase1 = 1 in self.train_config.phases
+        if not _phase1:
+            # a skipped phase may not be one phase 3 still consumes. same
+            # simple question as the gate itself: are latents needed and not
+            # yet present? vae_load_needed is the fork's own predicate, so a
+            # model/dataset that needs no latents passes through untouched.
+            if 3 in self.train_config.phases and vae_load_needed:
+                raise ValueError(
+                    "phases excludes 1 but its work is still needed: the vae "
+                    "gate requires a load (uncached latents, clip-vision "
+                    "caching, validation latents, or vae_training_mode='keep' "
+                    "for live/training-time encoding). Include phase 1 or "
+                    "complete the latent caches."
+                )
+            print_acc(
+                "phase 1 not selected - skipping vae load and latent caching"
+            )
+        elif vae_load_needed:
             self.sd.load_vae()
         else:
             print_acc("Skipping VAE load - every latent is cached to disk")
         flush()
 
-        for dataset in all_dataset_objs:
-            if dataset.is_caching_latents:
-                dataset.cache_latents_all_latents()
-            if dataset.is_caching_clip_vision_to_disk:
-                dataset.cache_clip_vision_to_disk()
-        self.setup_validation_latents()
+        if _phase1:
+            for dataset in all_dataset_objs:
+                if dataset.is_caching_latents:
+                    dataset.cache_latents_all_latents()
+                if dataset.is_caching_clip_vision_to_disk:
+                    dataset.cache_clip_vision_to_disk()
+            self.setup_validation_latents()
         # IRON RULE: at the phase 1 -> 2 boundary the vae must never be left
         # resident unless vae_training_mode is 'keep' (live per-batch latent
         # encoding or model-declared train-time encoding, e.g. edit refs).
@@ -2179,21 +2197,50 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.sd.vae = None
         flush()
 
+        if (
+            2 not in self.train_config.phases
+            and 3 not in self.train_config.phases
+        ):
+            print_acc(
+                f"phases={self.train_config.phases} complete: latent caches "
+                "built; stopping here (phases 2 and 3 not selected)"
+            )
+            return
+
         # ### phase 2: text encoder + embedding caching ###
-        if self.needs_text_encoder_load():
+        _phase2 = 2 in self.train_config.phases
+        _needs_te = self.needs_text_encoder_load()
+        if not _phase2:
+            # same simple question as the TE gate: is the text encoder (or an
+            # uncached embedding) still needed by what is selected?
+            # needs_text_encoder_load() is the fork's own predicate.
+            if 3 in self.train_config.phases and _needs_te:
+                raise ValueError(
+                    "phases excludes 2 but its work is still needed: the text "
+                    "encoder gate requires a load (uncached embeddings, text "
+                    "encoder training, embedding training, validation items, "
+                    "or live text encoding). Include phase 2 or complete the "
+                    "text embedding caches."
+                )
+            print_acc(
+                "phase 2 not selected - skipping text encoder load and "
+                "embedding caches"
+            )
+        elif _needs_te:
             self.sd.load_text_encoder()
         else:
             print_acc("Skipping text encoder load - every embedding is cached")
 
-        for dataset in all_dataset_objs:
-            if dataset.is_caching_text_embeddings:
-                dataset.cache_text_embeddings()
-            if dataset.is_generating_controls:
-                # always do this last
-                dataset.setup_controls()
+        if _phase2:
+            for dataset in all_dataset_objs:
+                if dataset.is_caching_text_embeddings:
+                    dataset.cache_text_embeddings()
+                if dataset.is_generating_controls:
+                    # always do this last
+                    dataset.setup_controls()
 
-        # validation prompt embeds (the latents half ran in phase 1)
-        self.setup_validation_embeds()
+            # validation prompt embeds (the latents half ran in phase 1)
+            self.setup_validation_embeds()
 
 
         # embedding training: construct the embedding now, before anything
@@ -2232,6 +2279,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # just to convert embeds (e.g. text projection layers) free them at
         # this boundary; BaseModel is a no-op.
         self.sd.release_encode_phase_components()
+
+        if 3 not in self.train_config.phases:
+            print_acc(
+                f"phases={self.train_config.phases} complete: caches built; "
+                "stopping here (phase 3 not selected, transformer never "
+                "loaded)"
+            )
+            return
 
         # ### phase 3: transformer ###
         self.sd.load_transformer()
