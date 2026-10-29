@@ -13,7 +13,8 @@ found through the shared resolver, read by a WeightSource, mapped onto a meta
 shell. This document is the contract for that last mile. Read it before
 writing a new loader or touching shared loading code — the rules here are the
 ones `AGENTS.md` ("Loading rules", "Iron rules") enforces, with the code
-anchors that show how.
+anchors that show how. Vae loading for new/migrated models goes through the
+`vae_id` registry — §5.
 
 ## 1. Resolution: never hardcode a path or a capacity
 
@@ -139,12 +140,72 @@ in the file never catches:
    (e.g. a pipeline still holding it — see the `self.pipeline` rewiring in
    `_ensure_connectors`/`release_encode_phase_components`, ltx2.py:1775/:1795).
 
-## 5. Where the pieces live
+## 5. The vae_id registry (component-keyed vae resolution)
+
+`toolkit/models/vae_registry.py` + the dispatch in
+`PhasedLoadMixin.load_vae` (`toolkit/models/phased_load.py`). A model opts
+in by declaring the class attribute `vae_id`; the registry maps that id to
+the entry that owns the vae — construction, placement policy, and the
+cache-tag pin — instead of the model's own `load_vae`/`_load_vae` body.
+Models that declare no id are untouched (the only sense in which this is
+opt-in: a model that declares one gets NO vae loading of its own left).
+
+**Entry shape** (`VaeEntry`, frozen dataclass): `vae_id`; `components`
+(role → component class — the class carrying `aitk_comfy_*` metadata, never
+a path); `load(model)` (resolves candidates through `_resolve_comfy_file`,
+streams to `model.vae_device_torch`, returns the module or bundle);
+`dtype_policy` (`keep_shipped` = placement only moves, shipped precisions
+survive verbatim; `as_configured` = placement also casts to
+`model_config.vae_dtype`); `bundle` (multiple sub-vae members behind one
+`self.vae` handle — forces `keep_shipped`, members may be None under
+staged sampling); `latent_space_version` (the explicit cache tag — applied
+at construction, not load time, because a `phases` run that never loads
+the vae still hashes the tag into cache filenames); `encode_images` /
+`decode_latents` (reserved for the encode migration — until an id fills
+them, the model's own encode/decode methods are the call surface).
+
+**Onboarding a model** (the H3 migration, commit `c578d205`, is the
+reference):
+
+1. Write the id module next to the model class (e.g.
+   `minimax_h3_vae_id.py`): import the component classes + bundle, define
+   `load`, `register_vae_entry(VaeEntry(...))`. Import it from the
+   extension's `__init__.py`.
+2. Declare `vae_id` on the model class; remove its `load_vae` override /
+   `_load_vae` body, any vae entries in a model-level `COMFY_FILES`-style
+   table, and any in-body `latent_space_version` assignment (the pin
+   comes from the entry).
+3. Duplicate ids, unknown ids, and cast policies on bundles all raise at
+   registration/construction — do not soften these into warnings.
+
+**Migration is replacement.** An agreed migration deletes the path it
+supersedes in the same commit — no dual-path flags, no try-registry-except
+-fallback, no feature toggles kept "for safety". The opt-in in rule 3 of §4
+is about the *shared dispatch* staying inert for models that never declare
+an id; it is never a reason to keep a migrated model's old loader alive. If
+the old path must stay reachable, the migration is not agreed — ask.
+
+**Byte identity is a guard, not the goal.** Diffing cache bytes old-path vs
+new-path proves a *structure-only* move (the Stage A gate for the H3
+migration: 40/40 files, 80/80 tensors, 40/40 meta dicts). It must never
+veto a semantic change: any deliberate dtype/precision change is a
+Stage-B change, and it breaks bytes ON PURPOSE with an explicit
+`latent_space_version` bump. A bumped tag is stranded-by-construction —
+the tag is hashed into cache filenames
+(`dataloader_mixins.py` `get_latent_info_dict`), so old caches are never
+opened, never "migrated", and simply sit unread. Quality is the goal;
+identity only proves the move itself changed nothing.
+
+## 6. Where the pieces live
 
 | Concern | Anchor |
 |---|---|
 | Candidate ranking + download policy | `resolver.py:19` `comfy_precision_rank`, `:66` `resolve_comfy_candidates` |
 | Model file registration | `_mixin.py:109/116/122/145` |
+| vae_id registry + entry shape | `toolkit/models/vae_registry.py` |
+| Registry dispatch + construction-time validation/pin | `phased_load.py` `PhasedLoadMixin.__init__` / `load_vae` |
+| Reference vae_id migration (bundle, keep_shipped, tag pin, kill-list) | `minimax_h3/minimax_h3_vae_id.py`, commit `c578d205` |
+| Lifecycle phase selection (`phases`) | `config_modules.py` `TrainConfig.phases`; guards/exits in `BaseSDTrainProcess.run()` |
 | Lazy reader, per-key placement | `weight_source.py:25` `:90` |
 | Stream-to-meta-shell reference | `ltx2.py:1609` `_stream_load`, `:1593` `_remap_file_key` |
 | Batched path only when required | `ltx2.py:1570` `_as_shipped_stream_target` |

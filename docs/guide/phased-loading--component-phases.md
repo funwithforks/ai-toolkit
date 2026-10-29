@@ -45,6 +45,22 @@ frozen — see the DO-NOT-TOUCH comment at `SDTrainer.needs_text_encoder_load`
 (`extensions_built_in/sd_trainer/SDTrainer.py:321`–`:328`) and its paired
 VAE-gate clause (`BaseSDTrainProcess.py:1925`).
 
+**Phase selection (`phases`)** — added commit `cd9d5d4d`: `train.phases` is a
+subset of the fixed lifecycle [1, 2, 3] (default [1, 2, 3] = the normal full
+run, byte-for-byte). Excluding a phase is legal only when no selected phase
+still consumes its work; the guards ask exactly the question the phase's own
+gate asks (`vae_load_needed` for latents, `needs_text_encoder_load()` for
+embeds) and refuse with a printed `ValueError` naming the gate and the fix —
+no extra gate conditions were invented, and new ones get added only when a
+real consumer needs them. When the selected prep phases finish and nothing
+selected consumes them, the run exits cleanly at the boundary with a printed
+`phases=[...] complete` line (after the phase-1 iron-rule free, or before
+`load_transformer`). Phase 1 and phase 2 share nothing (separate cache dirs,
+separate version knobs, separate gates), so `[1]`-only and `[2]`-only runs
+are independent dataset-prep jobs. The vae_id cache-tag pin applies at model
+construction precisely so a `[2]`-only run still hashes the right tag into
+latent cache filenames ([loader conventions](./phased-loading--loader-conventions.md) §5).
+
 ## Sampling rounds (sample())
 
 - Non-staged models: if `vae_training_mode == 'reload'` and the vae is not
