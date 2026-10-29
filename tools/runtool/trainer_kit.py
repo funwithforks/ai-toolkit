@@ -179,14 +179,20 @@ TRAINER_MARKERS = {
     "plan": (r"Batched caption cache: (?P<planned>\d+) captions "
              r"-> (?P<groups>\d+) groups"),
     "vae_round": r"VAE unloaded until next sample round",
-    # forward vocabulary (stranded_refused pattern): the phase-list skip
-    # guard (owner law 2026-10-29). The list declares WHICH phases run
-    # (default [1,2,3]); a skipped phase's body never runs but its
-    # slot's guard does -- phase 2 skipped with embeddings needed and
-    # uncached CRASHES at that point, named. No fallback that ignores
-    # the declaration. The print is the fork's half; declaring it here
-    # means their landing is graded, not grepped.
-    "phase_guard_refused": (r"phase guard refused: (?P<detail>.+)"),
+    # the declarative phases lifecycle (owner law 2026-10-29, guide
+    # phased-loading--component-phases.md): the list declares WHICH phases
+    # run (default [1,2,3]); a clean completion at the last selected phase
+    # prints this line and exits 0 (BaseSDTrainProcess.py:2205, 2285).
+    # Declared so a phases-exit run is graded PASS by intent, not dug from
+    # stdout by hand (R6).
+    "phases_complete": (r"phases=(?P<selected>\[[^\]]*\]) complete: "
+                        r"(?P<detail>.+)"),
+    # the skip guard's refusal (owner law: a skipped phase never silently
+    # forces its artifacts back -- it CRASHES, named, at its slot): the
+    # raise is BaseSDTrainProcess.py:2160 (phase 1) / :2218 (phase 2).
+    # Replaced the forward-declared guess with the real raise text.
+    "phase_guard_refused": (r"phases excludes (?P<phase>\d) but its work is "
+                            r"still needed: (?P<reason>.+)"),
 }
 
 
@@ -252,6 +258,9 @@ def patchable(prefix):
         train + ".cache_text_embeddings",
         train + ".unload_text_encoder",
         train + ".dtype",
+        train + ".phases",  # lifecycle option (config_modules.py:424,
+        # default [1,2,3]): declarative WHICH-phases-run list; a trainer
+        # suite patching it produces prep/build jobs with full provenance
         f"{prefix}.sample.sample_every",
         f"{prefix}.sample.comfy",
         f"{prefix}.sample.seed",
@@ -480,15 +489,40 @@ def watch_mem(paths: RunPaths, stop: threading.Event, interval=1.0):
 
 
 @tag_metrics("steps.wall_time (db) + loss/loss")
+def _phases_exit_witnessed(paths):
+    """A clean phases-exit completion line (phases_complete marker) near
+    the end of stdout: the only legitimate reason a finished trainer run
+    has no train db."""
+    import re
+    try:
+        with open(paths.stdout, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            tail = f.read()
+    except FileNotFoundError:
+        return False
+    return re.search(rb"phases=\[?[\d, ]*\]? complete:", tail) is not None
+
+
 def parse_metrics(paths: RunPaths, params):
     """All metrics from the job's loss_log.db (steps.wall_time +
     loss/loss); prefers the record's own snapshot (recompute contract:
     reproducible from the record alone)."""
     db = os.path.join(paths.artifacts, "metrics.db")
     if not os.path.exists(db):
-        with open(paths.result) as f:
-            job_dir = json.load(f).get("job_dir")
-        db = os.path.join(job_dir, "loss_log.db")
+        try:
+            with open(paths.result) as f:
+                job_dir = json.load(f).get("job_dir")
+        except FileNotFoundError:
+            # phases=[1]/[1,2] exits finish before any job dir is written;
+            # a witnessed completion exit is legitimate, not a crash (R6).
+            # Unwitnessed runs still hit the loud sqlite error below.
+            job_dir = None
+        db = os.path.join(job_dir, "loss_log.db") if job_dir else None
+    if (db is None or not os.path.exists(db)) and _phases_exit_witnessed(paths):
+        return {k: None for k in ("step_ms_window", "step_ms_last100",
+                                  "loss_final", "loss_mean_last10",
+                                  "steps_done", "wall_s")}
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         wall = dict(con.execute("select step, wall_time from steps"))
