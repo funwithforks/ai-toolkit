@@ -613,7 +613,14 @@ class TrainerKit:
 
     def build(self, params, paths: RunPaths):
         argv = [sys.executable, "-m", self.module, "--run-dir", paths.root]
-        env = {"SEED": params["seed"], "AITK_STEP_TIME": "1"}
+        env = {
+            "SEED": params["seed"],
+            "AITK_STEP_TIME": "1",
+            # no usage telemetry from training runs (owner ruling); the
+            # hub resolver itself stays fully live -- downloads on a new
+            # model's tested rollout are expected, they just go to VRAM
+            "HF_HUB_DISABLE_TELEMETRY": "1",
+        }
         if params.get("prof_start") is not None:
             # the SDTrainer profiler window (no-stack); AITK_PROF_STACK is
             # never set (host OOM incident rule: stacks not exposed)
