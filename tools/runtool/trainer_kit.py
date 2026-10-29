@@ -70,8 +70,13 @@ def tool_dataset_check(dataset, folders):
     root = os.path.realpath(dsets.DATASETS_ROOT) + os.sep
     for folder in folders:
         rp = os.path.realpath(folder)
-        if not (rp.startswith(root)
-                and os.path.basename(rp).startswith(dsets.TOOL_PREFIX)):
+        # ownership = first path segment under the tool root is rt_-
+        # prefixed (create() may keep folder structure inside it);
+        # a manually-placed real folder never qualifies.
+        owned = rp.startswith(root) and os.path.relpath(
+            rp, os.path.realpath(dsets.DATASETS_ROOT)).split(
+                os.sep)[0].startswith(dsets.TOOL_PREFIX)
+        if not owned:
             raise ParamError(
                 f"dataset '{dataset}' points outside the tool dataset "
                 f"namespace; make a tool dataset with 'runtool datasets "
@@ -149,6 +154,16 @@ METRICS = {
 # marker lines the SHARED trainer code prints (SDTrainer.py,
 # dataloader_mixins.py); patterns were taken from real records -- do not
 # "prettify" them without re-checking. Model-specific markers are extras.
+def tag_metrics(src):
+    """Decorator: a parse function states where its numbers come from;
+    result.json carries the label (a custom parser that skips this is
+    silently mislabeled -- the label is the contract)."""
+    def deco(fn):
+        fn.metric_source = src
+        return fn
+    return deco
+
+
 TRAINER_MARKERS = {
     "te_skip": r"Skipping text encoder load",
     "te_load": r"Loading \S+ text encoder from",
@@ -232,13 +247,21 @@ def patchable(prefix):
 
 
 def merge_plan(params, overrides, config_patch, name, *, prefix,
-               patchable_paths, fields=None, jobs_root=None):
+               patchable_paths, fields=None, jobs_root=None, switches=None):
     """Derive the run config from base template + suite params +
     config_patch, with a provenance row for every field any layer
     touched. Raises ParamError listing EVERY unresolved conflict:
     a defaulted param disagreeing with an explicit template value is
     refused -- the silent sample-disable incident is structurally
-    impossible. Explicit params win over templates and are logged."""
+    impossible. Explicit params win over templates and are logged.
+
+    switches maps suite param -> dotted config path (e.g. the
+    model_kwargs entries the model actually reads). Switch fields are
+    PARAM-OWNED like the train.* fields: they carry full loud-merge
+    semantics (default vs template conflict refused) and config_patch
+    can never claim them. This is how model kwargs become trackable:
+    every value lands in artifacts/config.yaml, the provenance file
+    and the submit echo -- never in a side channel."""
     import yaml
 
     try:
@@ -251,18 +274,24 @@ def merge_plan(params, overrides, config_patch, name, *, prefix,
             f"base template {params['base']!r} is not valid YAML: {e}")
 
     fields = fields or param_fields(prefix)
+    switches = dict(switches or {})
     owned = {path: pname for pname, (path, _) in fields.items()}
+    owned.update({path: pname for pname, path in switches.items()})
     overrides = set(overrides or ())
     config_patch = dict(config_patch or {})
     prov, conflicts = [], []
 
-    # -- param layer ------------------------------------------------------
-    for pname, (path, pick) in fields.items():
+    # -- param layer (owned fields + model switches) ----------------------
+    items = [(pn, path, pick, "param")
+             for pn, (path, pick) in fields.items()]
+    items += [(pn, path, (lambda p, _n=pn: p[_n]), "param-switch")
+              for pn, path in sorted(switches.items())]
+    for pname, path, pick, tag in items:
         segs = dotpath.parse(path)
         value = pick(params)
         template_v = dotpath.get(cfg, segs)
         if pname in overrides:
-            note = {"path": path, "source": "param", "value": value}
+            note = {"path": path, "source": tag, "value": value}
             if template_v is not dotpath.MISSING and template_v != value:
                 note["against_template"] = template_v
             dotpath.setval(cfg, segs, value)
@@ -283,7 +312,7 @@ def merge_plan(params, overrides, config_patch, name, *, prefix,
                 )
                 continue
             dotpath.setval(cfg, segs, value)
-            prov.append({"path": path, "source": "param(default)",
+            prov.append({"path": path, "source": f"{tag}(default)",
                          "value": value})
 
     # -- patch layer -------------------------------------------------------
@@ -362,10 +391,41 @@ def watch_db(job_dir, paths: RunPaths, stop: threading.Event):
             pass  # db not created / mid-transaction; retry next tick
 
 
+def _tree_rss_mb():
+    """Sum RSS (MB) of every process in THIS process group -- the run's
+    real host-memory footprint (supervisor, harness, run.py and their
+    children share the group). This is the 'RSS delta during load'
+    attribution: system-wide memory can't say who ate it; the group
+    can (e.g. weights staging in host RAM instead of going direct to
+    GPU -- the legacy-load-code failure mode)."""
+    total = 0
+    try:
+        pgid = os.getpgid(0)
+    except OSError:
+        return 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            if int(fields[2]) != pgid:  # ppid... field 3 = pgrp after ')'
+                continue
+            with open(f"/proc/{pid}/statm") as f:
+                total += int(f.read().split()[1])
+        except (FileNotFoundError, ProcessLookupError, IndexError,
+                PermissionError, ValueError):
+            continue
+    return total * 4096 // (1024 * 1024)
+
+
 def watch_mem(paths: RunPaths, stop: threading.Event, interval=1.0):
-    """1 Hz used-mem sampler (nvidia-smi, external = zero in-process
-    cost). Emits peak plus a compact summary to events.jsonl on exit."""
+    """1 Hz sampler: GPU memory (nvidia-smi, external = zero in-process
+    cost) AND this run's host RSS (own process group). Emits peak plus a
+    compact summary to events.jsonl on exit. gpu fields keep their old
+    names; rss/rss_peak are the per-run host footprint."""
     peak = 0
+    rss_peak = 0
     samples = []
     while not stop.wait(interval):
         try:
@@ -377,13 +437,15 @@ def watch_mem(paths: RunPaths, stop: threading.Event, interval=1.0):
             used = max(int(x) for x in out.split())
         except Exception:
             continue
-        if used > peak:
-            peak = used
+        rss = _tree_rss_mb()
+        peak = max(peak, used)
+        rss_peak = max(rss_peak, rss)
         samples.append(used)
         if len(samples) >= 5 and len(samples) % 30 == 0:
             from .runner import emit
 
-            emit(paths, "mem", used=used, peak=peak)
+            emit(paths, "mem", used=used, peak=peak, rss=rss,
+                 rss_peak=rss_peak)
     if samples:
         from .runner import emit
 
@@ -391,9 +453,11 @@ def watch_mem(paths: RunPaths, stop: threading.Event, interval=1.0):
         emit(
             paths, "mem_summary", peak=peak,
             tail_median=sorted(tail)[len(tail) // 2], tail_max=max(tail),
+            rss_peak=rss_peak,
         )
 
 
+@tag_metrics("steps.wall_time (db) + loss/loss")
 def parse_metrics(paths: RunPaths, params):
     """All metrics from the job's loss_log.db (steps.wall_time +
     loss/loss); prefers the record's own snapshot (recompute contract:
@@ -447,7 +511,8 @@ class TrainerKit:
 
     def __init__(self, *, namespace, module, prefix="config.process[0]",
                  extra_params=None, extra_markers=None, build_env=None,
-                 extra_flags=None, jobs_root=None):
+                 extra_flags=None, jobs_root=None, switches=None,
+                 parse=None, spawn_job=None):
         from .runner import RUNS_ROOT  # no cycle: runner never imports kit
 
         self.namespace = namespace
@@ -457,6 +522,15 @@ class TrainerKit:
         self.extra_markers = dict(extra_markers or {})
         self.build_env = build_env or (lambda p, paths: {})
         self.extra_flags = extra_flags or (lambda p: [])
+        # param -> dotted config path for model switches (model_kwargs
+        # and anything else the model reads from config); tracked with
+        # full provenance, param-owned, never patchable
+        self.switches = dict(switches or {})
+        # custom metric parsing (probe-shaped suites); default loss-db
+        self.parse = parse or parse_metrics
+        # custom inner job spawn for probe-shaped harnesses; default
+        # spawns run.py with the derived config
+        self.spawn_job = spawn_job
         self.jobs_root = jobs_root or os.path.join(RUNS_ROOT, "jobs")
         self.job_name = job_name_base(namespace)
         self.patchable = patchable(prefix)
@@ -474,7 +548,7 @@ class TrainerKit:
         return merge_plan(
             params, ctx.get("overrides"), ctx.get("config_patch"),
             name, prefix=self.prefix, patchable_paths=self.patchable,
-            jobs_root=self.jobs_root,
+            jobs_root=self.jobs_root, switches=self.switches,
         )
 
     def reserve(self, params, ctx=None):
@@ -500,6 +574,7 @@ class TrainerKit:
         cfg, prov = merge_plan(
             params, overrides, config_patch, name, prefix=self.prefix,
             patchable_paths=self.patchable, jobs_root=self.jobs_root,
+            switches=self.switches,
         )
         folders = load_map(params["dataset"])
         ds = cfg["config"]["process"][0]["datasets"]
@@ -627,10 +702,14 @@ class TrainerKit:
         threading.Thread(target=watch_mem, args=(paths, stop),
                          daemon=True).start()
 
-        rc = subprocess.call(
-            [sys.executable, "run.py", cfg_path, "--log", log_path],
-            cwd=manifest["cwd"],
-        )
+        if self.spawn_job is not None:
+            # probe-shaped suite: its own inner command
+            rc = self.spawn_job(paths, params, manifest, cfg_path, job_dir)
+        else:
+            rc = subprocess.call(
+                [sys.executable, "run.py", cfg_path, "--log", log_path],
+                cwd=manifest["cwd"],
+            )
         stop.set()
         if rc != 0:
             emit(paths, "stage_failed", rc=rc)
@@ -658,12 +737,13 @@ class TrainerKit:
             if removed:
                 emit(paths, "artifact_cleanup", removed=removed)
 
-        metrics = parse_metrics(paths, params)
+        metrics = self.parse(paths, params)
         with open(paths.result + ".tmp", "w") as f:
             json.dump(
                 {"ok": True, "metrics": metrics, "job_name": name,
                  "job_dir": job_dir,
-                 "metric_source": "steps.wall_time (db) + loss/loss"},
+                 "metric_source": getattr(self.parse, "metric_source",
+                                          "steps.wall_time (db) + loss/loss")},
                 f, indent=1,
             )
         os.replace(paths.result + ".tmp", paths.result)
@@ -682,7 +762,7 @@ class TrainerKit:
             params=base_params(**self.extra_params),
             metrics=metrics or METRICS,
             build=self.build,
-            parse=parse_metrics,
+            parse=self.parse,
             precheck=self.precheck,
             resolve=self.resolve,
             reserve=self.reserve,
