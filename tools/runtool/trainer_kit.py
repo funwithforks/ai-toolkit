@@ -179,6 +179,14 @@ TRAINER_MARKERS = {
     "plan": (r"Batched caption cache: (?P<planned>\d+) captions "
              r"-> (?P<groups>\d+) groups"),
     "vae_round": r"VAE unloaded until next sample round",
+    # forward vocabulary (stranded_refused pattern): the phase-list skip
+    # guard (owner law 2026-10-29). The list declares WHICH phases run
+    # (default [1,2,3]); a skipped phase's body never runs but its
+    # slot's guard does -- phase 2 skipped with embeddings needed and
+    # uncached CRASHES at that point, named. No fallback that ignores
+    # the declaration. The print is the fork's half; declaring it here
+    # means their landing is graded, not grepped.
+    "phase_guard_refused": (r"phase guard refused: (?P<detail>.+)"),
 }
 
 
