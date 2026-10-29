@@ -20,11 +20,18 @@
                               diagnostic digest for strange runs: ugly-line
                               signals, stall seconds, line spam, raw tails
                               (0 = whole file), caller regex over the record
+  judge  RUN_ID [--verdict V] [--note TEXT]
+                               the owner's verdict on a record (concat
+                               watch, listen, blind A/B): appended to
+                               judgments.jsonl, never overwriting the
+                               machine expect verdict; cancelled/crashed
+                               records are judgeable too
   cancel RUN_ID
   list   [--limit N]
   search [--suite S] [--status ST] [--dataset K] [--tag T] [--note TEXT]
          [--metric NAME<OP>NUM]... [--marker M]... [--no-marker M]...
-         [--param K=V]... [--expect PASS|FAIL] [--since DAYS] [--variant V]
+         [--param K=V]... [--expect PASS|FAIL] [--judged V] [--since DAYS]
+         [--variant V]
          [--jobs] [--limit N]
                               query the history over record JSON (fast,
                               read-only -- never starts queued runs);
@@ -149,12 +156,22 @@ def main(argv=None):
                         "cutlass_bwd=off (switches are params)")
     p.add_argument("--expect", choices=("PASS", "FAIL"),
                    help="persisted expect verdict")
+    p.add_argument("--judged", choices=("PASS", "FAIL", "MIXED", "INCONCLUSIVE"),
+                   help="owner verdict attached by `judge`")
     p.add_argument("--since", type=float, default=None, metavar="DAYS",
                    help="only records newer than N days")
     p.add_argument("--jobs", action="store_true",
                    help="instead of records: the job dirs that exist "
                         "(owner, run status, size, age)")
     p.add_argument("--limit", type=int, default=25)
+
+    p = sub.add_parser("judge",
+                       help="attach the owner's verdict/note to a record")
+    p.add_argument("run_id")
+    p.add_argument("--verdict",
+                   choices=("PASS", "FAIL", "MIXED", "INCONCLUSIVE"),
+                   default=None)
+    p.add_argument("--note", default=None)
 
     p = sub.add_parser("gc")
     p.add_argument("--days", type=float, default=7.0)
@@ -260,6 +277,8 @@ def main(argv=None):
                 show_config=a.show_config))
         elif a.op == "cancel":
             res = runner.cancel(a.run_id)
+        elif a.op == "judge":
+            res = runner.judge(a.run_id, verdict=a.verdict, note=a.note)
         elif a.op == "gc":
             from . import gc as gc_mod
             if a.apply:
@@ -289,7 +308,7 @@ def main(argv=None):
                     dataset=a.dataset, tag=a.tag, note=a.note,
                     metric=a.metric, marker=a.marker,
                     no_marker=a.no_marker, param=a.param, expect=a.expect,
-                    since=a.since, limit=a.limit)
+                    judged=a.judged, since=a.since, limit=a.limit)
         print(json.dumps(res, indent=1, default=str))
         status = res.get("status") if isinstance(res, dict) else None
         return 0 if status not in ("crash", "failed", "timeout") else 1

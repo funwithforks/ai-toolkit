@@ -105,6 +105,10 @@ class RunPaths:
         return os.path.join(self.root, "cancel.flag")
 
     @property
+    def judgments(self):
+        return os.path.join(self.root, "judgments.jsonl")
+
+    @property
     def patch(self):
         return os.path.join(self.root, "patch.diff")
 

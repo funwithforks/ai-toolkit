@@ -21,8 +21,8 @@ import os
 import re
 import time
 
-from .runner import (RUNS_ROOT, _all_record_ids, _pid_alive, _read_json,
-                     _run_dir)
+from .runner import (RUNS_ROOT, _all_record_ids, _last_judgment, _pid_alive,
+                     _read_json, _run_dir)
 
 JOBS_ROOT = os.path.join(RUNS_ROOT, "jobs")
 FINAL = ("done", "failed", "crash", "cancelled")
@@ -74,9 +74,10 @@ def _metric_ok(metrics, clause):
 
 def search(suite=None, status=None, dataset=None, tag=None, note=None,
            metric=None, marker=None, no_marker=None, param=None,
-           expect=None, since=None, variant=None, limit=25):
+           expect=None, judged=None, since=None, variant=None, limit=25):
     """metric: ["loss_final<0.31", ...]; param: ["cutlass_bwd=off", ...];
-    since: float days; expect: 'PASS'|'FAIL' (the persisted verdict)."""
+    since: float days; expect: 'PASS'|'FAIL' (the persisted verdict);
+    judged: verdict the owner attached via `judge`."""
     metric = metric or []
     param = param or []
     cutoff = time.time() - since * 86400 if since else None
@@ -128,6 +129,9 @@ def search(suite=None, status=None, dataset=None, tag=None, note=None,
         verdict = (mk.get("expect") or {}).get("verdict")
         if expect and verdict != expect:
             continue
+        judgment = _last_judgment(paths)
+        if judged and (judgment or {}).get("verdict") != judged:
+            continue
 
         matched += 1
         if len(rows) < limit:
@@ -143,6 +147,8 @@ def search(suite=None, status=None, dataset=None, tag=None, note=None,
             }
             if verdict:
                 row["verdict"] = verdict
+            if judgment and judgment.get("verdict"):
+                row["judged"] = judgment["verdict"]
             if p.get("dataset"):
                 row["dataset"] = p["dataset"]
             if p.get("tag"):
