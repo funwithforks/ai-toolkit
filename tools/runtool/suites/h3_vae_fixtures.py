@@ -46,8 +46,9 @@ import os
 from ..registry import Param, ParamError, RunPaths
 from ..trainer_kit import TrainerKit, tag_metrics
 
-_ARMS = ("old_path", "registry_path")  # registry_path: NOT WIRED (no
-# vae_id registry in tree yet; the harness fails loudly, by name)
+_ARMS = ("old_path", "registry_path")  # arm truth is gated against the
+# model's vae_id migration state at harness start (H3 migrated c578d205:
+# registry_path real, old_path refuses)
 _MODES = ("encode", "compare")
 
 _FIXT_MARKERS = {
@@ -183,15 +184,16 @@ _kit = TrainerKit(
                       desc="encode: run the real phase-1 cache pass under "
                            "one arm; compare: pair two encode records' "
                            "cache artifacts and grade (run_a/run_b)"),
-        "arm": Param("enum", default="old_path", choices=_ARMS,
-                     desc="encode pipeline arm. old_path is the current "
-                          "per-model path (real). registry_path is NOT "
-                          "WIRED: no vae_id registry in the tree yet; a "
-                          "run selecting it fails loudly at harness start "
-                          "and records the refusal (never silently "
-                          "encodes via old_path). The arm is exported as "
-                          "RUNTOOL_VAE_ARM; the registry-side consumer "
-                          "lands with the door."),
+        "arm": Param("enum", default="registry_path", choices=_ARMS,
+                     desc="encode pipeline arm, gated against migration: "
+                          "registry_path (real since the model declares "
+                          "vae_id, c578d205) and old_path (refuses once "
+                          "migrated -- the label could not name a path "
+                          "that no longer runs; pre-migration baselines "
+                          "are era-superseded per owner ruling 2026-10-29 "
+                          "anyway). The runner refuses mismatches loudly; "
+                          "nothing is ever substituted. Arm exported as "
+                          "RUNTOOL_VAE_ARM for registry-side consumers."),
         "stage": Param("enum", default="A", choices=("A", "B"),
                        desc="A: structure-only moves, byte-identity "
                             "required. B: quality regime -- diffs are "
