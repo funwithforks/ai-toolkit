@@ -1,4 +1,5 @@
 import os
+import torch
 from toolkit.basic import flush
 
 from .vae_registry import get_vae_entry
@@ -141,20 +142,23 @@ class PhasedLoadMixin:
         self.vae = vae
 
     def encode_images(self, image_list, device=None, dtype=None):
-        """A registry vae owns its encode: when the entry provides one it
-        runs (its output is exactly what latents caches store under the
-        vae id); otherwise the model/BaseModel implementation is used."""
+        """A registry vae encodes its own images: the vae object answers for the
+        math, its own precision included, so every model on the id encodes
+        identically and one cached latent is valid for all of them. The holder
+        contributes only residency (where the vae has to be to run)."""
         if getattr(self, "vae_id", None) is not None:
-            entry = get_vae_entry(self.vae_id)
-            if entry.encode_images is not None:
-                return entry.encode_images(self, image_list, device=device, dtype=dtype)
+            vae = self.vae
+            if vae.device == torch.device("cpu"):
+                vae.to(self.vae_device_torch)
+            return vae.encode_images(image_list, device=device, dtype=dtype)
         return super().encode_images(image_list, device=device, dtype=dtype)
 
     def decode_latents(self, latents, device=None, dtype=None):
         if getattr(self, "vae_id", None) is not None:
-            entry = get_vae_entry(self.vae_id)
-            if entry.decode_latents is not None:
-                return entry.decode_latents(self, latents, device=device, dtype=dtype)
+            vae = self.vae
+            if vae.device == torch.device("cpu"):
+                vae.to(self.vae_device_torch)
+            return vae.decode_latents(latents, device=device, dtype=dtype)
         return super().decode_latents(latents, device=device, dtype=dtype)
 
     def _post_model_load(self):

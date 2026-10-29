@@ -1,11 +1,11 @@
 """The Qwen-Image (wan-style video) VAE: one physical encoder, one id.
 
 This module IS the ``qwen_image`` vae_id contract: the component class
-(candidate metadata, key layout, loader), the encode/decode primitives, and
-the registry registration. Models join it by declaring ``vae_id =
-"qwen_image"`` (krea2 today); a future model on this encoder adds nothing
-here. Alternate encode paths for THIS vae would live here as this vae's
-implementation -- they never fork the id.
+(candidate metadata, key layout, loader, and its own ``encode_images`` /
+``decode_latents`` methods), plus the registry registration. Models join it
+by declaring ``vae_id = "qwen_image"`` (krea2 today); a future model on this
+encoder adds nothing here. Alternate encode paths for THIS vae would live
+here as this vae's implementation -- they never fork the id.
 
 Loading is vendored here on purpose (the same call the minimax_h3 vae
 loaders make): the module shell is built with meta parameters, the
@@ -129,6 +129,69 @@ class QwenImageVAE(AutoencoderKLQwenImage, OstrisModelMixin):
         # the entry's loader maps the keys itself
         return convert_comfy_qwen_image_state_dict(state_dict)
 
+    # -- the vae does the vae work ------------------------------------------------
+    # These are what phase 1 caches and what sampling decodes, so they belong to
+    # the vae rather than to any model: device and precision come from this
+    # module's own parameters, which is what makes one cached latent valid for
+    # every model that declares this id, and what stops a job config from
+    # rounding the latents. device/dtype say where the CALLER wants the result;
+    # they never change how it is computed. Residency is the holder's job.
+
+    # full-resolution decode spikes VRAM; holders opt in to tiling it
+    # (decode only; encode stays untiled)
+    decode_tiled = False
+
+    @torch.no_grad()
+    def encode_images(self, image_list, device=None, dtype=None):
+        """It is a video VAE: images ride in a single-frame dim, and latents
+        normalize with this vae's own latents_mean/std."""
+        self.eval()
+        self.requires_grad_(False)
+        images = torch.stack([img.to(self.device, dtype=self.dtype) for img in image_list])
+        images = images.unsqueeze(2)  # add the frame dim
+        latents = self.encode(images).latent_dist.sample()
+
+        latents_mean = (
+            torch.tensor(self.config.latents_mean)
+            .view(1, self.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.config.latents_std).view(
+            1, self.config.z_dim, 1, 1, 1
+        ).to(latents.device, latents.dtype)
+
+        latents = (latents - latents_mean) * latents_std
+        latents = latents.squeeze(2)  # drop the frame dim
+        return latents if device is None and dtype is None else latents.to(device, dtype=dtype)
+
+    @torch.no_grad()
+    def decode_latents(self, latents, device=None, dtype=None):
+        latents = latents.to(self.device, dtype=self.dtype)
+        latents = latents.unsqueeze(2)  # add the frame dim
+
+        latents_mean = (
+            torch.tensor(self.config.latents_mean)
+            .view(1, self.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = (
+            torch.tensor(self.config.latents_std)
+            .view(1, self.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents = latents * latents_std + latents_mean
+
+        if self.decode_tiled:
+            self.enable_tiling()
+        try:
+            images = self.decode(latents).sample
+        finally:
+            if self.decode_tiled:
+                self.disable_tiling()
+
+        images = images.squeeze(2)  # drop the frame dim
+        return images if device is None and dtype is None else images.to(device, dtype=dtype)
+
 
 # ----------------------------------------------------------------------
 # comfy repack -> this class's tree (pure rename, verified tensor-for-tensor)
@@ -208,82 +271,8 @@ def convert_comfy_qwen_image_state_dict(state_dict: dict) -> dict:
 
 
 # ----------------------------------------------------------------------
-# encode / decode primitives (owned by the vae, shared with holder models)
+# the qwen_image vae_id contract
 # ----------------------------------------------------------------------
-
-
-def encode_images(model, image_list, device=None, dtype=None):
-    """It is a video VAE: images ride in a single-frame dim, and latents
-    normalize with the config's latents_mean/std."""
-    if device is None:
-        device = model.vae_device_torch
-    if dtype is None:
-        dtype = model.vae_torch_dtype
-    vae = model.vae
-
-    if vae.device == torch.device("cpu"):
-        vae.to(device)
-    vae.eval()
-    vae.requires_grad_(False)
-
-    image_list = [image.to(device, dtype=dtype) for image in image_list]
-    images = torch.stack(image_list).to(device, dtype=dtype)
-    images = images.unsqueeze(2)  # add the frame dim
-    latents = vae.encode(images).latent_dist.sample()
-
-    latents_mean = (
-        torch.tensor(vae.config.latents_mean)
-        .view(1, vae.config.z_dim, 1, 1, 1)
-        .to(latents.device, latents.dtype)
-    )
-    latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(
-        1, vae.config.z_dim, 1, 1, 1
-    ).to(latents.device, latents.dtype)
-
-    latents = (latents - latents_mean) * latents_std
-    latents = latents.squeeze(2)  # drop the frame dim
-    return latents.to(device, dtype=dtype)
-
-
-def decode_latents(model, latents, device=None, dtype=None):
-    if device is None:
-        device = model.vae_device_torch
-    if dtype is None:
-        dtype = model.vae_torch_dtype
-    vae = model.vae
-
-    if vae.device == torch.device("cpu"):
-        vae.to(device)
-
-    latents = latents.to(device, dtype=dtype)
-    latents = latents.unsqueeze(2)  # add the frame dim
-
-    latents_mean = (
-        torch.tensor(vae.config.latents_mean)
-        .view(1, vae.config.z_dim, 1, 1, 1)
-        .to(latents.device, latents.dtype)
-    )
-    latents_std = (
-        torch.tensor(vae.config.latents_std)
-        .view(1, vae.config.z_dim, 1, 1, 1)
-        .to(latents.device, latents.dtype)
-    )
-    latents = latents * latents_std + latents_mean
-
-    # full-resolution decode spikes VRAM; models opt in to tiling it
-    tiled = getattr(model, "vae_decode_tiled_on_low_vram", False) and (
-        model.model_config.low_vram
-    )
-    if tiled:
-        vae.enable_tiling()
-    try:
-        images = vae.decode(latents).sample
-    finally:
-        if tiled:
-            vae.disable_tiling()
-
-    images = images.squeeze(2)  # drop the frame dim
-    return images.to(device, dtype=dtype)
 
 
 def _load_qwen_image_vae(model):
@@ -300,8 +289,6 @@ register_vae_entry(
         vae_id="qwen_image",
         components={"vae": QwenImageVAE},
         load=_load_qwen_image_vae,
-        encode_images=encode_images,
-        decode_latents=decode_latents,
     )
 )
 
@@ -309,15 +296,26 @@ register_vae_entry(
 class QwenImageVAEHolderMixin:
     """BaseModel-side encode_images/decode_latents for models whose self.vae
     is the Qwen-Image VAE but that are NOT yet on the vae_id registry
-    (qwen_image, nucleus_image). The bodies live in this module's entry --
-    one source of truth; migrating a model onto the id retires its use of
-    this holder."""
+    (qwen_image, nucleus_image). The encode/decode bodies are QwenImageVAE's
+    own methods -- one source of truth; this holder only supplies residency
+    and the low-VRAM tiling opt-in. Migrating a model onto the id retires
+    its use of this holder."""
 
     # tile the decode when low_vram (decode only; encode stays untiled)
     vae_decode_tiled_on_low_vram = False
 
     def encode_images(self, image_list, device=None, dtype=None):
-        return encode_images(self, image_list, device=device, dtype=dtype)
+        if self.vae.device == torch.device("cpu"):
+            self.vae.to(self.vae_device_torch)
+        return self.vae.encode_images(image_list, device=device, dtype=dtype)
 
     def decode_latents(self, latents, device=None, dtype=None):
-        return decode_latents(self, latents, device=device, dtype=dtype)
+        if self.vae.device == torch.device("cpu"):
+            self.vae.to(self.vae_device_torch)
+        self.vae.decode_tiled = (
+            self.vae_decode_tiled_on_low_vram and self.model_config.low_vram
+        )
+        try:
+            return self.vae.decode_latents(latents, device=device, dtype=dtype)
+        finally:
+            self.vae.decode_tiled = False

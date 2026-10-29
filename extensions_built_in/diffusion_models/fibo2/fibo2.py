@@ -78,8 +78,6 @@ from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
 from toolkit.models.phased_load import PhasedLoadMixin
-from toolkit.models.v2.resolver import resolve_comfy_file
-from toolkit.models.v2.vae.flux2_kl import AutoEncoder
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
@@ -94,16 +92,16 @@ if TYPE_CHECKING:
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
-# The package's VAE file in the comfy layout: the same BFL packed AE the flux2
-# family ships, loaded by the shared v2 class. The DiT and TE files are
-# registered as comfy candidates on their classes, not here.
-VAE_FILE = "vae/flux2-vae.safetensors"
-DEFAULT_REPO = "Comfy-Org/Fibo-2.0"
+# The VAE is the shared flux2 vae_id entry (toolkit/models/v2/vae/flux2_kl.py):
+# file resolution, load, encode and decode all live there. The DiT and TE files
+# are registered as comfy candidates on their classes, not here.
 
 
 class Fibo2Model(PhasedLoadMixin, BaseModel):
     arch = "fibo2"
     display_name = "Fibo 2.0"
+    # the shared FLUX.2 packed AE; load/encode/decode are owned by that entry
+    vae_id = "flux2"
 
     def __init__(
         self,
@@ -188,32 +186,6 @@ class Fibo2Model(PhasedLoadMixin, BaseModel):
         text_encoder.eval()
         text_encoder.requires_grad_(False)
         return tokenizer, text_encoder, {"image_processor": processor.image_processor}
-
-    def _load_vae(self) -> AutoEncoder:
-        # The FLUX.2 packed AE: the shared v2 class (toolkit/models/v2/vae/
-        # flux2_kl), not a fibo2 copy. Generic resolver door: vae_path override,
-        # a local package dir as an extra root, a miss downloads into
-        # MODELS_PATH/vae/ (comfy layout), never the HF cache. Phase-1 component:
-        # it caches latents, is unloaded at the phase boundary, and sampling
-        # rounds reload it through this hook.
-        self.print_and_status_update("Loading image VAE")
-        base = self.model_config.name_or_path or DEFAULT_REPO
-        vae_path = resolve_comfy_file(
-            VAE_FILE,
-            base,
-            override_path=self.model_config.model_kwargs.get("vae_path", None),
-            extra_roots=[base] if os.path.isdir(base) else None,
-            hf_token=HF_TOKEN,
-            status_fn=self.print_and_status_update,
-        )
-        vae = AutoEncoder.load_model(
-            vae_path,
-            dtype=self.vae_torch_dtype,
-            aitk_device=None if self.model_config.low_vram else self.vae_device_torch,
-        )
-        vae.eval()
-        vae.requires_grad_(False)
-        return vae
 
     def _build_pipeline(self):
         # the phased mixin drives load_transformer/load_text_encoder/load_vae
@@ -381,30 +353,9 @@ class Fibo2Model(PhasedLoadMixin, BaseModel):
     # ------------------------------------------------------------------
     # VAE encode / decode
     # ------------------------------------------------------------------
-    @torch.no_grad()
-    def encode_images(self, image_list, device=None, dtype=None):
-        """Images (C, H, W) in [-1, 1] -> normalized latents (B, 128, H/16, W/16)."""
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(device)
-        batch = torch.stack(
-            [img.to(device, dtype=self.vae.dtype) for img in image_list]
-        )
-        return self.vae.encode(batch).to(device, dtype=dtype)
-
-    @torch.no_grad()
-    def decode_latents(self, latents: torch.Tensor, device=None, dtype=None):
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(device)
-        images = self.vae.decode(latents.to(device, self.vae.dtype))
-        return images.to(device, dtype)
+    # Both are the flux2 vae's own methods (toolkit/models/v2/vae/flux2_kl.py),
+    # reached through PhasedLoadMixin -- there is no fibo2 encoding to keep in
+    # step with them.
 
     # ------------------------------------------------------------------
     # Saving / bookkeeping
