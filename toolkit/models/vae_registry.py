@@ -16,9 +16,13 @@ roots > MODELS_PATH layout > hub).
 
 A bundle (multiple sub-VAEs behind the single ``self.vae`` handle, e.g.
 video + audio with members that may be None under staged sampling) is
-owned by the id: ``bundle=True`` pins ``dtype_policy='keep_shipped'`` --
-mixed shipped precisions must survive placement verbatim or the id's load
-contract is broken.
+owned by the id: ``bundle=True`` only says so, which is what lets
+``self.vae`` members be probed for residency.
+
+Precision is not a policy: a vae is loaded at the precision it ships in, by
+its own vendored loader, and placement only moves it. There is no cast
+option to choose -- upstream's blanket "cast the vae to the job's dtype"
+loses precision for no benefit and is not offered.
 
 ``te_id`` is the future sibling: it will use this entry shape through its
 own table; nothing here needs a reshape for it.
@@ -31,46 +35,27 @@ not at first encode -- see PhasedLoadMixin.__init__.
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Type
 
-_DTYPE_POLICIES = ("keep_shipped", "as_configured")
-
-
 @dataclass(frozen=True)
 class VaeEntry:
     vae_id: str
     # role -> component class; a plain vae is one role, a bundle has several
     components: Dict[str, Type]
-    # (model) -> vae module or bundle: resolves candidates through the comfy
-    # door, streams to the target device, applies the id's per-member dtype
-    # policy at LOAD time (placement below only moves, never casts, unless
-    # the policy says as_configured)
+    # (model) -> vae module or bundle: the id's own loader resolves candidates
+    # through the comfy door and streams the checkpoint onto the target device
+    # at shipped precision. Placement upstream only moves it -- no cast exists
     load: Callable[[object], object]
-    dtype_policy: str = "keep_shipped"
     bundle: bool = False
     # encode/decode primitives (module-pair half); until an id migrates its
     # encode path these stay None and the model's own methods are the call
     # surface
     encode_images: Optional[Callable] = None
     decode_latents: Optional[Callable] = None
-    # explicit latent-space cache tag pin; None defers to the model attribute
-    latent_space_version: Optional[str] = None
 
 
 _REGISTRY: Dict[str, VaeEntry] = {}
 
 
 def register_vae_entry(entry: VaeEntry) -> None:
-    if entry.dtype_policy not in _DTYPE_POLICIES:
-        raise ValueError(
-            f"vae_id {entry.vae_id!r}: dtype_policy must be one of "
-            f"{_DTYPE_POLICIES}, got {entry.dtype_policy!r}"
-        )
-    if entry.bundle and entry.dtype_policy != "keep_shipped":
-        raise ValueError(
-            f"vae_id {entry.vae_id!r}: bundles must keep shipped dtypes "
-            "(members ship at mixed precisions on purpose); a cast policy "
-            "on a bundle recreates the blanket-cast bug this registry "
-            "replaces"
-        )
     if entry.vae_id in _REGISTRY:
         raise ValueError(f"duplicate vae_id registration: {entry.vae_id!r}")
     _REGISTRY[entry.vae_id] = entry

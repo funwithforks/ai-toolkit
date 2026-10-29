@@ -220,8 +220,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         # embeds; the sample's frame cap while encoding sample prompts
         self._ref_video_dataset_config = None
         self._sample_ref_max_frames = None
-        # latent cache tag is pinned by the vae_id entry (minimax_h3_vae_id),
-        # applied by PhasedLoadMixin at construction
+        # latent caches key on the vae_id itself ("minimax_h3")
         # caption token cap (vision blocks are never truncated); the released
         # stack has no limit — set 0 to disable
         self.max_text_length = int(

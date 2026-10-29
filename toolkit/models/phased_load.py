@@ -40,18 +40,10 @@ class PhasedLoadMixin:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # fail at construction, not at first encode: a declared id that
-        # was never registered is a wiring bug, not a runtime condition
+        # was never registered is a wiring bug, not a runtime condition.
+        # Cache identity needs no setup here: latents key on vae_id itself.
         if self.vae_id is not None:
-            entry = get_vae_entry(self.vae_id)
-            # Apply the id's cache-tag pin HERE, not at load time: a
-            # skipped-phase-1 run never loads the vae but still hashes the
-            # tag into cache filenames when it checks latent completeness.
-            # (model_config.latent_space_version still outranks it upstream
-            # in get_latent_space_version.)
-            if entry.latent_space_version is not None and getattr(
-                self, "latent_space_version", None
-            ) is None:
-                self.latent_space_version = entry.latent_space_version
+            get_vae_entry(self.vae_id)
 
     @staticmethod
     def select_comfy_candidates(component, candidates, model_kwargs):
@@ -134,23 +126,36 @@ class PhasedLoadMixin:
         """Load the vae and place it per model_config.
 
         A class that declares ``vae_id`` resolves through the registry: the
-        id's module owns candidate resolution, streaming, and its per-member
-        dtype policy, so the placement here only moves (``keep_shipped`` --
-        shipped precisions survive verbatim) or moves and casts
-        (``as_configured``). Classes without an id are untouched."""
+        id's module owns candidate resolution and streams the checkpoint to
+        ``vae_device`` at the precision it ships in, so the placement here
+        only moves it. Classes without an id are untouched."""
         vae_id = getattr(self, "vae_id", None)
         if vae_id is not None:
-            entry = get_vae_entry(vae_id)
-            vae = entry.load(self)
-            if entry.dtype_policy == "keep_shipped":
-                vae.to(self.vae_device_torch)
-            else:
-                vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
+            vae = get_vae_entry(vae_id).load(self)
+            # never a cast: a vae keeps its shipped precision
+            vae.to(self.vae_device_torch)
             self.vae = vae
             return
         vae = self._load_vae()
         vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
         self.vae = vae
+
+    def encode_images(self, image_list, device=None, dtype=None):
+        """A registry vae owns its encode: when the entry provides one it
+        runs (its output is exactly what latents caches store under the
+        vae id); otherwise the model/BaseModel implementation is used."""
+        if getattr(self, "vae_id", None) is not None:
+            entry = get_vae_entry(self.vae_id)
+            if entry.encode_images is not None:
+                return entry.encode_images(self, image_list, device=device, dtype=dtype)
+        return super().encode_images(image_list, device=device, dtype=dtype)
+
+    def decode_latents(self, latents, device=None, dtype=None):
+        if getattr(self, "vae_id", None) is not None:
+            entry = get_vae_entry(self.vae_id)
+            if entry.decode_latents is not None:
+                return entry.decode_latents(self, latents, device=device, dtype=dtype)
+        return super().decode_latents(latents, device=device, dtype=dtype)
 
     def _post_model_load(self):
         pass

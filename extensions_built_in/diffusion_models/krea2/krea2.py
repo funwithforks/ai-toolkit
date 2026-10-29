@@ -37,7 +37,9 @@ from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConf
 from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.models.base_model import BaseModel
 from toolkit.models.phased_load import PhasedLoadMixin
-from toolkit.models.v2.vae.qwen_image import QwenImageVAE, QwenImageVAEHolderMixin
+from toolkit.models.v2.vae.qwen_image import (
+    QwenImageVAE,  # noqa: F401 - importing registers the qwen_image vae_id entry
+)
 from toolkit.models.v2.text_encoders.qwen3_vl import (
     Qwen3VLTextEncoder,
     patch_qwen_vl_patch_embed,
@@ -99,10 +101,10 @@ scheduler_config = {
 
 # Defaults; both overridable via model.model_kwargs. The TE's comfy
 # single-file repack (fp8-scaled) is declared as candidates on
-# Qwen3VLTextEncoder; the VAE's on QwenImageVAE. The raw repos remain
+# Qwen3VLTextEncoder; the VAE's on QwenImageVAE (toolkit/models/v2/vae/
+# qwen_image.py, the qwen_image vae_id entry). The raw repos remain
 # available via the corresponding *_path model_kwargs.
 QWEN3_VL_PATH = "Qwen/Qwen3-VL-4B-Instruct"
-QWEN_IMAGE_VAE_PATH = "Qwen/Qwen-Image"
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
@@ -134,8 +136,11 @@ def _load_mmdit_state_dict(name_or_path: str, device=None) -> dict:
     return _read()
 
 
-class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
+class Krea2Model(PhasedLoadMixin, BaseModel):
     arch = "krea2"
+    # the Qwen-Image VAE, owned by toolkit/models/v2/vae/qwen_image.py;
+    # load/encode/decode all come from that entry
+    vae_id = "qwen_image"
 
     def __init__(
         self,
@@ -311,25 +316,6 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
         text_encoder.requires_grad_(False)
         flush()
         return tokenizer, text_encoder, {'processor': processor, 'vl_processor': vl_processor}
-
-    def _load_vae(self):
-        # the Qwen-Image vae is a diffusers-layout repo folder: it loads
-        # through the hub cache (or a local vae_path override), streamed
-        # shard-by-shard onto the gpu via accelerate (no cpu staging, no
-        # model-sized ram). The comfy single-file repacks of this vae are
-        # wan-layout and are not loadable by this class; keep the two
-        # cleanly separated.
-        vae_path = self.model_config.model_kwargs.get("vae_path", QWEN_IMAGE_VAE_PATH)
-        self.print_and_status_update(f"Loading Qwen-Image VAE from {vae_path}")
-        vae = QwenImageVAE.load_model(
-            vae_path,
-            dtype=self.vae_torch_dtype,
-            token=HF_TOKEN,
-            aitk_device=None if self.model_config.low_vram else self.vae_device_torch,
-        )
-        vae.eval()
-        vae.requires_grad_(False)
-        return vae
 
     def load_training_adapter(self, transformer: SingleStreamDiT):
         self.print_and_status_update("Loading assistant LoRA")
@@ -772,7 +758,8 @@ class Krea2Model(QwenImageVAEHolderMixin, PhasedLoadMixin, BaseModel):
         return False
 
     # ------------------------------------------------------------------
-    # VAE (Qwen-Image AutoencoderKLQwenImage -- shared QwenImageVAEHolderMixin)
+    # VAE (Qwen-Image encoder -- the qwen_image vae_id entry owns load /
+    # encode / decode; tiled decode below low_vram thresholds opt-in)
     # ------------------------------------------------------------------
     vae_decode_tiled_on_low_vram = True
     # ------------------------------------------------------------------

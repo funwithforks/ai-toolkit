@@ -525,8 +525,20 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         
         self.size_database["__version__"] = dataloader_version
 
-        # cache keys come from the model so a model can invalidate them on its own kwargs
-        latent_space_version = self.sd.get_latent_space_version() if self.sd is not None else "sd1"
+        # cache identity is the model's vae_id itself (the vae owns the
+        # latents; same-vae models share caches and cache filenames). A
+        # model not on the registry fails loudly: it must declare a vae_id.
+        if self.sd is None:
+            latent_space_version = "sd1"
+        else:
+            latent_space_version = getattr(self.sd, "vae_id", None)
+            if latent_space_version is None:
+                raise ValueError(
+                    f"{type(self.sd).__name__} declares no vae_id: latent "
+                    "caches are keyed to the vae through the registry. Give "
+                    "the model a vae_id (toolkit/models/vae_registry.py) "
+                    "before caching latents."
+                )
         text_embedding_space_version = self.sd.get_text_embedding_space_version() if self.sd is not None else "sd1"
             
         temporal_compression = 8

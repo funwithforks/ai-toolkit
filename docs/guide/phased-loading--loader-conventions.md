@@ -145,24 +145,44 @@ in the file never catches:
 `toolkit/models/vae_registry.py` + the dispatch in
 `PhasedLoadMixin.load_vae` (`toolkit/models/phased_load.py`). A model opts
 in by declaring the class attribute `vae_id`; the registry maps that id to
-the entry that owns the vae — construction, placement policy, and the
-cache-tag pin — instead of the model's own `load_vae`/`_load_vae` body.
-Models that declare no id are untouched (the only sense in which this is
+the entry that owns the vae — file resolution, load, and behavior — instead
+of the model's own `load_vae`/`_load_vae` body. Models that declare no id
+are untouched (the only sense in which this is
 opt-in: a model that declares one gets NO vae loading of its own left).
 
 **Entry shape** (`VaeEntry`, frozen dataclass): `vae_id`; `components`
 (role → component class — the class carrying `aitk_comfy_*` metadata, never
 a path); `load(model)` (resolves candidates through `_resolve_comfy_file`,
 streams to `model.vae_device_torch`, returns the module or bundle);
-`dtype_policy` (`keep_shipped` = placement only moves, shipped precisions
-survive verbatim; `as_configured` = placement also casts to
-`model_config.vae_dtype`); `bundle` (multiple sub-vae members behind one
-`self.vae` handle — forces `keep_shipped`, members may be None under
-staged sampling); `latent_space_version` (the explicit cache tag — applied
-at construction, not load time, because a `phases` run that never loads
-the vae still hashes the tag into cache filenames); `encode_images` /
-`decode_latents` (reserved for the encode migration — until an id fills
-them, the model's own encode/decode methods are the call surface).
+`bundle` (multiple sub-vae members behind one `self.vae` handle — members
+may be None under staged sampling); `encode_images` / `decode_latents` (the
+vae's behavior: when filled, `PhasedLoadMixin.encode_images`/`decode_latents`
+run them — their output is exactly what the latent cache stores; until
+filled, the model's own methods are the call surface).
+
+**Precision is not a policy.** A vae is loaded at the precision it ships in.
+The entry's loader takes no `dtype` argument, and `load_vae`'s placement step
+for registry models is `vae.to(device)` with no cast — so a downcast is not
+something an id opts out of, it is not expressible. Upstream's blanket "cast
+the vae to the job's dtype" (and the `aitk_cast_on_load` /
+`convert_state_dict_on_load` machinery behind it) is bypassed rather than
+disabled: each vae's module vendors its own loader — meta-parameter shell,
+`WeightSource.open(path).materialize(device)` so tensors land on the gpu one
+at a time (peak ram = largest tensor, never the model),
+`load_state_dict(strict=True, assign=True)` — the pattern minimax_h3
+established for its video/audio vaes. `qwen_image` follows it
+(`toolkit/models/v2/vae/qwen_image.py`), which is why that module also vendors
+the vae's architecture + latent normalization (`QWEN_IMAGE_VAE_CONFIG`): a
+load needs the weights file and nothing else. Computed work may upcast where
+the model is built for it; degrading stored weights may not.
+
+**Cache identity is the id.** There is no latent-space-version concept on
+the registry: the dataloader keys latent caches on `model.vae_id` directly
+(`data_loader.py` — a model without an id fails loudly there), so every
+model declaring `qwen_image` shares one cache namespace and one set of
+files. Any deliberate semantic change to a vae's output is made by the vae
+module's owner (the quality pass) and handled by deleting/stranding the id's
+cache directory — caches are cheap.
 
 **Onboarding a model** (the H3 migration, commit `c578d205`, is the
 reference):
@@ -172,11 +192,21 @@ reference):
    `load`, `register_vae_entry(VaeEntry(...))`. Import it from the
    extension's `__init__.py`.
 2. Declare `vae_id` on the model class; remove its `load_vae` override /
-   `_load_vae` body, any vae entries in a model-level `COMFY_FILES`-style
-   table, and any in-body `latent_space_version` assignment (the pin
-   comes from the entry).
+   `_load_vae` body (and `_load_vae`-era constants), any vae entries in a
+   model-level `COMFY_FILES`-style table, and any in-body
+   `latent_space_version` assignment (identity is the id; there is no
+   version to set).
 3. Duplicate ids, unknown ids, and cast policies on bundles all raise at
    registration/construction — do not soften these into warnings.
+
+**A vae-keyed cache holds the vae's output, nothing else.** What is
+written under a `vae_id` is exactly what the entry's encode returns --
+never a model's derived post-transform (models with deterministic
+per-step layers on latents must recompute at batch time from the shared
+latents, or keep their derived tensors in a separate model-keyed cache of
+their own identity). A file carrying derived bytes under a vae tag breaks
+the one promise the registry exists to keep: same id, compatible latents,
+any model.
 
 **Migration is replacement.** An agreed migration deletes the path it
 supersedes in the same commit — no dual-path flags, no try-registry-except
@@ -188,12 +218,10 @@ the old path must stay reachable, the migration is not agreed — ask.
 **Byte identity is a guard, not the goal.** Diffing cache bytes old-path vs
 new-path proves a *structure-only* move (the Stage A gate for the H3
 migration: 40/40 files, 80/80 tensors, 40/40 meta dicts). It must never
-veto a semantic change: any deliberate dtype/precision change is a
-Stage-B change, and it breaks bytes ON PURPOSE with an explicit
-`latent_space_version` bump. A bumped tag is stranded-by-construction —
-the tag is hashed into cache filenames
-(`dataloader_mixins.py` `get_latent_info_dict`), so old caches are never
-opened, never "migrated", and simply sit unread. Quality is the goal;
+veto a semantic change and it is not a gate on new work: caches are cheap,
+and a deliberate quality/semantic change to a vae's output ships when the
+vae module's owner says so — the id's cache directory is then cleared,
+full stop. No version strings, no migration code. Quality is the goal;
 identity only proves the move itself changed nothing.
 
 ## 6. Where the pieces live
@@ -203,8 +231,10 @@ identity only proves the move itself changed nothing.
 | Candidate ranking + download policy | `resolver.py:19` `comfy_precision_rank`, `:66` `resolve_comfy_candidates` |
 | Model file registration | `_mixin.py:109/116/122/145` |
 | vae_id registry + entry shape | `toolkit/models/vae_registry.py` |
-| Registry dispatch + construction-time validation/pin | `phased_load.py` `PhasedLoadMixin.__init__` / `load_vae` |
-| Reference vae_id migration (bundle, keep_shipped, tag pin, kill-list) | `minimax_h3/minimax_h3_vae_id.py`, commit `c578d205` |
+| Registry dispatch + construction-time validation | `phased_load.py` `PhasedLoadMixin.__init__` / `load_vae` / `encode_images` / `decode_latents` |
+| Cache identity = vae_id (loud refusal without one) | `data_loader.py` (latent cache keying) |
+| Reference vae_id migration (bundle, vendored loaders, kill-list) | `minimax_h3/minimax_h3_vae_id.py`, commit `c578d205` |
+| Reference single-vae migration (vendored loader + vendored config, entry-owned encode/decode) | `toolkit/models/v2/vae/qwen_image.py` (the `qwen_image` id; krea2 declares it) |
 | Lifecycle phase selection (`phases`) | `config_modules.py` `TrainConfig.phases`; guards/exits in `BaseSDTrainProcess.run()` |
 | Lazy reader, per-key placement | `weight_source.py:25` `:90` |
 | Stream-to-meta-shell reference | `ltx2.py:1609` `_stream_load`, `:1593` `_remap_file_key` |

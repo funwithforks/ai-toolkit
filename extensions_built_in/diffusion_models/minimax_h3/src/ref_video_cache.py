@@ -205,7 +205,7 @@ def load_ref_video_latent(
         "num_frames": num_frames,
         "fps": dataset_config.fps,
         "trim_tail": trim_tail,
-        "latent_space_version": model.latent_space_version,
+        "vae_id": model.vae_id,
         "is_ref_video": True,
     }
     cache_file = _cache_path(path, hash_dict)
