@@ -1,24 +1,39 @@
 """
 MageVAE: DConvEncoder + DConvDenoiser (with CoD Decoder) wrapper.
 
+This module IS the ``mage`` vae_id contract: the component class (its comfy
+file contract, key layout, loader, and its own ``encode_images`` /
+``decode_latents``) plus nothing else -- the registration that turns it into an
+id lives in ``../mageflow_vae_id.py``. Both mageflow archs join it by declaring
+``vae_id = "mage"``, and one cached latent is then valid for either of them
+because both mean this one physical encoder.
+
 Vendored from the reference implementation
 (github.com/microsoft/Mage, mage_flow/models/modules/mage_vae.py); loguru
-swapped for prints, otherwise unchanged. Loads the kl0.1 CoD ckpt layout used
-by ``vae/diffusion_pytorch_model.safetensors`` in the Mage-Flow HF repos:
+swapped for prints, otherwise unchanged. Key layout of the checkpoint (the
+``kl0.1 CoD`` layout every published Mage-Flow vae file uses):
   encoder weights: 'student.dconv_encoder.*' (packed mean+logvar, out_ch_mult=2)
   decoder weights: 'pipeline.*' (denoiser + y_embedder.decoder)
 
 Latent shape: [B, 128, H/16, W/16] — no patch packing, no normalization.
 Encode input / decode output are [-1, 1] pixel images with H, W multiples of 16.
+
+Nothing in the load takes a dtype. The vae is loaded at the precision it ships
+in (the comfy single file is bf16) and the latents keep that precision -- a
+job's ``dtype`` rounding them on the way into the latent cache is the
+loss-of-quality pattern this fork does not keep.
 """
 
 import math
 import os
+import time
 from functools import lru_cache
+from typing import List, Union
 
 import torch
 
 from toolkit.models.v2._mixin import OstrisModelMixin
+from toolkit.util.weight_source import WeightSource
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -602,6 +617,68 @@ class MageVAE(nn.Module, OstrisModelMixin):
     latent_channels = 128
     downsample_factor = 16
 
+    # The file contract lives on the class, the same as every other component:
+    # one named comfy single file -- NOT ``vae/diffusion_pytorch_model.safetensors``,
+    # a name that says nothing about which encoder it holds -- resolved through
+    # the comfy door and kept in ``MODELS_PATH/vae/``.
+    aitk_subfolder = "vae"
+    aitk_comfy_repo = "Comfy-Org/Mage-Flow"
+    # One physical encoder behind every name a job may use as ``name_or_path``:
+    # the comfy repo, the microsoft/* ids this extension's README documents, and
+    # the mage-flow-community/* mirrors that carry the diffusers folder layout.
+    # Whichever a job names, the bytes are this one file and the download comes
+    # from the comfy repo.
+    _COMFY_VAE = ["vae/mage_flow_vae_bf16.safetensors"]
+    aitk_comfy_weight_names = {
+        "Comfy-Org/Mage-Flow": _COMFY_VAE,
+        "microsoft/Mage-Flow": _COMFY_VAE,
+        "microsoft/Mage-Flow-Base": _COMFY_VAE,
+        "microsoft/Mage-Flow-Edit-Base": _COMFY_VAE,
+        "mage-flow-community/Mage-Flow": _COMFY_VAE,
+        "mage-flow-community/Mage-Flow-Base": _COMFY_VAE,
+        "mage-flow-community/Mage-Flow-Edit-Base": _COMFY_VAE,
+    }
+
+    @classmethod
+    def load_to_device(cls, file_path: str, device) -> "MageVAE":
+        """Load a Mage-Flow vae file onto ``device``, at the precision it ships in.
+
+        There is no dtype argument and no cast after the load. The published
+        files are bf16 and a freshly built shell is fp32, so this is the exact
+        spot where a blanket cast used to round the encoder -- and every latent
+        it produced -- to the job's dtype.
+
+        Tensors are read onto the target device one at a time (``WeightSource``)
+        and adopted in place with ``assign=True``, so peak ram is the largest
+        tensor rather than a second copy of the model. Both halves then load
+        strictly (see ``_load_encoder`` / ``_load_decoder``).
+        """
+        t0 = time.perf_counter()
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        state = WeightSource.open(file_path).materialize(dev)
+        model = cls(ckpt_path=None)
+        model._load_encoder(state, file_path)
+        model._load_decoder(state, file_path)
+        del state
+        # adaLN modulation depends only on t and t is always 0 here: fold the
+        # timestep MLPs into constants now that their weights are in, then drop
+        # them. The fold is derived math, so the resulting constants carry the
+        # device they were computed on: the same file folded on cpu rather than
+        # cuda disagrees on those two tensors by up to 3.1e-2 (measured), and
+        # latents by 4.7e-2 against a latent std of 0.76. Nothing here bends the
+        # load to avoid that -- making the fold itself device-independent is
+        # this vae's own numerics question, not a load-order one.
+        model._freeze_adaln_cache()
+        model.to(dev)
+        model.eval().requires_grad_(False)
+        print(
+            f"[load-timing] MageVAE: {os.path.basename(file_path)} -> {dev} "
+            f"{time.perf_counter() - t0:.1f}s"
+        )
+        return model
+
     def __init__(self, ckpt_path: str = None, sample_posterior: bool = True):
         super().__init__()
         self.sample_posterior = sample_posterior
@@ -618,16 +695,10 @@ class MageVAE(nn.Module, OstrisModelMixin):
             # Precompute and drop the MLPs once at construction (~37M params saved).
             self._freeze_adaln_cache()
 
-    @classmethod
-    def load_from_state_dict(cls, state_dict, dtype=None, **kwargs):
-        model = cls(
-            ckpt_path=None,
-            sample_posterior=kwargs.pop("sample_posterior", True),
-        )
-        model._load_encoder(state_dict, "<state dict>")
-        model._load_decoder(state_dict, "<state dict>")
-        model._freeze_adaln_cache()
-        return model
+    # Encoder-side conditioning weights that ride in the checkpoint but are not
+    # part of this module: y_embedder.encoder / .bottleneck belong to the
+    # image-to-y path, which the decode side never runs.
+    _DECODER_NOT_LOADABLE = ("y_embedder.encoder.", "y_embedder.bottleneck.")
 
     def _load_encoder(self, sd, ckpt_path):
         prefix = "student.dconv_encoder."
@@ -640,9 +711,10 @@ class MageVAE(nn.Module, OstrisModelMixin):
                 f"MageVAE encoder: expected packed mean+logvar (proj_out out_channels="
                 f"{2 * self.latent_channels}), got {None if proj is None else tuple(proj.shape)}"
             )
-        missing, unexpected = self.dconv_encoder.load_state_dict(enc_sd, strict=False)
-        if missing:
-            print(f"MageVAE encoder missing keys: {missing[:10]}")
+        # strict: this is a 342/342 key match on the real file, so a leftover
+        # lenient load would only ever hide the wrong file -- half an encoder
+        # left at its random init still produces plausible-looking latents.
+        self.dconv_encoder.load_state_dict(enc_sd, strict=True, assign=True)
 
     def _load_decoder(self, sd, ckpt_path):
         prefix = "pipeline."
@@ -654,15 +726,29 @@ class MageVAE(nn.Module, OstrisModelMixin):
             if not k.startswith(prefix):
                 continue
             new_k = k[len(prefix) :]
-            if new_k.startswith("y_embedder.encoder.") or new_k.startswith(
-                "y_embedder.bottleneck."
-            ):
+            if new_k.startswith(self._DECODER_NOT_LOADABLE):
                 continue
-            if new_k in model_dict and model_dict[new_k].shape == v.shape:
-                matched[new_k] = v
-        self.decoder_model.load_state_dict(matched, strict=False)
-        if not matched:
-            raise RuntimeError(f"MageVAE decoder: 0 params matched from {ckpt_path}")
+            if new_k not in model_dict:
+                # keys the module does not have are the y_embedder encoder side
+                # (or a different model entirely); say so instead of ignoring
+                continue
+            if tuple(model_dict[new_k].shape) != tuple(v.shape):
+                raise RuntimeError(
+                    f"MageVAE decoder: {new_k} shape {tuple(v.shape)} in "
+                    f"{ckpt_path} does not fit the module "
+                    f"{tuple(model_dict[new_k].shape)} -- wrong vae file"
+                )
+            matched[new_k] = v
+        # every decoder parameter must be covered. strict=False below is only
+        # because the y_embedder encoder weights above are deliberately not
+        # part of this module; the check here is the strictness.
+        uncovered = sorted(set(model_dict) - set(matched))
+        if uncovered:
+            raise RuntimeError(
+                f"MageVAE decoder: {len(uncovered)} parameters not in "
+                f"{ckpt_path}, e.g. {uncovered[:5]}"
+            )
+        self.decoder_model.load_state_dict(matched, strict=False, assign=True)
 
     @torch.no_grad()
     def _moments(self, x: torch.Tensor):
@@ -697,6 +783,53 @@ class MageVAE(nn.Module, OstrisModelMixin):
         noise = torch.zeros(B, 3, H, W, device=z.device, dtype=z.dtype)
         t = torch.zeros(B, device=z.device, dtype=z.dtype)
         return self.decoder_model.forward(noise, t, cond)
+
+    # -- the vae does the vae work ---------------------------------------------
+    # These two are what phase 1 caches and what sampling decodes, so they belong
+    # to the vae and not to the models that declare ``vae_id = "mage"``: device
+    # and precision come from this module's own parameters, which is what makes
+    # one cached latent valid for both mageflow archs. device/dtype describe where
+    # the CALLER wants the result; they never change how it is computed. Residency
+    # (the cpu -> vae-device move) is the holder's job, supplied by
+    # PhasedLoadMixin.encode_images / decode_latents.
+    #
+    # There is no scaling or shift here: this codec's raw output IS the latent
+    # space the transformer trains against.
+
+    @torch.no_grad()
+    def encode_images(
+        self, image_list: Union[List[torch.Tensor], torch.Tensor], device=None, dtype=None
+    ) -> torch.Tensor:
+        """Pixels -> latents. Used for latent caching and for control images.
+
+        in:  image_list  list of (3, H, W) tensors (a (1,3,H,W) item is accepted,
+                         which is what the data loader hands over) -- or a
+                         (B, 3, H, W) batch -- with values in [-1, 1] and H, W
+                         multiples of 16
+        out: (B, 128, H/16, W/16) latents in this vae's own precision
+        """
+        if isinstance(image_list, torch.Tensor):
+            images = image_list
+        else:
+            images = torch.stack(
+                [img.squeeze(0) if img.dim() == 4 else img for img in image_list], dim=0
+            )
+        images = images.to(self.device, dtype=self.dtype)
+        z = self.encode(images)
+        return z if device is None and dtype is None else z.to(device, dtype=dtype)
+
+    @torch.no_grad()
+    def decode_latents(
+        self, latents: torch.Tensor, device=None, dtype=None
+    ) -> torch.Tensor:
+        """Latents -> pixels. Used when rendering previews.
+
+        in:  (B, 128, h, w) latents as encode_images produces them
+        out: (B, 3, h*16, w*16) images in [-1, 1]
+        """
+        z = latents.to(self.device, dtype=self.dtype)
+        images = self.decode(z)
+        return images if device is None and dtype is None else images.to(device, dtype=dtype)
 
     @property
     def device(self):

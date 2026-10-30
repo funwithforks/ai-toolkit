@@ -12,7 +12,9 @@ Components (diffusers-style repo layout):
     conditioning is the final hidden states with the templated system prompt
     dropped (34 tokens for t2i, 64 for edit).
   - autoencoder: ``MageVAE`` (src/vae.py) — 128-channel, 16x downsample
-    one-step diffusion codec, no latent normalization.
+    one-step diffusion codec, no latent normalization. Not read from this
+    folder: it is the named comfy single file the class declares, resolved
+    through the comfy door into MODELS_PATH/vae/ and owned by ``vae_id = "mage"``.
 
 Flow matching convention matches ai-toolkit exactly (sigma=1 noise -> sigma=0
 clean, target = noise - clean), static sigma shift 6.0. Edit mode feeds the
@@ -49,7 +51,6 @@ from toolkit.accelerator import unwrap_model
 from toolkit.metadata import get_meta_for_safetensors
 
 from .src.transformer import MageFlow, MageFlowParams
-from .src.vae import MageVAE
 from .src.text_encoder import (
     encode_mageflow_prompt,
     patch_qwen_vl_patch_embed,
@@ -100,6 +101,15 @@ HF_TOKEN = os.getenv("HF_TOKEN", None)
 class MageFlowModel(PhasedLoadMixin, BaseModel):
     display_name = "Mage-Flow"
     arch = "mageflow"
+
+    # The vae is owned by its id, not by this class: load construction comes
+    # from the registered entry (mageflow_vae_id.py) and encode/decode are
+    # methods on the vae itself (src/vae.py). A model that declares an id keeps
+    # no vae code, which is what makes one cached latent valid for every model on
+    # it -- MageFlowEditModel below is the same physical encoder, so an encoded
+    # dataset serves both archs.
+    vae_id = "mage"
+
     is_edit = False
     use_old_lokr_format = False
 
@@ -227,20 +237,10 @@ class MageFlowModel(PhasedLoadMixin, BaseModel):
         # text encoder phase
         return tokenizer, text_encoder, {'vl_processor': vl_processor}
 
-    def _load_vae(self) -> MageVAE:
-        self.print_and_status_update("Loading MageVAE")
-        vae_path = self.model_config.model_kwargs.get("vae_path", None)
-        if vae_path is None:
-            vae_path = self._get_model_file("vae/diffusion_pytorch_model.safetensors")
-        vae = MageVAE.load_model(
-            vae_path,
-            sample_posterior=bool(
-                self.model_config.model_kwargs.get("vae_sample_posterior", True)
-            ),
-        )
-        vae.eval()
-        vae.requires_grad_(False)
-        return vae
+    # _load_vae: not here. The vae is owned by its id -- PhasedLoadMixin.load_vae
+    # dispatches through the registered "mage" entry (mageflow_vae_id.py), which
+    # resolves the named comfy single file through the comfy door and streams it
+    # to the vae device at the precision it ships in.
 
     def get_quantization_exclude_modules(self):
         # sensitive modules kept in full precision (fnmatch patterns on module
@@ -502,41 +502,13 @@ class MageFlowModel(PhasedLoadMixin, BaseModel):
         return False
 
     # ------------------------------------------------------------------
-    # VAE (MageVAE -- raw latents, no normalization)
+    # VAE encode / decode
     # ------------------------------------------------------------------
-    def encode_images(self, image_list: List[torch.Tensor], device=None, dtype=None):
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(device)
-        self.vae.eval()
-
-        if isinstance(image_list, list):
-            images = torch.stack(
-                [img.squeeze(0) if img.dim() == 4 else img for img in image_list], dim=0
-            )
-        else:
-            images = image_list
-        images = images.to(self.vae.device, dtype=self.vae.dtype)
-
-        latents = self.vae.encode(images)  # (B, 128, H/16, W/16)
-        return latents.to(device, dtype=dtype)
-
-    def decode_latents(self, latents: torch.Tensor, device=None, dtype=None):
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(device)
-
-        latents = latents.to(self.vae.device, dtype=self.vae.dtype)
-        images = self.vae.decode(latents)  # (B, 3, H, W) in [-1, 1]
-        return images.to(device, dtype=dtype)
+    # Both are the vae's own methods (src/vae.py), reached through
+    # PhasedLoadMixin.encode_images / decode_latents, which supply residency
+    # only. Models on the id keep no encode code of their own: the precision the
+    # latents come out in is the vae's, not the job's, and that is what makes one
+    # cached latent valid for every model declaring vae_id = "mage".
 
     # ------------------------------------------------------------------
     # Saving / bookkeeping
