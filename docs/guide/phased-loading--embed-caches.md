@@ -144,3 +144,9 @@ loaded from disk instead.
 5. Verify the acceptance line on a real job, cold and warm: first run
    encodes and writes; second run prints the skip lines and loads nothing on
    the GPU except the transformer.
+6. Read back what the caches stored and check the dtypes, not only the shapes:
+   the tensors must be in the precision the producing component ships in, not
+   the job's dtype. Existence and key checks (`embed_file_valid`) cannot see a
+   precision change, so the check is done on a freshly written file. See the
+   producer -> cache cast sweep in
+   [loader conventions §5](./phased-loading--loader-conventions.md).
