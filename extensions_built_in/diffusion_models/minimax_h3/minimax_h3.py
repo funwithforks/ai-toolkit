@@ -236,10 +236,11 @@ class MiniMaxH3VaeBundle(torch.nn.Module):
 
     @torch.no_grad()
     def encode_keyframe_latents(self, frames):
-        """(B, 3, 1, H, W) in [-1, 1] -> normalized latents (B, 24, 1, h, w), with
-        the released conditioning recipe: seeded posterior sample (seed 42,
-        independent of the request seed) rounded to fp16 before normalization.
-        Returned fp32 -- this is the conditioning reference, not a cache entry."""
+        """(B, 3, 1, H, W) in [-1, 1] -> normalized latents (B, 24, 1, h, w):
+        posterior sample from a fixed seed (packing.KEYFRAME_ENCODE_SEED,
+        independent of the request seed), rounded to fp16 before
+        normalization. Returned fp32 -- this is the conditioning reference,
+        not a cache entry."""
         if self.video_vae is None:
             raise RuntimeError("minimax_h3 vae: keyframe encode needs the video vae")
         generator = torch.Generator(device="cpu").manual_seed(packing.KEYFRAME_ENCODE_SEED)
@@ -955,8 +956,9 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
 
     @torch.no_grad()
     def encode_keyframe_latents(self, frames: torch.Tensor) -> torch.Tensor:
-        """(B, 3, 1, H, W) in [-1, 1] -> normalized latents (B, 24, 1, h, w)
-        with the released conditioning recipe, which lives with the vae."""
+        """(B, 3, 1, H, W) in [-1, 1] -> normalized latents (B, 24, 1, h, w).
+        Residency only; the keyframe encode (seeded posterior fold, fp16
+        rounding before normalization) lives with the vae."""
         # under staged sampling the vae is not resident while denoising:
         # conditioning encodes borrow it for this call and hand it back
         loaded_here = self.vae is None
@@ -1698,8 +1700,8 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         """Decode a reference video with the SAME temporal treatment training
         uses (real-time pacing from frame 0 at 24 fps, tail trimmed, snapped
         down to 17n+5, capped at the sample's frame count), area-match it to
-        the target with its own aspect, and encode with the released keyframe
-        recipe. Returns normalized latents (C, T, h, w)."""
+        the target with its own aspect, and encode with the keyframe recipe
+        used by training. Returns normalized latents (C, T, h, w)."""
         import cv2
         import numpy as np
 
@@ -1765,7 +1767,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         """A still ctrl image as a silent static reference clip
         (``image_refs_as_video``): held for ``image_ref_video_frames`` frames,
         video-sized to the target's pixel area with its own aspect, encoded
-        with the released keyframe recipe. Same shape of entry as
+        with the keyframe recipe used by training. Same shape of entry as
         :meth:`_encode_ref_video_for_sampling`."""
         import numpy as np
 

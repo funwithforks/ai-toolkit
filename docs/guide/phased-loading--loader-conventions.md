@@ -209,32 +209,31 @@ reference):
    model-level `COMFY_FILES`-style table, and any in-body
    `latent_space_version` assignment (identity is the id; there is no
    version to set).
-3. Sweep the whole producer -> cache path for casts, not just the loader. The
-   no-dtype rule in §4 guards the weights; the tensor stays exposed to
-   everything downstream. Grep the model's own encode helpers and the cache
-   writers for
-   casts of derived tensors — `.to(..., self.torch_dtype)`, `.half()` /
-   `.float()` / `.bfloat16()`, quantizing storage helpers, and every
-   `state_dict[...] =` / `save_file` that writes a cache — then follow each hit
-   to see whether the *consumer* or the *writer* sits on the other side. A
-   consumer taking job dtype is correct; a producer rounding its own return, or
-   a writer rounding what it stores, is the bug, because the rounded bytes are
-   what every later job reads. Finish with the empirical half: encode once, read
-   the file back, print every tensor's dtype, and require the component's
-   precision rather than the job's. This one slipped through a load-only scope:
-   the bundle's audio encode returned fp32 and `encode_audio` then rounded it on
-   return (minimax_h3.py:1026), so the prep writer stored bf16 `audio_latent`
-   (dataloader_mixins.py:2490) while the train step upcasts it back to fp32
-   (minimax_h3.py:1126) — fp32 → bf16 → cache → fp32, bits gone, loader clean.
-   Judge each hit rather than deleting every cast. `encode_keyframe` folds with
-   `fp16_round=True` and returns `.float()` (minimax_h3.py:244-251) because the
-   fp16 rounding *is* the released conditioning recipe and the docstring says it
-   is not a cache entry — that is declared behavior. `_latent_to_uint8`
-   (dataloader_mixins.py:2050, reached by `cache_latents_as_uint8` at `:2429`) is
-   a declared storage policy too, and no model turns it on today; two things to
-   check before any model does: it clamps to [-1, 1], so it is only sound for
-   pixel-space latents, and it is not a term in `get_latent_info_dict`, so
-   switching it changes stored latents without changing the cache key.
+3. Sweep the producer -> cache path for casts, not only the loader. The
+   no-dtype rule in §4 guards the weights; the returned tensor is still
+   exposed to everything downstream. Grep the model's encode helpers and the
+   cache writers for casts of derived tensors — `.to(..., self.torch_dtype)`,
+   `.half()` / `.float()` / `.bfloat16()`, quantizing storage helpers, and
+   every `state_dict[...] =` / `save_file` that writes a cache. Then read the
+   other side of each hit: a consumer taking the job's dtype is correct; a
+   producer rounding its own return, or a writer rounding what it stores, is
+   not, because those are the bytes every later job reads. Finish
+   empirically — encode once, read the file back, print every tensor's dtype,
+   and require the component's precision rather than the job's. Case in
+   point: the H3 bundle's audio encode returns fp32, `encode_audio` rounded it
+   on return (minimax_h3.py:1026), the prep writer stored that bf16
+   `audio_latent` (dataloader_mixins.py:2490), and the train step upcasts it
+   back to fp32 (minimax_h3.py:1126). Every cast of a cached tensor is judged
+   by measured error against the unrounded value, not by whether it was
+   written on purpose — intent is not evidence that the loss is small.
+   `encode_keyframe` folds with `fp16_round=True` and returns `.float()`
+   (minimax_h3.py:243-251); `_latent_to_uint8` (dataloader_mixins.py:2050,
+   reached by `cache_latents_as_uint8` at `:2429`) is a storage option no
+   model enables today. Both are subject to the same measurement. Two things
+   to check before any model enables the uint8 option: it clamps to [-1, 1],
+   so it is only sound for pixel-space latents, and it is not a term in
+   `get_latent_info_dict`, so switching it changes stored latents without
+   changing the cache key.
 4. Duplicate ids, unknown ids, and cast policies on bundles all raise at
    registration/construction — do not soften these into warnings.
 
@@ -255,10 +254,10 @@ the latent key has no dtype term to catch the difference (see "Byte identity is
 a guard" below: the remedy is clearing the id's cache directory). One artifact
 can also have several writers, each with its own private policy
 (`dataloader_mixins.py:2490` and `minimax_h3/src/ref_video_cache.py:269` both
-write an `audio_latent`, the second deliberately to fp16), so a producer that
-gets fixed must be re-checked against *every* writer of that artifact, not only
-the one that surfaced the bug. Grepping yields candidates; only reading back a
-freshly written cache file settles it.
+write an `audio_latent`, the second to fp16), so a producer that gets fixed
+must be re-checked against *every* writer of that artifact, not only the one
+where the problem surfaced. Check dtypes by reading a freshly written cache
+file; grep only yields candidates.
 
 **Migration is replacement.** An agreed migration deletes the path it
 supersedes in the same commit — no dual-path flags, no try-registry-except

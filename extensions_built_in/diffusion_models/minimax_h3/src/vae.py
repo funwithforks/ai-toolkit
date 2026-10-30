@@ -13,9 +13,9 @@ The reference pixel convention is ImageNet-normalized RGB over [0, 1];
 ``encode``/``decode`` here speak ai-toolkit's [-1, 1] and convert inside.
 Spatial tiling (256 px tiles, >= 64 px overlap, linearly blended) is ON by
 default for both encode and decode -- the model was released that way and
-the released frames are the blended-tile ones. The checkpoint is float32
-and the released decode recipe is fp16 autocast over the fp32 weights, with
-the token embedder, output projection, and every norm kept in fp32.
+the released frames are the blended-tile ones. The checkpoint is float32;
+decode runs fp16 autocast over those weights, with the token embedder,
+output projection, and every norm kept in fp32.
 """
 
 import math
@@ -370,9 +370,9 @@ class ViTDecoder3d(nn.Module):
         b, c, t, h, w = z.shape
         tokens = z.permute(0, 2, 3, 4, 1).reshape(b, t * h * w, c)
 
-        # released recipe: token embedder / output projection / norms compute
-        # fp32 even when the matmuls run fp16 (autocast or fp16 storage); the
-        # block stack then runs at the storage dtype
+        # token embedder / output projection / norms compute fp32 even when the
+        # matmuls run fp16 (autocast or fp16 storage); the block stack then runs
+        # at the storage dtype
         with torch.autocast(device_type=z.device.type, enabled=False):
             x = F.linear(
                 tokens.float(),
@@ -814,8 +814,8 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
         keyframe: spatial encode only, no temporal chunking). Returns
         normalized latents (B, latent_channels, t, h, w): posterior sampled
         (or the mean when sample=False), optionally rounded through fp16
-        BEFORE the (z - latents_mean) / latents_std normalization
-        (fp16_round=True is the released first-frame-conditioning recipe)."""
+        BEFORE the (z - latents_mean) / latents_std normalization. The round
+        is used by the first-frame conditioning path (encode_keyframe)."""
         x = pixels
         if x.ndim == 4:
             x = x.unsqueeze(2)
@@ -849,7 +849,7 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
     def decode(self, latents, autocast_fp16=True):
         """Normalized latents (B, latent_channels, t, h, w) -> pixels
         (B, 3, T, H, W) in [-1, 1]. Runs under fp16 autocast over the fp32
-        weights on cuda (the released recipe) unless autocast_fp16=False."""
+        weights on cuda unless autocast_fp16=False."""
         shape = (1, -1, 1, 1, 1)
         z = latents.float() * self.latents_std.view(shape) + self.latents_mean.view(
             shape
