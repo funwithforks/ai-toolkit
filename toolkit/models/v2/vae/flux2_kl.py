@@ -379,6 +379,9 @@ class AutoEncoder(nn.Module, OstrisModelMixin):
         "black-forest-labs/flux-3-image-klein-comfy": ["vae/flux2-vae.safetensors"],
         "Comfy-Org/Fibo-2.0": ["vae/flux2-vae.safetensors"],
         "Comfy-Org/MOSS-Image": ["vae/flux2-vae.safetensors"],
+        # ideogram4's only official release is quantized (fp8/nf4, diffusers
+        # layout); its comfy packaging ships the same byte-identical vae
+        "Comfy-Org/Ideogram-4": ["vae/flux2-vae.safetensors"],
         "OpenMOSS-Team/MOSS-Image-Base": ["vae/flux2-vae.safetensors"],
     }
 
