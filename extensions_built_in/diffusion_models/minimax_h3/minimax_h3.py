@@ -997,7 +997,10 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
     @torch.no_grad()
     def encode_audio(self, audio_data_list):
         """[{"waveform": (C, L), "sample_rate": int}, ...] -> packed audio
-        rows (B, 2*T, 32), normalized, channel-major stereo."""
+        rows (B, 2*T, 32), normalized, channel-major stereo. Returned in the
+        audio vae's own precision (fp32); this holder moves to the device and
+        never rounds the latents, because what it returns is what the latent
+        cache stores."""
         import torchaudio
 
         if self.vae.device == torch.device("cpu"):
@@ -1025,7 +1028,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         packed = [
             torch.nn.functional.pad(p, (0, 0, 0, max_len - p.shape[1])) for p in packed
         ]
-        return torch.cat(packed, dim=0).to(self.device_torch, self.torch_dtype)
+        return torch.cat(packed, dim=0).to(self.device_torch)
 
     # ------------------------------------------------------------------
     # Training forward
