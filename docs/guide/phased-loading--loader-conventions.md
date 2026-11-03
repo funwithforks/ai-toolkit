@@ -85,7 +85,12 @@ The whole-file `load_file()` batched state dict is now the **exception path**,
 kept only where the requantizer genuinely needs the whole cpu dict —
 low_vram parking or a user-requested requantization
 (`_as_shipped_stream_target`, ltx2.py:1570: returns the stream device, or
-`None` to select the batched cpu path).
+`None` to select the batched cpu path). `WeightSource.materialize` enforces
+the same line on its own API: a cpu destination raises unless the caller
+passes `allow_cpu=True` — peak host ram is then the file's total size, the
+pattern that ooms at transformer sizes. No caller in the repo passes cpu
+today; the gpu branch reads one tensor at a time and moves immediately
+(peak ram = largest tensor).
 
 ## 3. Placement: meta shell + per-key plan (as-shipped path)
 
