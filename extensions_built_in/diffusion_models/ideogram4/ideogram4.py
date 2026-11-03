@@ -25,20 +25,15 @@ from huggingface_hub.errors import EntryNotFoundError
 from transformers import AutoModel, AutoTokenizer
 
 from .src.transformer import Ideogram4Config, Ideogram4Transformer2DModel
-from toolkit.models.v2.vae.flux2_kl import (
-    AutoEncoder,
-    AutoEncoderParams,
-    convert_diffusers_state_dict,
-)
+from toolkit.models.v2.vae.flux2_kl import AutoEncoder
 from toolkit.models.v2.text_encoders.qwen3_vl import Qwen3VLModelEncoder
-from .src.latent_norm import get_latent_norm
+from toolkit.ragged import RaggedBatch, is_ragged
+from .src.latent_layout import layout_from_file, layout_from_vae, resolve_vae_file
 from .src.pipeline import (
     Ideogram4Pipeline,
     get_qwen3_vl_features,
     pad_text_features,
-    patchify_latents,
     predict_velocity,
-    unpatchify_latents,
 )
 
 
@@ -165,6 +160,14 @@ def _load_sharded(base, index_path, is_local, prefix="") -> dict:
 class Ideogram4Model(PhasedLoadMixin, BaseModel):
     arch = "ideogram4"
     display_name = "Ideogram4"
+    # the vae is owned by its id, not by this class: PhasedLoadMixin.load_vae
+    # dispatches through the registered "flux2" entry (flux2_kl.py) -- the
+    # same physical vae the flux2 family trains on, so one cache serves all
+    # of them. The DiT consumes a different channel packing + normalization
+    # of that vae's latents; the conversion lives in src/latent_layout.py
+    # and runs at the noising/target/decode boundaries (see below), never on
+    # the cache path.
+    vae_id = "flux2"
 
     def __init__(
         self,
@@ -191,9 +194,6 @@ class Ideogram4Model(PhasedLoadMixin, BaseModel):
         self.max_text_length = int(
             self.model_config.model_kwargs.get("max_text_length", 3072)
         )
-
-        self._latent_shift = None
-        self._latent_scale = None
 
         # Optional LoRA that is only switched on during the unconditional (negative)
         # CFG pass. Loaded from model_config.unconditional_lora_path if set; stays
@@ -264,19 +264,6 @@ class Ideogram4Model(PhasedLoadMixin, BaseModel):
         )
         transformer.rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
         return transformer
-
-    def _load_vae(self):
-        base = self.model_config.name_or_path
-        dtype = self.torch_dtype
-        self.print_and_status_update("Loading VAE")
-        vae_sd = _load_component_state_dict(base, "vae", "diffusion_pytorch_model")
-        vae_sd = convert_diffusers_state_dict(vae_sd)
-        vae = AutoEncoder.load_from_state_dict(vae_sd, self.vae_torch_dtype)
-        del vae_sd
-        vae.to(self.vae_device_torch, dtype=dtype)
-        vae.eval()
-        vae.requires_grad_(False)
-        return vae
 
     def load_unconditional_lora(self, transformer: Ideogram4Transformer2DModel):
         """Load the unconditional-pass LoRA and leave it applied but inactive.
@@ -359,16 +346,6 @@ class Ideogram4Model(PhasedLoadMixin, BaseModel):
         network.is_active = False
         self.unconditional_lora = network
         self.print_and_status_update("Unconditional LoRA loaded (inactive)")
-
-    def load_vae(self):
-        vae = self._load_vae()
-        # the latent norm constants are consumed by encode_images/decode_latents
-        # (dataset latent caching runs right after this phase), so they are set
-        # here alongside the vae
-        shift, scale = get_latent_norm()
-        self._latent_shift = shift.view(1, -1, 1, 1)
-        self._latent_scale = scale.view(1, -1, 1, 1)
-        self.vae = vae
 
     def _build_pipeline(self):
         return Ideogram4Pipeline(self)
@@ -504,47 +481,59 @@ class Ideogram4Model(PhasedLoadMixin, BaseModel):
         return False
 
     # ------------------------------------------------------------------
-    # VAE
+    # latent layout: the shared flux2 cache vs the DiT's packing
     # ------------------------------------------------------------------
-    def encode_images(self, image_list: List[torch.Tensor], device=None, dtype=None):
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(self.vae_device_torch)
 
-        if isinstance(image_list, list):
-            images = torch.stack(image_list, dim=0)
-        else:
-            images = image_list
-        images = images.to(device, dtype=dtype)
+    def _latent_layout(self):
+        """The exact affine between the cache form and the DiT's, derived
+        once from the vae's own running stats: the resident module's
+        buffers when it is loaded (parked counts -- buffers are readable
+        wherever it sits), otherwise a header read of the resolved file,
+        which is the warm-run path where the vae never loads."""
+        layout = self.__dict__.get("_latent_layout_obj")
+        if layout is None:
+            if self.vae is not None and hasattr(self.vae, "bn"):
+                layout = layout_from_vae(self.vae, self.device_torch)
+            else:
+                layout = layout_from_file(
+                    resolve_vae_file(self), self.device_torch
+                )
+            self._latent_layout_obj = layout
+        return layout
 
-        ae_channels = self.vae.params.z_channels
-        moments = self.vae.encoder(images)
-        mean = moments[:, :ae_channels]
+    def _to_train_layout(self, z):
+        if is_ragged(z):
+            return RaggedBatch([self._latent_layout().to_train(item) for item in z])
+        return self._latent_layout().to_train(z)
 
-        patched = patchify_latents(mean, self.patch_size)
-        shift = self._latent_shift.to(patched.device, patched.dtype)
-        scale = self._latent_scale.to(patched.device, patched.dtype)
-        latents = (patched - shift) / scale
-        return latents.to(device, dtype=dtype)
+    def _from_train_layout(self, z):
+        if is_ragged(z):
+            return RaggedBatch([self._latent_layout().to_cache(item) for item in z])
+        return self._latent_layout().to_cache(z)
+
+    def add_noise(self, original_samples, noise, timesteps, **kwargs):
+        """The cache holds the canonical flux2 form; noising must happen in
+        the DiT's layout with the caller's N(0, I) noise -- an affine-mapped
+        noise component is not N(0, I), and that is a distribution the DiT
+        never saw. The noise itself passes through untouched: iid is
+        layout-agnostic, and get_loss_target below uses the same tensor."""
+        return super().add_noise(
+            self._to_train_layout(original_samples), noise, timesteps, **kwargs
+        )
+
+    def get_loss_target(self, *args, **kwargs):
+        noise = kwargs.get("noise")
+        batch = kwargs.get("batch")
+        # the prediction lives in the DiT's layout; the target's latent term
+        # must be converted to match. The noise term is already iid.
+        return (noise - self._to_train_layout(batch.latents)).detach()
 
     def decode_latents(self, latents: torch.Tensor, device=None, dtype=None):
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(self.vae_device_torch)
-
-        latents = latents.to(device, dtype=dtype)
-        shift = self._latent_shift.to(device, dtype)
-        scale = self._latent_scale.to(device, dtype)
-        patched = latents * scale + shift
-        z = unpatchify_latents(patched, self.patch_size)
-        images = self.vae.decoder(z)
-        return images
+        """Sampling and validation hand back DiT-layout latents; the vae
+        decodes the canonical form."""
+        return super().decode_latents(
+            self._from_train_layout(latents), device=device, dtype=dtype
+        )
 
     # ------------------------------------------------------------------
     # Saving / misc

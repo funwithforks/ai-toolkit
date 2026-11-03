@@ -5,6 +5,7 @@ import json
 import random
 import shutil
 from collections import OrderedDict
+from types import SimpleNamespace
 import os
 import re
 import traceback
@@ -1978,7 +1979,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
 
                 if self.sd.is_flow_matching:
-                    target = batch_noise - batch_latents
+                    if hasattr(self.sd, 'get_loss_target'):
+                        # the model owns the train-layout conversion of its
+                        # latents (the cache holds the shared canonical form);
+                        # a bare namespace is enough -- get_loss_target reads
+                        # batch.latents only
+                        target = self.sd.get_loss_target(
+                            noise=batch_noise,
+                            batch=SimpleNamespace(latents=batch_latents),
+                        ).detach()
+                    else:
+                        target = batch_noise - batch_latents
                 elif self.sd.prediction_type == 'v_prediction':
                     target = self.sd.noise_scheduler.get_velocity(batch_latents, batch_noise, timesteps)
                 else:
