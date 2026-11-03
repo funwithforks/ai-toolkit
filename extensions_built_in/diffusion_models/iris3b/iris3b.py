@@ -3,10 +3,10 @@
 
   - **Pixel space, no VAE.** The transformer denoises raw RGB (``in_channels=3``,
     ``patch_size=16``) through a 24-block hybrid trunk (8 dual-stream MM-DiT +
-    16 single-stream) and a 4-block per-pixel PiT head. ``_load_vae`` returns a
-    ``FakeVAE`` (identity): the toolkit's "latents" are the image in [-1, 1] and
-    the latent caches store pixels through the vae phase unchanged. Buckets snap
-    to 16 px. Architecture vendored in ``src/dit.py``.
+    16 single-stream) and a 4-block per-pixel PiT head. The ``iris3b`` vae_id
+    entry supplies a ``FakeVAE`` (identity): the toolkit's "latents" are the
+    image in [-1, 1] and the latent caches store pixels through the vae phase
+    unchanged. Buckets snap to 16 px. Architecture vendored in ``src/dit.py``.
   - **v-prediction rectified flow, shift 4.** Velocity = noise - clean on
     ``x_t = (1 - t) * clean + t * noise`` -- ai-toolkit's own convention, so no
     flip/negation (the process default flow-matching target is already the
@@ -52,7 +52,6 @@ from toolkit.basic import flush
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
-from toolkit.models.FakeVAE import FakeVAE
 from toolkit.models.phased_load import PhasedLoadMixin
 from toolkit.models.v2.resolver import resolve_component_file
 from toolkit.models.v2.text_encoders.qwen3_vl import Qwen3VLTextEncoder
@@ -131,6 +130,10 @@ def _resolve_checkpoint(
 class Iris3BModel(PhasedLoadMixin, BaseModel):
     arch = "iris3b"
     display_name = "Iris 3B"
+    # the vae is owned by its id, not by this class: PhasedLoadMixin.load_vae
+    # dispatches through the registered "iris3b" entry (iris3b_vae_id.py) --
+    # a FakeVAE (identity), since pixel space has no weights to resolve
+    vae_id = "iris3b"
 
     def __init__(
         self,
@@ -289,17 +292,6 @@ class Iris3BModel(PhasedLoadMixin, BaseModel):
         text_encoder.requires_grad_(False)
         flush()
         return tokenizer, text_encoder, {}
-
-    def _load_vae(self):
-        # pixel space: the identity vae makes every latent/decode touchpoint a
-        # pass-through. Cheap enough that the phase gates paying it is free,
-        # and routing "latents" through encode_images keeps future latent
-        # normalization in one place.
-        self.print_and_status_update("Preparing pixel-space VAE (identity)")
-        vae = FakeVAE(scaling_factor=1.0)
-        vae.eval()
-        vae.requires_grad_(False)
-        return vae
 
     def _build_pipeline(self):
         return Iris3BPipeline(self)

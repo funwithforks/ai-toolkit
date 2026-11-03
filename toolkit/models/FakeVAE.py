@@ -50,11 +50,20 @@ class FakeVAE(nn.Module):
 
     # mimic to from torch
     def to(self, *args, **kwargs):
-        # pull out dtype and device if they exist
+        # pull out dtype and device if they exist -- in keyword OR positional
+        # form, so the soft _device/_dtype mirrors track every real placement
+        # (the registry's placement step calls vae.to(device) positionally)
         if "dtype" in kwargs:
             self._dtype = kwargs["dtype"]
         if "device" in kwargs:
             self._device = kwargs["device"]
+        for a in args:
+            if isinstance(a, torch.dtype):
+                self._dtype = a
+            elif isinstance(a, torch.device):
+                self._device = a
+            elif isinstance(a, str):
+                self._device = torch.device(a)
         return super().to(*args, **kwargs)
 
     def enable_xformers_memory_efficient_attention(self):
@@ -133,3 +142,28 @@ class FakeVAE(nn.Module):
             return (dec,)
 
         return DecoderOutput(sample=dec)
+
+    # -- the vae does the vae work ------------------------------------------------
+    # Registry-facing surface for pixel-space models: the latents ARE the
+    # images in [-1, 1]. Device and precision come from the vae's own
+    # _device/_dtype, so a job's dtype cannot round what the latent cache
+    # stores. device/dtype say where the CALLER wants the result; they never
+    # change how it is computed.
+
+    @torch.no_grad()
+    def encode_images(self, image_list, device=None, dtype=None) -> torch.FloatTensor:
+        """Images (C, H, W) in [-1, 1], or a stacked batch -> the same
+        tensor: identity encode."""
+        if isinstance(image_list, (list, tuple)):
+            batch = torch.stack([img.to(self.device, self.dtype) for img in image_list])
+        else:
+            batch = image_list.to(self.device, self.dtype)
+        return batch if device is None and dtype is None else batch.to(device, dtype=dtype)
+
+    def decode_latents(self, latents: torch.FloatTensor, device=None, dtype=None) -> torch.FloatTensor:
+        """Identity decode: latents -> the same tensor. Left differentiable
+        on purpose -- pixel-space losses may backprop through it, matching
+        the legacy path's semantics. Range post-processing (the [-1, 1]
+        export clamp) belongs to the caller, not the vae."""
+        images = latents.to(self.device, self.dtype)
+        return images if device is None and dtype is None else images.to(device, dtype=dtype)
