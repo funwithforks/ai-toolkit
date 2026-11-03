@@ -1091,7 +1091,7 @@ class SDTrainer(BaseSDTrainProcess):
                     
                     stepped_latents = torch.cat(stepped_chunks, dim=0)
                     
-                stepped_latents = stepped_latents.to(self.sd.vae.device, dtype=self.sd.vae.dtype)
+                stepped_latents = stepped_latents.to(self.device_torch, dtype=self.sd.vae.dtype)
                 sl = stepped_latents
                 if len(sl.shape) == 5:
                     # video B,C,T,H,W
@@ -1101,7 +1101,7 @@ class SDTrainer(BaseSDTrainProcess):
                 pred_features = self.dfe(sl.float())
                 with torch.no_grad():
                     bl = batch.latents
-                    bl = bl.to(self.sd.vae.device)
+                    bl = bl.to(self.device_torch)
                     if len(bl.shape) == 5:
                         # video B,C,T,H,W
                         bl = bl.permute(0, 2, 1, 3, 4)  # B,T,C,H,W

@@ -168,6 +168,18 @@ class DiffusionFeatureExtractor(nn.Module):
 
 
 class DiffusionFeatureExtractor3(nn.Module):
+    @property
+    def device(self) -> torch.device:
+        """This extractor's own compute device. The vae is not the oracle:
+        the memory machinery parks it on cpu between phases (tracked
+        truthfully by its device mirror), while the feature modules live
+        where the trainer placed them."""
+        for p in self.parameters():
+            return p.device
+        for b in self.buffers():
+            return b.device
+        return torch.device("cpu")
+
     def __init__(self, device=torch.device("cuda"), dtype=torch.bfloat16, vae=None, sd: BaseModel = None):
         super().__init__()
         self.version = 3
@@ -196,7 +208,7 @@ class DiffusionFeatureExtractor3(nn.Module):
         
     def get_siglip_features(self, tensors_0_1):
         dtype = torch.bfloat16
-        device = self.vae.device
+        device = self.device
         # resize to 384x384
         if 'height' in self.image_processor.size:
             size = self.image_processor.size['height']
@@ -223,7 +235,7 @@ class DiffusionFeatureExtractor3(nn.Module):
         return last_hidden_state
     
     def get_lpips_features(self, tensors_0_1):
-        device = self.vae.device
+        device = self.device
         tensors_n1p1 = (tensors_0_1 * 2) - 1
         def get_lpips_features(img):  # -1 to 1
             in0_input = self.lpips_model.scaling_layer(img)
@@ -268,7 +280,7 @@ class DiffusionFeatureExtractor3(nn.Module):
         model=None
     ):
         dtype = torch.bfloat16
-        device = self.vae.device
+        device = self.device
         
         
         if model is not None and hasattr(model, 'get_stepped_pred'):
@@ -297,7 +309,7 @@ class DiffusionFeatureExtractor3(nn.Module):
             
             stepped_latents = torch.cat(stepped_chunks, dim=0)
             
-        latents = stepped_latents.to(self.vae.device, dtype=self.vae.dtype)
+        latents = stepped_latents.to(self.device, dtype=self.vae.dtype)
         
         scaling_factor = self.vae.config.scaling_factor if hasattr(self.vae.config, 'scaling_factor') else 1.0
         shift_factor = self.vae.config.shift_factor if hasattr(self.vae.config, 'shift_factor') else 0.0
@@ -372,6 +384,15 @@ class DiffusionFeatureExtractor3(nn.Module):
         return total_loss
 
 class DiffusionFeatureExtractor4(nn.Module):
+    @property
+    def device(self) -> torch.device:
+        """See DiffusionFeatureExtractor3.device."""
+        for p in self.parameters():
+            return p.device
+        for b in self.buffers():
+            return b.device
+        return torch.device("cpu")
+
     def __init__(self, device=torch.device("cuda"), dtype=torch.bfloat16, vae=None, sd: BaseModel = None):
         super().__init__()
         self.version = 4
@@ -467,7 +488,7 @@ class DiffusionFeatureExtractor4(nn.Module):
         
     def get_siglip_features(self, tensors_0_1):
         dtype = torch.bfloat16
-        device = self.vae.device
+        device = self.device
         
         tensors_0_1 = torch.clamp(tensors_0_1, 0.0, 1.0)
 
@@ -527,7 +548,7 @@ class DiffusionFeatureExtractor4(nn.Module):
         model=None
     ):
         dtype = torch.bfloat16
-        device = self.vae.device
+        device = self.device
         tensors = batch.tensor.to(device, dtype=dtype)
         is_video = False
         if len(noise_pred.shape) == 5:
@@ -560,7 +581,7 @@ class DiffusionFeatureExtractor4(nn.Module):
 
             stepped_latents = x0
 
-        latents = stepped_latents.to(self.vae.device, dtype=self.vae.dtype)
+        latents = stepped_latents.to(self.device, dtype=self.vae.dtype)
 
         scaling_factor = self.vae.config.scaling_factor if hasattr(self.vae.config, 'scaling_factor') else 1.0
         shift_factor = self.vae.config.shift_factor if hasattr(self.vae.config, 'shift_factor') else 0.0
@@ -670,6 +691,15 @@ class DiffusionFeatureExtractor5(DiffusionFeatureExtractor4):
 
 
 class DiffusionFeatureExtractor6(nn.Module):
+    @property
+    def device(self) -> torch.device:
+        """See DiffusionFeatureExtractor3.device."""
+        for p in self.parameters():
+            return p.device
+        for b in self.buffers():
+            return b.device
+        return torch.device("cpu")
+
     def __init__(self, device=torch.device("cuda"), dtype=torch.bfloat16, vae=None, sd: BaseModel = None):
         super().__init__()
         self.version = 6
@@ -759,7 +789,7 @@ class DiffusionFeatureExtractor6(nn.Module):
         model=None
     ):
         dtype = torch.bfloat16
-        device = self.vae.device
+        device = self.device
         tensors = batch.tensor.to(device, dtype=dtype)
         is_video = False
         if len(noise_pred.shape) == 5:
@@ -789,7 +819,7 @@ class DiffusionFeatureExtractor6(nn.Module):
         
         stepped_latents = x0
             
-        latents = stepped_latents.to(self.vae.device, dtype=self.vae.dtype)
+        latents = stepped_latents.to(self.device, dtype=self.vae.dtype)
 
         scaling_factor = self.vae.config.scaling_factor if hasattr(self.vae.config, 'scaling_factor') else 1.0
         shift_factor = self.vae.config.shift_factor if hasattr(self.vae.config, 'shift_factor') else 0.0
@@ -860,6 +890,15 @@ class ModelOutputWrapper:
     
 
 class DiffusionFeatureExtractor7(nn.Module):
+    @property
+    def device(self) -> torch.device:
+        """See DiffusionFeatureExtractor3.device."""
+        for p in self.parameters():
+            return p.device
+        for b in self.buffers():
+            return b.device
+        return torch.device("cpu")
+
     def __init__(
         self, 
         device=torch.device("cuda"), 
@@ -936,7 +975,7 @@ class DiffusionFeatureExtractor7(nn.Module):
         model=None
     ):
         dtype = torch.bfloat16
-        device = self.sd_ref().vae.device
+        device = self.device
         tensors = batch.tensor.to(device, dtype=dtype)
         is_video = False
         if len(noise_pred.shape) == 5:
@@ -977,7 +1016,7 @@ class DiffusionFeatureExtractor7(nn.Module):
             
             with torch.no_grad():
                 # make a noisy target at next timestep
-                target_latents = batch.latents.to(self.sd_ref().vae.device, dtype=self.sd_ref().vae.dtype)
+                target_latents = batch.latents.to(self.device, dtype=self.sd_ref().vae.dtype)
                 # add noise
                 target_latents = (1.0 - next_step) * target_latents + next_step * noise
                 target_n1p1 = self.sd_ref().decode_latents(target_latents)
@@ -985,7 +1024,7 @@ class DiffusionFeatureExtractor7(nn.Module):
                     target_n1p1 = _fold_frames_to_batch(target_n1p1)
                 target_0_1 = (target_n1p1 + 1) / 2  # 0 to 1
 
-        latents = stepped_latents.to(self.sd_ref().vae.device, dtype=self.sd_ref().vae.dtype)
+        latents = stepped_latents.to(self.device, dtype=self.sd_ref().vae.dtype)
         
         tensors_n1p1 = self.sd_ref().decode_latents(latents)
         if is_video:
@@ -1079,6 +1118,15 @@ class DiffusionFeatureExtractor8(DiffusionFeatureExtractor7):
         self.version = 8
 
 class DiffusionFeatureExtractor9(nn.Module):
+    @property
+    def device(self) -> torch.device:
+        """See DiffusionFeatureExtractor3.device."""
+        for p in self.parameters():
+            return p.device
+        for b in self.buffers():
+            return b.device
+        return torch.device("cpu")
+
     def __init__(
         self, 
         device=torch.device("cuda"), 
@@ -1140,7 +1188,7 @@ class DiffusionFeatureExtractor9(nn.Module):
         model=None
     ):
         dtype = torch.bfloat16
-        device = self.sd_ref().vae.device
+        device = self.device
         tensors = batch.tensor.to(device, dtype=dtype)
         is_video = False
         if len(noise_pred.shape) == 5:
@@ -1181,7 +1229,7 @@ class DiffusionFeatureExtractor9(nn.Module):
 
             with torch.no_grad():
                 # make a noisy target at next timestep
-                target_latents = batch.latents.to(self.sd_ref().vae.device, dtype=self.sd_ref().vae.dtype)
+                target_latents = batch.latents.to(self.device, dtype=self.sd_ref().vae.dtype)
                 # add noise
                 target_latents = (1.0 - next_step) * target_latents + next_step * noise
                 target_n1p1 = self.sd_ref().decode_latents(target_latents)
@@ -1189,7 +1237,7 @@ class DiffusionFeatureExtractor9(nn.Module):
                     target_n1p1 = _fold_frames_to_batch(target_n1p1)
                 target_0_1 = (target_n1p1 + 1) / 2  # 0 to 1
 
-        latents = stepped_latents.to(self.sd_ref().vae.device, dtype=self.sd_ref().vae.dtype)
+        latents = stepped_latents.to(self.device, dtype=self.sd_ref().vae.dtype)
         
         tensors_n1p1 = self.sd_ref().decode_latents(latents)
         if is_video:
@@ -1238,6 +1286,15 @@ class DiffusionFeatureExtractor9(nn.Module):
         return loss_perceptual
 
 class DiffusionFeatureExtractor10(nn.Module):
+    @property
+    def device(self) -> torch.device:
+        """See DiffusionFeatureExtractor3.device."""
+        for p in self.parameters():
+            return p.device
+        for b in self.buffers():
+            return b.device
+        return torch.device("cpu")
+
     def __init__(
         self,
         device=torch.device("cuda"),
@@ -1303,7 +1360,7 @@ class DiffusionFeatureExtractor10(nn.Module):
         model=None
     ):
         dtype = torch.bfloat16
-        device = self.sd_ref().vae.device
+        device = self.device
         tensors = batch.tensor.to(device, dtype=dtype)
         is_video = False
         if len(noise_pred.shape) == 5:
@@ -1344,7 +1401,7 @@ class DiffusionFeatureExtractor10(nn.Module):
 
             with torch.no_grad():
                 # make a noisy target at next timestep
-                target_latents = batch.latents.to(self.sd_ref().vae.device, dtype=self.sd_ref().vae.dtype)
+                target_latents = batch.latents.to(self.device, dtype=self.sd_ref().vae.dtype)
                 # add noise
                 target_latents = (1.0 - next_step) * target_latents + next_step * noise
                 target_n1p1 = self.sd_ref().decode_latents(target_latents)
@@ -1352,7 +1409,7 @@ class DiffusionFeatureExtractor10(nn.Module):
                     target_n1p1 = _fold_frames_to_batch(target_n1p1)
                 target_0_1 = (target_n1p1 + 1) / 2  # 0 to 1
 
-        latents = stepped_latents.to(self.sd_ref().vae.device, dtype=self.sd_ref().vae.dtype)
+        latents = stepped_latents.to(self.device, dtype=self.sd_ref().vae.dtype)
 
         tensors_n1p1 = self.sd_ref().decode_latents(latents)
         if is_video:
