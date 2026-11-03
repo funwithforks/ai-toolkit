@@ -275,6 +275,39 @@ vae module's owner says so — the id's cache directory is then cleared,
 full stop. No version strings, no migration code. Quality is the goal;
 identity only proves the move itself changed nothing.
 
+**A model on an id may consume a different packing or normalization.**
+The cache holds the vae's own encode output; a model whose DiT was
+trained on a different channel packing or normalization of those same
+latents converts at its own boundaries — `add_noise` (before noising),
+`get_loss_target`, and `decode_latents` — and never on the cache path,
+so one cache still serves every model on the id (ideogram4 is the
+reference). The noising order is forced, not stylistic: the DiT was
+trained on `x_t = (1-sigma) * latent + sigma * noise` with N(0, I)
+noise in its own layout, and an affine-mapped noise component is not
+N(0, I) — converting after noising shifts the training distribution.
+The validation loss target routes through `get_loss_target` when the
+model declares one, so val/loss measures the space the train step does.
+Conversion constants come from the vae's own running stats — the
+resident module's buffers, or a header read of the resolved file on
+warm runs that never load the vae. Never hardcode the stats.
+
+**An id may have no weights at all.** A pixel-space model's entry
+constructs its identity vae instead of resolving a file
+(`iris3b_vae_id.py` + `FakeVAE.encode_images`/`decode_latents`); the
+comfy door is never exercised, and range post-processing (an export
+clamp) stays with the caller. FakeVAE's device mirror tracks positional
+`.to()` placements — the registry's placement step is positional.
+
+**Rollout status (marked 2026-11-03).** `minimax_h3` is the migration
+with live phased-run verification (Stage A byte identity, 40/40 files,
+plus the phases ladder). `iris3b` and `ideogram4` are complete at the
+code plus unit-verification level — identity smoke for the former; the
+layout affine measured at ~2e-7 against the native math on the real
+checkpoint, both directions, cold and warm-header, through the
+`Comfy-Org/Ideogram-4` door path — and the owner declined the live
+acceptance runs: no live phased run of either model has happened.
+Treat the first real training run of either as the shakedown.
+
 ## 6. Where the pieces live
 
 | Concern | Anchor |
@@ -286,7 +319,9 @@ identity only proves the move itself changed nothing.
 | Cache identity = vae_id (loud refusal without one) | `data_loader.py` (latent cache keying) |
 | Reference vae_id migration (bundle, vendored loaders, encode/decode as bundle methods, kill-list) | `minimax_h3/minimax_h3_vae_id.py` + `MiniMaxH3VaeBundle` in `minimax_h3.py` |
 | Reference single-vae migration (vendored loader + vendored config, encode/decode as vae methods) | `toolkit/models/v2/vae/qwen_image.py` (the `qwen_image` id; krea2 declares it) |
-| Reference shared-file id (one physical file, three declaring models) | `toolkit/models/v2/vae/flux2_kl.py` (the `flux2` id; flux3, fibo2, moss_image declare it) |
+| Reference shared-file id (one physical file, four declaring models) | `toolkit/models/v2/vae/flux2_kl.py` (the `flux2` id; flux3, fibo2, moss_image, ideogram4 declare it) |
+| Reference layout-converting model (shared cache; converts at the noising/target/decode boundaries) | `ideogram4/src/latent_layout.py` + the `add_noise`/`get_loss_target`/`decode_latents` overrides in `ideogram4.py` (the `flux2` id) |
+| Reference identity/no-weights id (constructs its vae; the comfy door is never exercised) | `iris3b/iris3b_vae_id.py` + `FakeVAE.encode_images/decode_latents` (the `iris3b` id) |
 | Lifecycle phase selection (`phases`) | `config_modules.py` `TrainConfig.phases`; guards/exits in `BaseSDTrainProcess.run()` |
 | Lazy reader, per-key placement | `weight_source.py:25` `:90` |
 | Stream-to-meta-shell reference | `ltx2.py:1609` `_stream_load`, `:1593` `_remap_file_key` |
