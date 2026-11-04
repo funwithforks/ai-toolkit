@@ -70,12 +70,24 @@ def fast_chunk_gated_delta_rule(
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
     final_state_dtype=None,
+    ut_inverse: str = "series",
 ):
     """(B, L, H, D) in, (B, L, H, D) out -- the tower's own dtype at the
     boundary, fp32 for every matmul and the carry inside (see module
     docstring for why). final_state_dtype overrides the boundary dtype for
     the carried state only (callers with an fp32 state cache pass
-    torch.float32; the default keeps the tower's own-dtype behavior)."""
+    torch.float32; the default keeps the tower's own-dtype behavior).
+
+    ut_inverse: "series" (default) evaluates (I - M)^-1 as the log2
+    doubling of the geometric series -- the installed tower path's
+    established numerics, unchanged. "solve" evaluates it as one batched
+    triangular solve instead: algebraically identical, but its
+    intermediates never exceed the result's scale, which the doubling's
+    M^k terms do (they grow with the intra-chunk path count and must
+    cancel -- a cancellation fp32 cannot resolve when adjacent keys
+    collide, measured on qwen38 media activations as a 5.6e2-per-token
+    training loss against ~3.1). Opt-in per caller; the tower keeps
+    "series"."""
     wd = query.dtype
     rd = torch.float32
     query, key, value = [x.to(rd) for x in (query, key, value)]
@@ -127,14 +139,20 @@ def fast_chunk_gated_delta_rule(
     # (I - M)^-1 exactly -- the same forward-substitution result, evaluated
     # as log2(chunk_size) doubling steps instead of a loop.
     eye = torch.eye(chunk_size, dtype=m.dtype, device=m.device)
-    t_matrix = eye + m  # 2 terms: I + M
-    e = m @ m  # M^k, k = 2
-    k = 2
-    while k < chunk_size:
-        t_matrix = t_matrix + t_matrix @ e  # -> 2k terms
-        e = e @ e
-        k *= 2
-    del e
+    if ut_inverse == "solve":
+        # one batched triangular solve; see the docstring for why the
+        # doubling's M^k intermediates are not resolvable in fp32 on
+        # collision-heavy activations
+        t_matrix = torch.linalg.solve_triangular(eye - m, eye, upper=False, unitriangular=True)
+    else:
+        t_matrix = eye + m  # 2 terms: I + M
+        e = m @ m  # M^k, k = 2
+        k = 2
+        while k < chunk_size:
+            t_matrix = t_matrix + t_matrix @ e  # -> 2k terms
+            e = e @ e
+            k *= 2
+        del e
     value = t_matrix @ v_beta
     k_cumdecay = t_matrix @ (k_beta * g.exp().unsqueeze(-1))
     _probe("gdn_ut", m, m, t_matrix, value, k_cumdecay)

@@ -271,6 +271,7 @@ class GatedDeltaNet(nn.Module):
         core, final = fast_chunk_gated_delta_rule(
             q, k, v, g=g, beta=beta, initial_state=None, output_final_state=cache is not None,
             use_qk_l2norm_in_kernel=True, final_state_dtype=torch.float32,
+            ut_inverse="solve",
         )
         if cache is not None:
             cache.rec.copy_(final)
