@@ -178,7 +178,8 @@ def _get_kernels():
     global _kernels
     if _kernels is not None:
         return _kernels
-    triton, tl, libdevice = _import_triton()
+    triton, tl = _import_triton()
+    from triton.language.extra.cuda import libdevice
 
     @triton.jit
     def _fp8_rep8(s_u8):
@@ -528,7 +529,25 @@ class ConvRotW4A8Quantizer(ConvRotInt8Quantizer):
     def _srel(self, module) -> torch.Tensor:
         return module.cw4_srel.view(torch.float8_e4m3fn)
 
-    def _linear_ste(self, module, x2d: torch.Tensor, out_dtype: str) -> torch.Tensor:
+    def _linear_ste(
+        self,
+        module,
+        x2d: torch.Tensor,
+        out_dtype: str,
+        cr8_lora: tuple | None = None,
+        cr8_lora2: tuple | None = None,
+    ) -> torch.Tensor:
+        """The W4A8 STE path has no lora epilogue fold (the parent's has): the
+        mixin's fold predicate requires cr8_qdata, which cw4 modules do not
+        carry, so a non-None fold here is a predicate regression and is
+        refused rather than silently dropped. None (the common case) is the
+        plain int8 STE."""
+        if cr8_lora is not None or cr8_lora2 is not None:
+            raise RuntimeError(
+                "ConvRotW4A8Quantizer: a lora epilogue fold was offered but the "
+                "W4A8 backend does not consume it -- the fold predicate should "
+                "never fire for cw4 modules"
+            )
         return _w4a8_linear_ste_op(
             x2d, module.cw4_qdata, module.cw4_srel, module.cw4_codebook, module.cw4_scales,
             module.bias, module.cw4_group_size, self.act_qmax, out_dtype,
@@ -591,11 +610,17 @@ class ConvRotW4A8Quantizer(ConvRotInt8Quantizer):
         )
         return out.reshape(*shape[:-1], module.out_features)
 
-    def forward(self, module, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, module, x: torch.Tensor, cr8_lora=None, cr8_lora2=None) -> torch.Tensor:
+        """cr8_lora/cr8_lora2 are accepted for signature compatibility with
+        OstrisLinear.forward (which passes them whenever the backend inherits
+        accepts_cr8_lora). The W4A8 epilogue does not fold the lora epilogue:
+        the mixin's fold predicate requires cr8_qdata, which cw4 modules do
+        not carry, so a non-None fold here means a predicate regression and
+        is refused rather than silently dropped."""
         if self.gemv_ok(module, x):
             xq, xs = self.prepare_act(module, x)
             return self.gemv_prepared(module, xq, xs, x.shape, x.dtype)
-        return super().forward(module, x)
+        return super().forward(module, x, cr8_lora=cr8_lora, cr8_lora2=cr8_lora2)
 
 
 def module_is_plain(mod) -> bool:

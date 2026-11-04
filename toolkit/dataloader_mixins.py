@@ -1137,11 +1137,6 @@ class ImageProcessingDTOMixin:
             transform: Union[None, transforms.Compose],
             only_load_latents=False
     ):
-        if getattr(self, "is_conversation", False):
-            raise RuntimeError(
-                f"conversation item {self.path} has no media tensor; the "
-                "holder's encode_conversation assembles it at cache time"
-            )
         # handle get_prompt_embedding
         if self.is_text_embedding_cached:
             self.load_prompt_embedding()
@@ -1162,6 +1157,11 @@ class ImageProcessingDTOMixin:
                 if self.has_unconditional:
                     self.load_unconditional_image()
                 return
+        if getattr(self, "is_conversation", False):
+            raise RuntimeError(
+                f"conversation item {self.path} has no media tensor; its "
+                "training sequence comes from the phase-1 artifact"
+            )
         if self.is_audio_model:
             self.load_and_process_audio()
             return

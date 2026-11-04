@@ -366,8 +366,12 @@ class Qwen38LLM(PhasedLoadMixin, BaseModel):
     # ------------------------------------------------------------------
     def _lm_loss(self, ids, media, position_ids, loss_start: int):
         model = self.model
-        embeds = build_sequence_embeds(model, ids, media, [self._placeholder[KIND_IMAGE]])
-        hidden = model.forward_hidden(embeds, position_ids)[0, loss_start - 1 : -1]
+        # the placeholder id comes from the config, not the template: on a warm
+        # run load_vae never ran, and the train step needs nothing else from it
+        embeds = build_sequence_embeds(model, ids, media, [self._config.image_token_id])
+        # the rope expects [3, B, T] (the get_rope_index contract); the cached
+        # artifact stores [3, T] per item
+        hidden = model.forward_hidden(embeds, position_ids.view(3, 1, -1))[0, loss_start - 1 : -1]
         targets = ids[loss_start:]
         lm_head = model.lm_head
 

@@ -104,7 +104,14 @@ class InterleavedMRope(nn.Module):
         """position_ids [3, B, T] -> cos, sin [B, T, rotary_dim]."""
         pos = position_ids.float()
         freqs = pos[..., None] * self.inv_freq.float()[None, None, None, :]  # [3,B,T,half]
-        freqs = torch.gather(freqs, 0, self.axis.view(1, 1, 1, -1).expand(1, *freqs.shape[1:]))[0]
+        index = self.axis.view(1, 1, 1, -1).expand(1, *freqs.shape[1:])
+        if int(index.max()) >= freqs.shape[0] or int(index.min()) < 0:
+            raise RuntimeError(
+                f"qwen38 rope gather OOB: index values {int(index.min())}..{int(index.max())} "
+                f"vs src dim0 {freqs.shape[0]}; position_ids shape {tuple(position_ids.shape)}; "
+                f"axis buffer {self.axis.tolist()[:8]}..."
+            )
+        freqs = torch.gather(freqs, 0, index)[0]
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos().to(dtype), emb.sin().to(dtype)
 
