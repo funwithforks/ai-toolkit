@@ -2447,7 +2447,11 @@ class LatentCachingMixin:
             try:
                 # waveforms stay fp32 into the audio encoder (bf16 mantissa is ~48 dB of noise)
                 imgs = file_item.tensor.unsqueeze(0).to(device, dtype=torch.float32 if file_item.is_audio_model else dtype)
-                latent = self.sd.encode_images(imgs)
+                # caching is inference by definition: the no_grad lives here so
+                # models with grad-capable encoders (future tower-LoRA) don't
+                # retain graphs during the pass
+                with torch.no_grad():
+                    latent = self.sd.encode_images(imgs)
                 # a model can return a DTO carrying extra streams alongside the latent
                 latent = latent.map(lambda t: t.squeeze(0)) if isinstance(latent, DTO) else latent.squeeze(0)
                 if to_disk:
@@ -2476,7 +2480,8 @@ class LatentCachingMixin:
                     first_frames = frames[:, 0]
                 else:
                     raise ValueError(f"Unknown frame shape {frames.shape}")
-                first_frame_latent = self.sd.encode_images(first_frames).squeeze(0)
+                with torch.no_grad():
+                    first_frame_latent = self.sd.encode_images(first_frames).squeeze(0)
                 if to_disk:
                     if cache_uint8:
                         state_dict['first_frame_latent'] = _latent_to_uint8(first_frame_latent).cpu()

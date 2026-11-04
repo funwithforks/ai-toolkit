@@ -46,6 +46,7 @@ from toolkit.basic import flush
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.dto import DTO
 from toolkit.models.base_model import BaseModel
+from toolkit.models.phased_load import PhasedLoadMixin
 from toolkit.models.v2.resolver import resolve_component_file
 from toolkit.print import print_acc
 
@@ -67,9 +68,14 @@ def _media_kind(path: str) -> int:
     return KIND_VIDEO if ext in VIDEO_EXTS else KIND_IMAGE
 
 
-class Qwen38LLM(BaseModel):
+class Qwen38LLM(PhasedLoadMixin, BaseModel):
     arch = "qwen38"
     is_llm = True
+    # the vision tower is the vae: its embeddings are the cached "latents"
+    # (a DTO with the media span + MRoPE grid), so phase 1 loads only the
+    # tower and the iron rule frees it; phase 3 builds the language stack
+    # without it (qwen38_vae_id.py registers the entry)
+    vae_id = "qwen38"
     # the data loader accepts image and video files in one dataset
     is_multimodal_llm = True
     sample_rate = 16000
@@ -109,11 +115,47 @@ class Qwen38LLM(BaseModel):
             return extras
         return BASE_REPO
 
+    def _cfg_src(self) -> str:
+        """The config/processor source: an explicit extras path, else the
+        checkpoint itself when it is a local dir or repo id (it ships the
+        processor files), else the base repo."""
+        cfg_src = self._config_source()
+        name_or_path = self.model_config.name_or_path or DEFAULT_CHECKPOINT
+        if not name_or_path.endswith(".safetensors"):
+            if os.path.isdir(name_or_path) or "/" in name_or_path:
+                cfg_src = name_or_path if self.model_config.extras_name_or_path in (None, "", name_or_path) else cfg_src
+        return cfg_src
+
+    def _checkpoint_path(self) -> str:
+        """The qwen38 checkpoint through the MODELS_PATH-first door, shared by
+        the vision-tower (vae) and transformer phases so both read the same
+        file."""
+        name_or_path = self.model_config.name_or_path or DEFAULT_CHECKPOINT
+        if name_or_path.endswith(".safetensors"):
+            return resolve_component_file(
+                name_or_path, folder="text_encoders", component="qwen3.8"
+            )
+        return name_or_path
+
+    def _load_processor(self, cfg_src: str):
+        self.processor = AutoProcessor.from_pretrained(cfg_src)
+        self.tokenizer = self.processor.tokenizer
+
+    def load_vae(self):
+        """Phase 1: the vision tower via the registry, plus the config,
+        processor and chat template the encoding pass needs. The model is not
+        built in this phase, so the template reads the config object."""
+        cfg_src = self._cfg_src()
+        self._config = AutoConfig.from_pretrained(cfg_src)
+        super().load_vae()  # the registry entry streams the tower into self.vae
+        self._load_processor(cfg_src)
+        self._build_template()
+
     def load_model(self):
         dtype = self.torch_dtype
         device = self.device_torch
         name_or_path = self.model_config.name_or_path or DEFAULT_CHECKPOINT
-        cfg_src = self._config_source()
+        cfg_src = self._cfg_src()
         want_quant = self.model_config.quantize
         qtype = self.model_config.qtype
         if self.model_config.layer_offloading and self.model_config.layer_offloading_transformer_percent > 0:
@@ -121,16 +163,13 @@ class Qwen38LLM(BaseModel):
 
         from .src.qwen38_load import dequantize_vision_tower, load_qwen38
 
+        source = self._checkpoint_path()
         if name_or_path.endswith(".safetensors"):
-            ckpt = resolve_component_file(name_or_path, folder="text_encoders", component="qwen3.8")
-            self.print_and_status_update(f"Loading Qwen3.8 from {os.path.basename(ckpt)}")
-            source = ckpt
+            self.print_and_status_update(f"Loading Qwen3.8 from {os.path.basename(source)}")
         else:
             self.print_and_status_update(f"Loading Qwen3.8 from {name_or_path}")
-            source = name_or_path
-            if os.path.isdir(name_or_path) or "/" in name_or_path:
-                cfg_src = name_or_path if self.model_config.extras_name_or_path in (None, "", name_or_path) else cfg_src
         config = AutoConfig.from_pretrained(cfg_src)
+        self._config = config
         model, prequantized = load_qwen38(source, config, dtype, device, status_fn=self.print_and_status_update)
         if prequantized:
             model.aitk_is_quantized = True
@@ -138,7 +177,7 @@ class Qwen38LLM(BaseModel):
                 print_acc(f"Checkpoint is pre-quantized (W4A8 / int8 convrot); keeping it instead of {qtype}")
             want_quant = False
         if self.vision_bf16 and prequantized:
-            n = dequantize_vision_tower(model, dtype)
+            n = dequantize_vision_tower(model.model.visual, dtype)
             print_acc(f"Vision tower: {n} int8 linears dequantized to {dtype} (model_kwargs.vision_bf16)")
         model.eval()
         model.requires_grad_(False)
@@ -151,8 +190,7 @@ class Qwen38LLM(BaseModel):
             flush()
         self.model = model
         self.model.generator = Qwen38Generator(model, use_cuda_graph=self.cuda_graph)
-        self.processor = AutoProcessor.from_pretrained(cfg_src)
-        self.tokenizer = self.processor.tokenizer
+        self._load_processor(cfg_src)
         self.text_encoder = None
         self.vae = None
         self.pipeline = self
@@ -185,10 +223,12 @@ class Qwen38LLM(BaseModel):
             KIND_VIDEO: text.replace(span, "<|vision_start|><|video_pad|><|vision_end|>").replace(mark, "x"),
         }
         self._tail_ids = enc(mid + "x" + after)
-        cfg = self.model.config
+        cfg = self._config
         self._placeholder = {KIND_IMAGE: cfg.image_token_id, KIND_VIDEO: cfg.video_token_id}
         self._im_end = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         self._eos_ids = [self._im_end, self.tokenizer.convert_tokens_to_ids("<|endoftext|>")]
+        # job constant: tokenized once, spliced per step in _sequence
+        self._instruction_ids = self.tokenizer(self.instruction, add_special_tokens=False).input_ids
 
     def get_transformer_block_names(self) -> Optional[List[str]]:
         return ["model.language_model.layers"]
@@ -235,13 +275,32 @@ class Qwen38LLM(BaseModel):
             grid_thw=torch.tensor([list(grid)], dtype=torch.int32, device=dev),
         )
 
-    @torch.no_grad()
+    def _vision(self):
+        """The tower: the registry vae when the phased path loaded it (the
+        only owner there -- the model is built without the tower in phase 3),
+        else the all-at-once model that still nests it."""
+        if self.vae is not None:
+            return self.vae
+        if self.model is None:
+            raise RuntimeError(
+                "qwen38: no vision tower resident -- the phase gate decides "
+                "when load_vae() runs; training on uncached latents needs "
+                "vae_training_mode='keep'"
+            )
+        return self.model
+
     def encode_images(self, image_list: torch.Tensor, device=None, dtype=None):
-        """[1, 3, H, W] image in [-1, 1] | [1, F, 3, H, W] frames."""
+        """[1, 3, H, W] image in [-1, 1] | [1, F, 3, H, W] frames.
+
+        No grad policy here -- the caller decides. The latent-cache pass runs
+        under its own no_grad (dataloader_mixins guards the call sites); a
+        future tower-LoRA train step backprops through this via get_llm_loss's
+        uncached fallback."""
         if image_list.shape[0] != 1:
             raise ValueError("qwen38 encodes one item at a time (batch_size 1)")
-        if self.model.device == torch.device("cpu"):
-            self.model.to(self.device_torch)
+        tower = self._vision()
+        if tower.device == torch.device("cpu"):
+            tower.to(self.device_torch)
         x = image_list[0]
         if x.ndim == 2:
             raise ValueError("qwen38 does not take audio")
@@ -265,7 +324,7 @@ class Qwen38LLM(BaseModel):
         pil = Image.fromarray(self._to_uint8(img))
         inputs = self.processor(text=self._probe[KIND_IMAGE], images=[pil], return_tensors="pt", min_pixels=self.min_pixels, max_pixels=self.max_pixels)
         grid = inputs["image_grid_thw"]
-        feats = self.model.get_image_features(inputs["pixel_values"].to(self.device_torch), grid.to(self.device_torch))
+        feats = self._vision().get_image_features(inputs["pixel_values"].to(self.device_torch), grid.to(self.device_torch))
         ids, types = self._span(inputs["input_ids"], inputs["mm_token_type_ids"])
         return self._pack(feats, ids, types, KIND_IMAGE, grid[0].tolist())
 
@@ -276,7 +335,7 @@ class Qwen38LLM(BaseModel):
             min_pixels=self.min_pixels, max_pixels=self.max_pixels,
         )
         grid = inputs["video_grid_thw"]
-        feats = self.model.get_image_features(inputs["pixel_values_videos"].to(self.device_torch), grid.to(self.device_torch))
+        feats = self._vision().get_image_features(inputs["pixel_values_videos"].to(self.device_torch), grid.to(self.device_torch))
         ids, types = self._span(inputs["input_ids"], inputs["mm_token_type_ids"])
         return self._pack(feats, ids, types, KIND_VIDEO, grid[0].tolist())
 
@@ -285,9 +344,8 @@ class Qwen38LLM(BaseModel):
     # ------------------------------------------------------------------
     def _sequence(self, media_ids: torch.Tensor, media_types: torch.Tensor, caption: str):
         """ids [L], token types [L] and the index where the caption (loss span) starts."""
-        instr = self.tokenizer(self.instruction, add_special_tokens=False).input_ids
         target = self.tokenizer(caption, add_special_tokens=False).input_ids + [self._im_end]
-        head = self._prefix_ids + media_ids.tolist() + self._mid_ids + instr + self._after_ids
+        head = self._prefix_ids + media_ids.tolist() + self._mid_ids + self._instruction_ids + self._after_ids
         ids = torch.tensor(head + target, dtype=torch.long, device=self.device_torch)
         types = torch.zeros_like(ids)
         p = len(self._prefix_ids)
@@ -379,6 +437,9 @@ class Qwen38LLM(BaseModel):
     @torch.no_grad()
     def generate_from_inputs(self, prepared: dict, max_new_tokens: Optional[int] = None, mtp_depth: Optional[int] = None) -> List[int]:
         """GPU half of caption(): vision tower, prefill and decode. Returns token ids."""
+        tower = self._vision()
+        if tower.device == torch.device("cpu"):
+            tower.to(self.device_torch)
         if self.model.device == torch.device("cpu"):
             self.model.to(self.device_torch)
         kind, inputs = prepared["kind"], prepared["inputs"]
@@ -389,10 +450,10 @@ class Qwen38LLM(BaseModel):
         image_grid = video_grid = None
         if kind == KIND_IMAGE:
             image_grid = inputs["image_grid_thw"].to(self.device_torch)
-            media = model.get_image_features(inputs["pixel_values"].to(self.device_torch), image_grid)
+            media = tower.get_image_features(inputs["pixel_values"].to(self.device_torch), image_grid)
         elif kind == KIND_VIDEO:
             video_grid = inputs["video_grid_thw"].to(self.device_torch)
-            media = model.get_image_features(inputs["pixel_values_videos"].to(self.device_torch), video_grid)
+            media = tower.get_image_features(inputs["pixel_values_videos"].to(self.device_torch), video_grid)
         embeds = build_sequence_embeds(model, ids, media, [self._placeholder[KIND_IMAGE], self._placeholder[KIND_VIDEO]])
         position_ids, delta = model.get_rope_index(ids, types, image_grid_thw=image_grid, video_grid_thw=video_grid)
         t0 = time.perf_counter()
