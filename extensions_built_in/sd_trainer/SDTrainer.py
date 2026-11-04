@@ -316,14 +316,18 @@ class SDTrainer(BaseSDTrainProcess):
     def needs_text_encoder_load(self):
         # the training process asks before the text encoder phase; False skips
         # loading it entirely (everything cached, nothing encodes live)
+        if not getattr(self.sd, 'has_text_encoder', True):
+            # the arch declares no neural text encoder (an llm whose loss
+            # consumes token ids from the cached artifact): phase 2 has
+            # nothing to load and nothing to cache
+            print_acc("Skipping text encoder load - the arch declares no text encoder")
+            return False
         for dataset in (self._dataset_objs or []) + (self._dataset_reg_objs or []):
             if not dataset.text_embedding_complete():
                 return True
         if self.train_config.train_text_encoder:
             return True
         if self.embed_config is not None:
-            return True
-        if getattr(self.sd, 'is_llm', False):
             return True
         if self._has_validation_items():
             # *** DO NOT TOUCH this clause for validation code until we
@@ -544,7 +548,14 @@ class SDTrainer(BaseSDTrainProcess):
 
         if self.sd.text_encoder is None:
             # the text encoder phase was skipped: needs_text_encoder_load()
-            # already verified every embed this run needs is cached
+            # already verified every embed this run needs is cached -- unless
+            # the run asks for text-embedding work an encoderless arch cannot
+            # do, which is refused here instead of silently doing nothing
+            if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
+                raise ValueError(
+                    f"{type(self.sd).__name__} has no text encoder: "
+                    "unload_text_encoder and text-embedding caching do not apply to it."
+                )
             self._load_fixed_embeds_from_cache()
             return
 

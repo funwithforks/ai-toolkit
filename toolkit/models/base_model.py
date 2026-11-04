@@ -107,6 +107,11 @@ class BaseModel:
     # text-generating models: the trainer runs train_llm_accumulation (model-owned
     # loss via get_llm_loss) instead of the diffusion step; no vae / text encoder
     is_llm = False
+    # whether the arch has a neural text encoder for the trainer to load in
+    # phase 2. Encoderless llm arches (the tokenizer is not one) declare
+    # False; the TE gate then skips phase 2 entirely instead of force-loading
+    # into a NotImplementedError. Default True: every existing model unchanged.
+    has_text_encoder = True
 
     def __init__(
             self,

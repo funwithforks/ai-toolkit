@@ -455,9 +455,11 @@ class Qwen38MTP(nn.Module):
 
 
 class Qwen38Inner(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, with_visual: bool = True):
         super().__init__()
-        self.visual = Qwen3_5VisionModel._from_config(config.vision_config)
+        # phase 3 builds without the tower: it is the vae's resident (qwen38_vae_id),
+        # freed at the phase boundary -- the language stack never carries it
+        self.visual = Qwen3_5VisionModel._from_config(config.vision_config) if with_visual else None
         self.language_model = Qwen38TextModel(config.text_config)
 
 
@@ -503,10 +505,10 @@ def compute_rope_index(config, input_ids: torch.Tensor, mm_token_type_ids: torch
 
 
 class Qwen38ForConditionalGeneration(nn.Module):
-    def __init__(self, config, with_mtp: bool = True):
+    def __init__(self, config, with_mtp: bool = True, with_visual: bool = True):
         super().__init__()
         self.config = config
-        self.model = Qwen38Inner(config)
+        self.model = Qwen38Inner(config, with_visual=with_visual)
         tc = config.text_config
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
         self.mtp = Qwen38MTP(tc) if with_mtp else None
@@ -528,7 +530,13 @@ class Qwen38ForConditionalGeneration(nn.Module):
     @torch.no_grad()
     def get_image_features(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         """Merged vision embeddings [N_merged, hidden] for one or more images / videos."""
-        visual = self.model.visual
+        visual = getattr(self.model, "visual", None)
+        if visual is None:
+            raise RuntimeError(
+                "qwen38: the model was built without the vision tower (the "
+                "phased path keeps it in the vae); route vision calls through "
+                "the holder's _vision()"
+            )
         out = visual(pixel_values.to(visual.patch_embed.proj.weight.dtype), grid_thw=grid_thw, return_dict=True)
         return out.pooler_output
 

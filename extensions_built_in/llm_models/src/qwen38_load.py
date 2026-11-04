@@ -42,65 +42,105 @@ def _read_keys(files):
     return keys
 
 
-def _load_into_device(files, device) -> dict:
-    sd = {}
-    dev = str(device)
-    for f in files:
-        with safe_open(f, "pt", device=dev) as sf:
-            for k in sf.keys():
-                sd[k] = sf.get_tensor(k)
-    return sd
-
-
 @torch.no_grad()
-def load_qwen38(
+def load_qwen38_language_stack(
     source: str,
     config,
     dtype: torch.dtype,
     device,
-    status_fn: Optional[Callable[[str], None]] = None,
+    status_fn: Optional[Callable[[str, None], None]] = None,
 ) -> Tuple[Qwen38ForConditionalGeneration, bool]:
-    """Returns (model on `device`, is_prequantized). Quantized ComfyUI layers keep
-    their stored format (convrotw4a8 / convrot8 OstrisLinear, int8 embeddings)."""
+    """Build the language stack (with_visual=False -- the tower is the vae's
+    resident) and stream every non-visual checkpoint key onto ``device`` per
+    tensor. The process never holds a model-sized dict: the whole-file path
+    this replaces peaked at ~2x the 17 GB checkpoint. Quantized (convrot /
+    W4A8) modules attach through the comfy-quant importer one marker at a
+    time; non-quantized floating tensors are cast to ``dtype`` as read,
+    matching the cherry-picked loader's numerics (the shipped-precision
+    question is a flagged dtype-pass decision, not made here). Returns
+    (model on ``device``, is_prequantized)."""
     from accelerate import init_empty_weights
 
     from toolkit.util.comfy_quant_import import import_comfy_quantized_layers
+    from toolkit.util.weight_source import WeightSource
 
     files, _ = _list_source_files(source)
     keys = _read_keys(files)
     with_mtp = any(k.startswith("mtp.") for k in keys)
+    tower_prefix = "model.visual."
+    stack_keys = sorted(k for k in keys if not k.startswith(tower_prefix))
+    if not stack_keys:
+        raise RuntimeError(f"No language-stack keys in {source}")
+    marker_keys = [k for k in stack_keys if k.endswith(".comfy_quant")]
+    quant_marker_prefixes = {k[: -len(".comfy_quant")] for k in marker_keys}
+    quant_entry_prefixes = {
+        p + suffix
+        for p in quant_marker_prefixes
+        for suffix in ("", ".weight", ".weight_scale", ".weight_scale_2", ".pre_quant_scale", ".bias")
+    }
+    quant_entries = {k for k in stack_keys if any(k == p or k.startswith(p + ".") for p in quant_marker_prefixes)}
+    plain_keys = [k for k in stack_keys if k not in quant_entries]
+    prequantized = bool(marker_keys)
+
     config.vision_config._attn_implementation = "sdpa"
     with init_empty_weights(include_buffers=False):
-        model = Qwen38ForConditionalGeneration(config, with_mtp=with_mtp)
+        model = Qwen38ForConditionalGeneration(config, with_mtp=with_mtp, with_visual=False)
     model.eval()
 
     if status_fn is not None:
-        status_fn(f"Reading {len(files)} weight file(s) onto {device}")
-    sd = _load_into_device(files, device)
-    prequantized = any(k.endswith(".comfy_quant") for k in sd)
-    if prequantized:
-        sd, n = import_comfy_quantized_layers(model, sd, orig_dtype=dtype, rotated_embedding_rows=True)
-        print_acc(f"Attached {n} pre-quantized ComfyUI layers")
-    sd = {k: (v.to(dtype) if v.is_floating_point() else v) for k, v in sd.items()}
-    result = model.load_state_dict(sd, assign=True, strict=False)
-    allowed = set()
-    for name, module in model.named_modules():
-        if hasattr(module, "ostris_quantizer"):
-            allowed.add(f"{name}.weight")
-            allowed.add(f"{name}.bias")
-    missing = [k for k in result.missing_keys if k not in allowed]
-    if missing or result.unexpected_keys:
-        raise RuntimeError(f"Qwen3.8 checkpoint mismatch. missing: {missing[:8]} unexpected: {result.unexpected_keys[:8]}")
+        status_fn(
+            f"Streaming language stack ({len(plain_keys)} tensors, "
+            f"{len(marker_keys)} quantized modules) onto {device}"
+        )
+
+    # key -> file, one header pass (no tensor reads)
+    key_file = {}
+    for f in files:
+        with safe_open(f, "pt") as sf:
+            for k in sf.keys():
+                key_file[k] = f
+
+    # quantized modules: the importer consumes one marker's entries at a time,
+    # so peak host ram is the largest single tensor in the file
+    consumed = set()
+    n_attached = 0
+    for marker in sorted(marker_keys):
+        prefix = marker[: -len(".comfy_quant")]
+        entry = {}
+        for k in sorted(quant_entries):
+            if k == prefix or k.startswith(prefix + "."):
+                with safe_open(key_file[k], "pt") as sf:
+                    entry[k] = sf.get_tensor(k)
+        leftover, n = import_comfy_quantized_layers(
+            model, entry, orig_dtype=dtype, rotated_embedding_rows=True
+        )
+        if leftover:
+            raise RuntimeError(f"qwen38: unconsumed quantized entries for {prefix}: {sorted(leftover)[:8]}")
+        n_attached += n
+        consumed.update(k for k in entry if k in quant_entries)
+    if status_fn is not None and n_attached:
+        print_acc(f"Attached {n_attached} pre-quantized ComfyUI layers")
+
+    # everything else: per-key straight onto the device, cast to the job dtype
+    # as read (tensor-sized staging; the shipped-precision question is flagged,
+    # not decided here)
+    remaining = set(plain_keys)
+    for f in files:
+        src = WeightSource.open(f)
+        for k in (k for k in src.keys() if k in remaining):
+            t = src.get(k, device)
+            if t.is_floating_point() and t.dtype != dtype:
+                t = t.to(dtype)
+            model.load_state_dict({k: t}, strict=False, assign=True)
+            remaining.discard(k)
+            consumed.add(k)
+    if remaining:
+        raise RuntimeError(f"qwen38 language-stack keys never read: {sorted(remaining)[:8]}")
     leftover = [n for n, p in model.named_parameters() if p.device.type == "meta"]
     if leftover:
-        raise RuntimeError(f"Params never loaded: {leftover[:8]}")
-    # buffers built in __init__ (rope tables) still live on the cpu
-    for module in model.modules():
-        if hasattr(module, "ostris_quantizer"):
-            continue
-        for pname, prm in list(module.named_parameters(recurse=False)):
-            if prm.is_floating_point() and prm.dtype != dtype:
-                prm.data = prm.data.to(dtype)
+        raise RuntimeError(f"qwen38 language-stack params never loaded: {leftover[:8]}")
+    # buffers built in __init__ (rope tables) were constructed on the cpu and
+    # ride the final placement; the tower keys are deliberately not here
     model.to(device)
     return model, prequantized
 

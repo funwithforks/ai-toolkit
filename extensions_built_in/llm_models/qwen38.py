@@ -26,17 +26,18 @@ model_kwargs:
   video_fps              fps the dataset extracted video frames at (dataset fps)
   max_new_tokens         sample generation budget (default 512)
   mtp_depth              MTP speculative draft depth for samples (default 3, 0 = off)
-  cuda_graph             CUDA-graph the decode step (default true)
-  vision_bf16            run the vision tower with bf16 activations on its dequantized int8
-                         weights (default true; int8 activations drift the image embeddings ~6%)
-  loss_chunk             positions per lm_head chunk in the CE (default 512)
+  cuda_graph             CUDA-graph the decode step (default false: the
+                         owner's flow optimizes kernels instead; graphs get
+                         ~20% where the optimization pass gets 50%-3x)
+  vision_bf16            dequantize the vision tower's int8 linears to bf16 (default
+                         false: the tower stays int8 convrot per owner decision;
+                         int8 activations drift the image embeddings ~6%)
 """
 
 import os
 import time
 from typing import List, Optional
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -71,6 +72,9 @@ def _media_kind(path: str) -> int:
 class Qwen38LLM(PhasedLoadMixin, BaseModel):
     arch = "qwen38"
     is_llm = True
+    # no neural text encoder: the tokenizer is not one, and the training loss
+    # consumes token ids from the cached artifact -- the TE gate skips phase 2
+    has_text_encoder = False
     # the vision tower is the vae: its embeddings are the cached "latents"
     # (a DTO with the media span + MRoPE grid), so phase 1 loads only the
     # tower and the iron rule frees it; phase 3 builds the language stack
@@ -99,8 +103,8 @@ class Qwen38LLM(PhasedLoadMixin, BaseModel):
         self.video_fps = float(kw.get("video_fps", 24))
         self.max_new_tokens = int(kw.get("max_new_tokens", 512))
         self.mtp_depth = int(kw.get("mtp_depth", 3))
-        self.cuda_graph = bool(kw.get("cuda_graph", True))
-        self.vision_bf16 = bool(kw.get("vision_bf16", True))
+        self.cuda_graph = bool(kw.get("cuda_graph", False))
+        self.vision_bf16 = bool(kw.get("vision_bf16", False))
         self.loss_chunk = int(kw.get("loss_chunk", 512))
         self.debug = bool(kw.get("debug", False))
         self.processor = None
@@ -156,35 +160,45 @@ class Qwen38LLM(PhasedLoadMixin, BaseModel):
         self._load_processor(cfg_src)
         self._build_template()
 
-    def load_model(self):
+    def load_text_encoder(self):
+        """qwen38 has no text encoder: the tokenizer is not one, and the
+        training loss consumes token ids from the cached artifact. This no-op
+        exists so the all-at-once compose and a mis-gated run fail soft; the
+        TE gate (has_text_encoder) means the trainer never calls it."""
+        self.text_encoder = None
+        print_acc("Skipping text encoder load - qwen38 has no text encoder")
+
+    def load_transformer(self):
+        """Phase 3: the language stack (with_visual=False -- the tower is the
+        vae's resident) streamed per tensor onto the training device.
+
+        This overrides the PUBLIC method, not _load_transformer:
+        Qwen38ForConditionalGeneration is not an OstrisModelMixin module and
+        has no aitk_post_load, so the mixin's wrapper would AttributeError.
+        Quantization and placement are therefore handled here, from
+        model_config -- the wrapper's component_load_kwargs does not apply."""
         dtype = self.torch_dtype
         device = self.device_torch
-        name_or_path = self.model_config.name_or_path or DEFAULT_CHECKPOINT
-        cfg_src = self._cfg_src()
-        want_quant = self.model_config.quantize
-        qtype = self.model_config.qtype
         if self.model_config.layer_offloading and self.model_config.layer_offloading_transformer_percent > 0:
             raise NotImplementedError("Layer offloading is not implemented for qwen38")
+        want_quant = self.model_config.quantize
+        qtype = self.model_config.qtype
 
-        from .src.qwen38_load import dequantize_vision_tower, load_qwen38
+        from .src.qwen38_load import load_qwen38_language_stack
 
         source = self._checkpoint_path()
-        if name_or_path.endswith(".safetensors"):
-            self.print_and_status_update(f"Loading Qwen3.8 from {os.path.basename(source)}")
+        if self.model_config.name_or_path and self.model_config.name_or_path.endswith(".safetensors"):
+            self.print_and_status_update(f"Loading Qwen3.8 language stack from {os.path.basename(source)}")
         else:
-            self.print_and_status_update(f"Loading Qwen3.8 from {name_or_path}")
-        config = AutoConfig.from_pretrained(cfg_src)
+            self.print_and_status_update(f"Loading Qwen3.8 language stack from {self.model_config.name_or_path}")
+        config = getattr(self, "_config", None) or AutoConfig.from_pretrained(self._cfg_src())
         self._config = config
-        model, prequantized = load_qwen38(source, config, dtype, device, status_fn=self.print_and_status_update)
+        model, prequantized = load_qwen38_language_stack(source, config, dtype, device, status_fn=self.print_and_status_update)
         if prequantized:
             model.aitk_is_quantized = True
             if want_quant and qtype not in ("convrotw4a8", "convrot8"):
                 print_acc(f"Checkpoint is pre-quantized (W4A8 / int8 convrot); keeping it instead of {qtype}")
             want_quant = False
-        if self.vision_bf16 and prequantized:
-            n = dequantize_vision_tower(model.model.visual, dtype)
-            print_acc(f"Vision tower: {n} int8 linears dequantized to {dtype} (model_kwargs.vision_bf16)")
-        model.eval()
         model.requires_grad_(False)
         if want_quant:
             from toolkit.util.quantize import get_qtype, quantize
@@ -192,14 +206,11 @@ class Qwen38LLM(PhasedLoadMixin, BaseModel):
             self.print_and_status_update(f"Quantizing Qwen3.8 ({qtype})")
             quantize(model, weights=get_qtype(qtype))
             model.aitk_is_quantized = True
-            flush()
         self.model = model
         self.model.generator = Qwen38Generator(model, use_cuda_graph=self.cuda_graph)
-        self._load_processor(cfg_src)
-        self.text_encoder = None
-        self.vae = None
+        # no scheduler: is_llm training never samples timesteps
+        self.noise_scheduler = self.get_train_scheduler()
         self.pipeline = self
-        self._build_template()
         flush()
 
     def _template_kwargs(self):
