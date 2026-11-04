@@ -18,7 +18,7 @@ from typing import List, Optional
 
 import torch
 import yaml
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 from transformers import AutoTokenizer, AutoModel
 
@@ -28,6 +28,7 @@ from toolkit.basic import flush
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.models.base_model import BaseModel
 from toolkit.models.phased_load import PhasedLoadMixin
+from toolkit.models.v2.resolver import resolve_component_file
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
@@ -161,24 +162,30 @@ class ExampleModel(PhasedLoadMixin, BaseModel):
 
         Quantization/offload/placement is NOT done here: the mixin applies
         component_load_kwargs("transformer") via aitk_post_load right after
-        this returns. Models whose checkpoint sourcing is standard can
-        collapse the build into that step: ExampleTransformer2DModel.load(
-        path, **kwargs)."""
-        dtype = self.torch_dtype
+        this returns."""
         self.print_and_status_update("Loading transformer")
-        model_path = self.model_config.name_or_path
-        # Instantiate on the meta device (no RAM used), then materialize the
-        # real tensors straight from the checkpoint with assign=True. This
-        # avoids allocating the model twice. If your model has non-persistent
-        # buffers, rebuild them after this (see ideogram4.py for an example).
-        with torch.device("meta"):
-            transformer = ExampleTransformer2DModel()
-        state_dict = load_file(
-            os.path.join(model_path, "transformer", "model.safetensors")
+        # resolve through the MODELS_PATH-first door: a local export folder
+        # wins, a hub reference downloads into MODELS_PATH (never the hf cache)
+        weights = resolve_component_file(
+            os.path.join(
+                self.model_config.name_or_path, "transformer", "model.safetensors"
+            ),
+            "diffusion_models",
+            component="example transformer",
+            hf_token=os.getenv("HF_TOKEN"),
+            status_fn=self.print_and_status_update,
         )
-        state_dict = {k: v.to(dtype) for k, v in state_dict.items()}
-        transformer.load_state_dict(state_dict, assign=True)
-        del state_dict
+        # as-shipped mode streams straight onto the gpu (no cpu staging);
+        # low_vram keeps the legacy cpu parking for the phased placement.
+        # Quantization / offload / final placement are the wrapper's
+        # aitk_post_load, driven by model_config -- the shipped dtype is
+        # kept, never cast here.
+        transformer_device = None if self.model_config.low_vram else self.device_torch
+        transformer = ExampleTransformer2DModel.load_model(
+            weights,
+            dtype=self.torch_dtype,
+            aitk_device=transformer_device,
+        )
         flush()  # gc + empty cuda cache; call it after dropping anything big
         return transformer
 
