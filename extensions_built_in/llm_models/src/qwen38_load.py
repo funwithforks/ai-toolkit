@@ -46,19 +46,18 @@ def _read_keys(files):
 def load_qwen38_language_stack(
     source: str,
     config,
-    dtype: torch.dtype,
     device,
     status_fn: Optional[Callable[[str, None], None]] = None,
 ) -> Tuple[Qwen38ForConditionalGeneration, bool]:
     """Build the language stack (with_visual=False -- the tower is the vae's
     resident) and stream every non-visual checkpoint key onto ``device`` per
-    tensor. The process never holds a model-sized dict: the whole-file path
-    this replaces peaked at ~2x the 17 GB checkpoint. Quantized (convrot /
-    W4A8) modules attach through the comfy-quant importer one marker at a
-    time; non-quantized floating tensors are cast to ``dtype`` as read,
-    matching the cherry-picked loader's numerics (the shipped-precision
-    question is a flagged dtype-pass decision, not made here). Returns
-    (model on ``device``, is_prequantized)."""
+    tensor, exactly as shipped: packed nibbles stay packed, fp8 scales stay
+    fp8, fp32 stays fp32. There is no dtype parameter and no cast -- the
+    whole-file path this replaced peaked at ~2x the 17 GB checkpoint because
+    it fattened every stored dtype to the job's. The quantizer dequantizes
+    per forward in-kernel; quantized modules attach through the comfy-quant
+    importer one marker at a time, so peak host ram is the largest single
+    tensor. Returns (model on ``device``, is_prequantized)."""
     from accelerate import init_empty_weights
 
     from toolkit.util.comfy_quant_import import import_comfy_quantized_layers
@@ -112,7 +111,7 @@ def load_qwen38_language_stack(
                 with safe_open(key_file[k], "pt") as sf:
                     entry[k] = sf.get_tensor(k)
         leftover, n = import_comfy_quantized_layers(
-            model, entry, orig_dtype=dtype, rotated_embedding_rows=True
+            model, entry, rotated_embedding_rows=True
         )
         if leftover:
             raise RuntimeError(f"qwen38: unconsumed quantized entries for {prefix}: {sorted(leftover)[:8]}")
@@ -121,17 +120,13 @@ def load_qwen38_language_stack(
     if status_fn is not None and n_attached:
         print_acc(f"Attached {n_attached} pre-quantized ComfyUI layers")
 
-    # everything else: per-key straight onto the device, cast to the job dtype
-    # as read (tensor-sized staging; the shipped-precision question is flagged,
-    # not decided here)
+    # everything else: per-key straight onto the device, assigned as read --
+    # there is no cast and there cannot be one
     remaining = set(plain_keys)
     for f in files:
         src = WeightSource.open(f)
         for k in (k for k in src.keys() if k in remaining):
-            t = src.get(k, device)
-            if t.is_floating_point() and t.dtype != dtype:
-                t = t.to(dtype)
-            model.load_state_dict({k: t}, strict=False, assign=True)
+            model.load_state_dict({k: src.get(k, device)}, strict=False, assign=True)
             remaining.discard(k)
             consumed.add(k)
     if remaining:
@@ -178,7 +173,6 @@ def load_vision_tower(
     source: str,
     config,
     device,
-    orig_dtype: torch.dtype,
     status_fn: Optional[Callable[[str], None]] = None,
 ):
     """Stream only the checkpoint's ``model.visual.*`` keys onto ``device`` and
@@ -222,7 +216,7 @@ def load_vision_tower(
         for k in (k for k in src.keys() if k in set(quant_keys)):
             quant_sd[k[len(TOWER_PREFIX):]] = src.get(k, "cpu")
     quant_sd, n_attached = import_comfy_quantized_layers(
-        tower, quant_sd, orig_dtype=orig_dtype, rotated_embedding_rows=True
+        tower, quant_sd, rotated_embedding_rows=True
     )
     if quant_sd:
         raise RuntimeError(f"Vision tower: unconsumed quantized entries: {sorted(quant_sd)[:8]}")

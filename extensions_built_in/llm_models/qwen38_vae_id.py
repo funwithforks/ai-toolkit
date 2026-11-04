@@ -75,7 +75,6 @@ def _load_qwen38_vision(model):
         model._checkpoint_path(),
         config,
         model.vae_device_torch,
-        orig_dtype=model.torch_dtype,
         status_fn=model.print_and_status_update,
     )
     if model.vision_bf16:

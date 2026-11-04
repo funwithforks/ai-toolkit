@@ -193,7 +193,7 @@ class Qwen38LLM(PhasedLoadMixin, BaseModel):
             self.print_and_status_update(f"Loading Qwen3.8 language stack from {self.model_config.name_or_path}")
         config = getattr(self, "_config", None) or AutoConfig.from_pretrained(self._cfg_src())
         self._config = config
-        model, prequantized = load_qwen38_language_stack(source, config, dtype, device, status_fn=self.print_and_status_update)
+        model, prequantized = load_qwen38_language_stack(source, config, device, status_fn=self.print_and_status_update)
         if prequantized:
             model.aitk_is_quantized = True
             if want_quant and qtype not in ("convrotw4a8", "convrot8"):
