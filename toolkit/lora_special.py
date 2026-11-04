@@ -509,7 +509,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                         all_layers = self.network_config is not None and getattr(self.network_config, 'all_layers', False)
                         is_leaf_with_weight = (
                             len(list(child_module.children())) == 0
-                            and isinstance(getattr(child_module, 'weight', None), torch.nn.Parameter)
+                            and isinstance(child_module._parameters.get('weight', None), torch.nn.Parameter)
                         )
                         matches_full_if_contains = len(self.full_if_contains) > 0 and (
                             any([word in clean_name for word in self.full_if_contains])
