@@ -461,6 +461,47 @@ class Qwen38Inner(nn.Module):
         self.language_model = Qwen38TextModel(config.text_config)
 
 
+def compute_rope_index(config, input_ids: torch.Tensor, mm_token_type_ids: torch.Tensor, image_grid_thw=None, video_grid_thw=None) -> torch.Tensor:
+    """Config-level port of transformers' Qwen3_5 get_rope_index for one
+    unpadded sequence: position_ids [3, T] from the token types and the media
+    grids. Config-only -- no model weights -- so the phase-1 cache pass can
+    compute it without the language stack resident. ``Qwen38ForConditional
+    Generation.get_rope_index`` delegates here; the rope delta is O(1)-derivable
+    from the result and is not part of this function."""
+    merge = config.vision_config.spatial_merge_size
+    device = input_ids.device
+    if video_grid_thw is not None:
+        video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+        video_grid_thw[:, 0] = 1
+    grids = {1: iter(image_grid_thw) if image_grid_thw is not None else None, 2: iter(video_grid_thw) if video_grid_thw is not None else None}
+    types = mm_token_type_ids.tolist()
+    groups = []
+    i = 0
+    while i < len(types):
+        j = i
+        while j < len(types) and types[j] == types[i]:
+            j += 1
+        groups.append((types[i], i, j))
+        i = j
+    cur = 0
+    parts = []
+    for kind, s, e in groups:
+        if kind == 0:
+            n = e - s
+            parts.append(torch.arange(n, device=device).view(1, -1).expand(3, -1) + cur)
+            cur += n
+        else:
+            thw = next(grids[kind])
+            t, h, w = int(thw[0]), int(thw[1]) // merge, int(thw[2]) // merge
+            n = t * h * w
+            pw = torch.arange(cur, cur + w, device=device).repeat(h * t)
+            ph = torch.arange(cur, cur + h, device=device).repeat_interleave(w * t)
+            pt = torch.full((n,), cur, device=device, dtype=torch.long)
+            parts.append(torch.stack([pt, ph, pw], dim=0))
+            cur += max(h, w)
+    return torch.cat(parts, dim=1)
+
+
 class Qwen38ForConditionalGeneration(nn.Module):
     def __init__(self, config, with_mtp: bool = True):
         super().__init__()
@@ -497,38 +538,7 @@ class Qwen38ForConditionalGeneration(nn.Module):
         """Port of transformers' Qwen3_5 get_rope_index for one unpadded sequence.
         input_ids / mm_token_type_ids [T]; returns position_ids [3, 1, T] and the rope
         delta (first text position after the sequence minus its length)."""
-        merge = self.config.vision_config.spatial_merge_size
-        device = input_ids.device
-        if video_grid_thw is not None:
-            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
-            video_grid_thw[:, 0] = 1
-        grids = {1: iter(image_grid_thw) if image_grid_thw is not None else None, 2: iter(video_grid_thw) if video_grid_thw is not None else None}
-        types = mm_token_type_ids.tolist()
-        groups = []
-        i = 0
-        while i < len(types):
-            j = i
-            while j < len(types) and types[j] == types[i]:
-                j += 1
-            groups.append((types[i], i, j))
-            i = j
-        cur = 0
-        parts = []
-        for kind, s, e in groups:
-            if kind == 0:
-                n = e - s
-                parts.append(torch.arange(n, device=device).view(1, -1).expand(3, -1) + cur)
-                cur += n
-            else:
-                thw = next(grids[kind])
-                t, h, w = int(thw[0]), int(thw[1]) // merge, int(thw[2]) // merge
-                n = t * h * w
-                pw = torch.arange(cur, cur + w, device=device).repeat(h * t)
-                ph = torch.arange(cur, cur + h, device=device).repeat_interleave(w * t)
-                pt = torch.full((n,), cur, device=device, dtype=torch.long)
-                parts.append(torch.stack([pt, ph, pw], dim=0))
-                cur += max(h, w)
-        pos = torch.cat(parts, dim=1)
+        pos = compute_rope_index(self.config, input_ids, mm_token_type_ids, image_grid_thw, video_grid_thw)
         delta = int(pos.max().item()) + 1 - input_ids.shape[0]
         return pos.view(3, 1, -1), delta
 

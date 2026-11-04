@@ -1137,6 +1137,11 @@ class ImageProcessingDTOMixin:
             transform: Union[None, transforms.Compose],
             only_load_latents=False
     ):
+        if getattr(self, "is_conversation", False):
+            raise RuntimeError(
+                f"conversation item {self.path} has no media tensor; the "
+                "holder's encode_conversation assembles it at cache time"
+            )
         # handle get_prompt_embedding
         if self.is_text_embedding_cached:
             self.load_prompt_embedding()
@@ -2427,31 +2432,38 @@ class LatentCachingMixin:
             frames = None
             # add batch dimension
             cache_uint8 = getattr(self.sd, 'cache_latents_as_uint8', False)
-            if self.dataset_config.cache_tensors_to_disk:
-                if not file_item.is_audio_model:
-                    tensor_uint8 = _latent_to_uint8(file_item.tensor).cpu()
-                    if to_disk:
-                        state_dict['tensor'] = tensor_uint8
-                    if to_memory:
-                        file_item._cached_tensor_uint8 = tensor_uint8
-                if file_item.audio_data is not None:
-                    # audio-only models: tensor IS the waveform, stored here as int16 instead of uint8
-                    waveform_int16 = _waveform_to_int16(file_item.audio_data['waveform']).cpu()
-                    sample_rate = int(file_item.audio_data['sample_rate'])
-                    if to_disk:
-                        state_dict['waveform'] = waveform_int16
-                        state_dict['waveform_sample_rate'] = torch.tensor(sample_rate, dtype=torch.int32)
-                    if to_memory:
-                        file_item._cached_waveform_int16 = waveform_int16
-                        file_item._cached_waveform_sample_rate = sample_rate
             try:
-                # waveforms stay fp32 into the audio encoder (bf16 mantissa is ~48 dB of noise)
-                imgs = file_item.tensor.unsqueeze(0).to(device, dtype=torch.float32 if file_item.is_audio_model else dtype)
-                # caching is inference by definition: the no_grad lives here so
-                # models with grad-capable encoders (future tower-LoRA) don't
-                # retain graphs during the pass
-                with torch.no_grad():
-                    latent = self.sd.encode_images(imgs)
+                if file_item.is_conversation:
+                    # the conversation artifact: the holder assembles the mixed
+                    # sequence (ids/types/positions/grids/embeds/loss span) from
+                    # the sidecar; caching is inference by definition
+                    with torch.no_grad():
+                        latent = self.sd.encode_conversation(file_item)
+                else:
+                    if self.dataset_config.cache_tensors_to_disk:
+                        if not file_item.is_audio_model:
+                            tensor_uint8 = _latent_to_uint8(file_item.tensor).cpu()
+                            if to_disk:
+                                state_dict['tensor'] = tensor_uint8
+                            if to_memory:
+                                file_item._cached_tensor_uint8 = tensor_uint8
+                        if file_item.audio_data is not None:
+                            # audio-only models: tensor IS the waveform, stored here as int16 instead of uint8
+                            waveform_int16 = _waveform_to_int16(file_item.audio_data['waveform']).cpu()
+                            sample_rate = int(file_item.audio_data['sample_rate'])
+                            if to_disk:
+                                state_dict['waveform'] = waveform_int16
+                                state_dict['waveform_sample_rate'] = torch.tensor(sample_rate, dtype=torch.int32)
+                            if to_memory:
+                                file_item._cached_waveform_int16 = waveform_int16
+                                file_item._cached_waveform_sample_rate = sample_rate
+                    # waveforms stay fp32 into the audio encoder (bf16 mantissa is ~48 dB of noise)
+                    imgs = file_item.tensor.unsqueeze(0).to(device, dtype=torch.float32 if file_item.is_audio_model else dtype)
+                    # caching is inference by definition: the no_grad lives here so
+                    # models with grad-capable encoders (future tower-LoRA) don't
+                    # retain graphs during the pass
+                    with torch.no_grad():
+                        latent = self.sd.encode_images(imgs)
                 # a model can return a DTO carrying extra streams alongside the latent
                 latent = latent.map(lambda t: t.squeeze(0)) if isinstance(latent, DTO) else latent.squeeze(0)
                 if to_disk:
@@ -2467,7 +2479,8 @@ class LatentCachingMixin:
             except UnusableFileError:
                 raise
             except Exception as e:
-                print_acc(f"Error processing image: {file_item.path}")
+                kind = "conversation sidecar" if file_item.is_conversation else "image"
+                print_acc(f"Error processing {kind}: {file_item.path}")
                 print_acc(f"Error: {str(e)}")
                 raise e
             # do first frame

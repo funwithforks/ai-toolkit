@@ -50,7 +50,7 @@ from toolkit.models.phased_load import PhasedLoadMixin
 from toolkit.models.v2.resolver import resolve_component_file
 from toolkit.print import print_acc
 
-from .src.qwen38_model import Qwen38Generator, build_sequence_embeds
+from .src.qwen38_model import Qwen38Generator, build_sequence_embeds, compute_rope_index
 
 BASE_REPO = "Qwen/Qwen3.8-27B"
 DEFAULT_CHECKPOINT = "Comfy-Org/Qwen3.8-27B/text_encoders/qwen3.8_27b_w4a8.safetensors"
@@ -79,6 +79,11 @@ class Qwen38LLM(PhasedLoadMixin, BaseModel):
     # the data loader accepts image and video files in one dataset
     is_multimodal_llm = True
     sample_rate = 16000
+
+    # conversation datasets (the sidecar content array) are the only item
+    # kind this arch trains on; the .json sidecar is parsed and validated at
+    # scan time and assembled into the cache artifact in phase 1
+    uses_conversation_sidecars = True
 
     def __init__(self, device, model_config: ModelConfig, dtype="bf16", custom_pipeline=None, noise_scheduler=None, **kwargs):
         super().__init__(device, model_config, dtype, custom_pipeline, noise_scheduler, **kwargs)
@@ -255,26 +260,6 @@ class Qwen38LLM(PhasedLoadMixin, BaseModel):
     # ------------------------------------------------------------------
     # media encoding (latent cache)
     # ------------------------------------------------------------------
-    def _span(self, input_ids: torch.Tensor, types: torch.Tensor):
-        """The processor-expanded media span (tokens between the template prefix and
-        the instruction tail), with its token-type ids."""
-        ids = input_ids[0]
-        n = ids.shape[0]
-        p, t = len(self._prefix_ids), len(self._tail_ids)
-        if ids[:p].tolist() != self._prefix_ids or ids[n - t :].tolist() != self._tail_ids:
-            raise RuntimeError("Processor output does not start/end with the template prefix/tail")
-        return ids[p : n - t].to(torch.int32), types[0, p : n - t].to(torch.int32)
-
-    def _pack(self, embeds, media_ids, media_types, kind, grid):
-        dev = embeds.device
-        return DTO(
-            embeds[None].to(self.torch_dtype),
-            media_ids=media_ids[None].to(dev),
-            media_types=media_types[None].to(dev),
-            kind=torch.tensor([kind], dtype=torch.int32, device=dev),
-            grid_thw=torch.tensor([list(grid)], dtype=torch.int32, device=dev),
-        )
-
     def _vision(self):
         """The tower: the registry vae when the phased path loaded it (the
         only owner there -- the model is built without the tower in phase 3),
@@ -289,78 +274,90 @@ class Qwen38LLM(PhasedLoadMixin, BaseModel):
             )
         return self.model
 
-    def encode_images(self, image_list: torch.Tensor, device=None, dtype=None):
-        """[1, 3, H, W] image in [-1, 1] | [1, F, 3, H, W] frames.
+    def encode_conversation(self, file_item):
+        """The phase-1 artifact for one conversation sidecar: the full token
+        sequence with media placeholders in place, the token-type vector, the
+        MRoPE positions, the concatenated tower embeds and the loss-span start.
+        Everything deterministic about the item -- the train step only gathers,
+        splices, forwards and reads the loss span. Runs in phase 1 (the tower
+        and processor are resident; the language stack is not). No grad policy
+        here: the cache pass wraps its call site in no_grad, and a future
+        tower-LoRA train step backprops through this."""
+        from PIL import Image
 
-        No grad policy here -- the caller decides. The latent-cache pass runs
-        under its own no_grad (dataloader_mixins guards the call sites); a
-        future tower-LoRA train step backprops through this via get_llm_loss's
-        uncached fallback."""
-        if image_list.shape[0] != 1:
-            raise ValueError("qwen38 encodes one item at a time (batch_size 1)")
+        messages = file_item.conversation
+        folder = os.path.dirname(file_item.path)
+        if self.processor is None or getattr(self, "_config", None) is None:
+            raise RuntimeError("qwen38: encode_conversation needs load_vae() to have run (the phase gate decides)")
+
+        def entry_text(entry):
+            if entry.get("file"):
+                with open(os.path.join(folder, entry["file"]), "r") as f:
+                    return f.read()
+            return entry["text"]
+
+        # the user turn: images collected in order, texts read; the processor
+        # expands the placeholder spans and returns one packed pixel tensor
+        user_content = []
+        images = []
+        for message in messages[:-1]:
+            for entry in message["content"]:
+                if entry["type"] == "image":
+                    images.append(Image.open(os.path.join(folder, entry["file"])).convert("RGB"))
+                    user_content.append({"type": "image"})
+                else:
+                    user_content.append({"type": "text", "text": entry_text(entry)})
+        prompt_msgs = [{"role": m["role"], "content": user_content} for m in messages[:-1]]
+        prompt_text = self.processor.apply_chat_template(
+            prompt_msgs, add_generation_prompt=True, tokenize=False, **self._template_kwargs()
+        )
+        inputs = self.processor(
+            text=[prompt_text], images=images, return_tensors="pt",
+            min_pixels=self.min_pixels, max_pixels=self.max_pixels,
+        )
+        prompt_ids = inputs["input_ids"][0]
+        prompt_types = inputs["mm_token_type_ids"][0]
+        grid = inputs["image_grid_thw"]
+
+        # the assistant turn: one text entry (scan-validated), tokenized raw
+        # with the end-of-turn token appended; the loss span starts here
+        output_text = entry_text(messages[-1]["content"][0])
+        output_ids = torch.tensor(
+            self.tokenizer(output_text, add_special_tokens=False).input_ids + [self._im_end],
+            dtype=torch.long,
+        )
+        ids = torch.cat([prompt_ids, output_ids]).long()
+        types = torch.cat([prompt_types, torch.zeros(output_ids.shape[0], dtype=prompt_types.dtype)])
+
         tower = self._vision()
         if tower.device == torch.device("cpu"):
             tower.to(self.device_torch)
-        x = image_list[0]
-        if x.ndim == 2:
-            raise ValueError("qwen38 does not take audio")
-        if x.ndim == 3:
-            return self._encode_image_item(x)
-        if x.ndim == 4:
-            return self._encode_video_item(x)
-        raise ValueError(f"Unexpected media tensor shape {tuple(image_list.shape)}")
-
-    def encode_audio(self, audio_data_list):
-        # the data loader offers a video's own audio track here; video is vision-only
-        return torch.zeros(len(audio_data_list), 1)
-
-    @staticmethod
-    def _to_uint8(img: torch.Tensor) -> np.ndarray:
-        return ((img.float().clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
-
-    def _encode_image_item(self, img: torch.Tensor):
-        from PIL import Image
-
-        pil = Image.fromarray(self._to_uint8(img))
-        inputs = self.processor(text=self._probe[KIND_IMAGE], images=[pil], return_tensors="pt", min_pixels=self.min_pixels, max_pixels=self.max_pixels)
-        grid = inputs["image_grid_thw"]
-        feats = self._vision().get_image_features(inputs["pixel_values"].to(self.device_torch), grid.to(self.device_torch))
-        ids, types = self._span(inputs["input_ids"], inputs["mm_token_type_ids"])
-        return self._pack(feats, ids, types, KIND_IMAGE, grid[0].tolist())
-
-    def _encode_video_item(self, frames: torch.Tensor):
-        video = np.stack([self._to_uint8(f) for f in frames])  # [F, H, W, 3]
-        inputs = self.processor(
-            text=self._probe[KIND_VIDEO], videos=[video], return_tensors="pt", fps=self.video_fps,
-            min_pixels=self.min_pixels, max_pixels=self.max_pixels,
+        media = tower.get_image_features(
+            inputs["pixel_values"].to(self.device_torch), grid.to(self.device_torch)
         )
-        grid = inputs["video_grid_thw"]
-        feats = self._vision().get_image_features(inputs["pixel_values_videos"].to(self.device_torch), grid.to(self.device_torch))
-        ids, types = self._span(inputs["input_ids"], inputs["mm_token_type_ids"])
-        return self._pack(feats, ids, types, KIND_VIDEO, grid[0].tolist())
+        expected = int((ids == self._placeholder[KIND_IMAGE]).sum())
+        if media.shape[0] != expected:
+            raise RuntimeError(
+                f"qwen38: tower embed count {media.shape[0]} != placeholder count {expected} for {file_item.path}"
+            )
+        position_ids = compute_rope_index(self._config, ids, types, image_grid_thw=grid)
+        return DTO(
+            media[None],
+            ids=ids[None],
+            types=types[None].to(torch.int32),
+            position_ids=position_ids[None].to(torch.int64),
+            grid_thw=grid.to(torch.int32),
+            loss_start=torch.tensor([prompt_ids.shape[0]], dtype=torch.int32),
+        )
 
     # ------------------------------------------------------------------
     # training
     # ------------------------------------------------------------------
-    def _sequence(self, media_ids: torch.Tensor, media_types: torch.Tensor, caption: str):
-        """ids [L], token types [L] and the index where the caption (loss span) starts."""
-        target = self.tokenizer(caption, add_special_tokens=False).input_ids + [self._im_end]
-        head = self._prefix_ids + media_ids.tolist() + self._mid_ids + self._instruction_ids + self._after_ids
-        ids = torch.tensor(head + target, dtype=torch.long, device=self.device_torch)
-        types = torch.zeros_like(ids)
-        p = len(self._prefix_ids)
-        types[p : p + media_ids.shape[0]] = media_types.to(types.dtype)
-        return ids, types, len(head)
-
-    def _lm_loss(self, ids, types, start: int, media: torch.Tensor, kind: int, grid):
+    def _lm_loss(self, ids, media, position_ids, loss_start: int):
         model = self.model
-        embeds = build_sequence_embeds(model, ids, media, [self._placeholder[kind]])
-        grid_t = torch.tensor([list(grid)], device=ids.device)
-        position_ids, _ = model.get_rope_index(
-            ids, types, image_grid_thw=grid_t if kind == KIND_IMAGE else None, video_grid_thw=grid_t if kind == KIND_VIDEO else None
-        )
-        hidden = model.forward_hidden(embeds, position_ids)[0, start - 1 : -1]
-        targets = ids[start:]
+        embeds = build_sequence_embeds(model, ids, media, [self._placeholder[KIND_IMAGE]])
+        hidden = model.forward_hidden(embeds, position_ids)[0, loss_start - 1 : -1]
+        targets = ids[loss_start:]
         lm_head = model.lm_head
 
         def chunk_ce(h, t):
@@ -376,25 +373,27 @@ class Qwen38LLM(PhasedLoadMixin, BaseModel):
         return total / targets.shape[0]
 
     def get_llm_loss(self, batch) -> torch.Tensor:
-        """Next-token cross-entropy on the caption, from the cached media embeddings.
-        Called by the trainer's train_llm_accumulation; logs ride in additional_loss_logs."""
+        """Next-token cross-entropy on the output span, from the cached
+        conversation artifact. Called by the trainer's train_llm_accumulation;
+        logs ride in additional_loss_logs."""
         if self.model.device == torch.device("cpu"):
             self.model.to(self.device_torch)
         lat = batch.latents
-        if not isinstance(lat, DTO) or lat.get("media_ids") is None:
-            if batch.tensor is None:
-                raise ValueError("qwen38 got a batch with neither media tensors nor cached embeddings")
-            lat = self.encode_images(batch.tensor)
+        if not isinstance(lat, DTO) or lat.get("ids") is None:
+            item = batch.file_items[0]
+            if not getattr(item, "is_conversation", False):
+                raise ValueError("qwen38 trains on conversation sidecar datasets")
+            lat = self.encode_conversation(item)
         if lat.shape[0] != 1:
             raise ValueError("qwen38 trains with batch_size 1")
-        captions = batch.get_caption_list()
         media = lat.tensor[0].to(self.device_torch, self.torch_dtype)
-        kind = int(lat.get("kind")[0])
-        ids, types, start = self._sequence(lat.get("media_ids")[0].long(), lat.get("media_types")[0].long(), captions[0])
-        ce = self._lm_loss(ids, types, start, media, kind, lat.get("grid_thw")[0].tolist())
+        ids = lat.get("ids")[0].long().to(self.device_torch)
+        position_ids = lat.get("position_ids")[0].long().to(self.device_torch)
+        loss_start = int(lat.get("loss_start"))
+        ce = self._lm_loss(ids, media, position_ids, loss_start)
         if self.debug:
             print_acc(
-                f"qwen38: seq {ids.shape[0]} target {ids.shape[0] - start} ce {ce.item():.4f} "
+                f"qwen38: seq {ids.shape[0]} target {ids.shape[0] - loss_start} ce {ce.item():.4f} "
                 f"peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB"
             )
         self.additional_loss_logs = {"loss/ce": ce.detach().float().item()}

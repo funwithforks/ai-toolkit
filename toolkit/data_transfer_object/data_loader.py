@@ -66,6 +66,11 @@ class FileItemDTO(
         dataset_is_video = self.dataset_config.num_frames > 1 or self.dataset_config.auto_frame_count
         self.is_video = dataset_is_video and os.path.splitext(self.path)[1].lower() in video_extensions
         self.is_audio_model = kwargs.get("is_audio_model", False)
+        # conversation sidecar item (a .json content array); no media tensor --
+        # the messages are parsed and validated at scan time, the segment
+        # files are read by the holder's encode_conversation at cache time
+        self.is_conversation = kwargs.get("is_conversation", False)
+        self.conversation = kwargs.get("conversation", None)
         self.sample_rate = kwargs.get("sample_rate", 48000)
         self.num_frames = self.dataset_config.num_frames if self.is_video else 1
         self.temporal_compression = kwargs.get("temporal_compression", 8)
@@ -116,7 +121,11 @@ class FileItemDTO(
                 use_db_entry = True
         video_total_frames = None
         video_fps = None
-        if self.is_audio_model:
+        if self.is_conversation:
+            # no media to probe: the artifact carries the geometry, and the
+            # segment files are read at encode time
+            w, h = 0, 0
+        elif self.is_audio_model:
             # get the length of the audio file in ms
             with av.open(self.path) as c:
                 if c.duration is not None:

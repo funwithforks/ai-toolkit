@@ -4,7 +4,7 @@ import os
 import random
 import traceback
 from functools import lru_cache
-from typing import List, TYPE_CHECKING
+from typing import Dict, List, TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -382,6 +382,95 @@ class PairedImageDataset(Dataset):
         return img, prompt, (self.neg_weight, self.pos_weight)
 
 
+def _scan_conversation_sidecars(file_list: List[str], dataset_root: str) -> Dict[str, dict]:
+    """Parse and validate every conversation sidecar in the dataset, and refuse
+    any media file the sidecars don't reference (the sidecar is the only item
+    kind in these datasets -- a loose image is a naming mistake, not data).
+
+    Loud ValueError naming the sidecar and the offending entry; returns
+    {sidecar_path: parsed_messages}."""
+    referenced = set()
+    parsed: Dict[str, dict] = {}
+    for sidecar in file_list:
+        folder = os.path.dirname(sidecar)
+        try:
+            with open(sidecar, "r") as f:
+                body = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Conversation sidecar {sidecar} is not valid json: {e}")
+        if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:
+            raise ValueError(f"Conversation sidecar {sidecar}: expected a non-empty 'messages' array")
+        messages = body["messages"]
+        assistant_at = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+        if len(assistant_at) != 1 or assistant_at[0] != len(messages) - 1:
+            raise ValueError(
+                f"Conversation sidecar {sidecar}: exactly one assistant message, "
+                "as the last message, is required (single-turn training)"
+            )
+        for mi, message in enumerate(messages):
+            role = message.get("role")
+            if role not in ("user", "assistant"):
+                raise ValueError(f"Conversation sidecar {sidecar}: message {mi} has role {role!r}")
+            content = message.get("content")
+            if not isinstance(content, list) or not content:
+                raise ValueError(f"Conversation sidecar {sidecar}: message {mi} content must be a non-empty array")
+            if role == "assistant" and len(content) != 1:
+                raise ValueError(
+                    f"Conversation sidecar {sidecar}: the assistant message takes exactly one text entry"
+                )
+            for ci, entry in enumerate(content):
+                kind = entry.get("type")
+                where = f"{sidecar} message {mi} entry {ci}"
+                if kind == "image":
+                    if role != "user":
+                        raise ValueError(f"Conversation sidecar {where}: images belong in user turns")
+                    ref = entry.get("file")
+                    if not ref:
+                        raise ValueError(f"Conversation sidecar {where}: image entry needs 'file'")
+                elif kind == "text":
+                    has_file, has_text = bool(entry.get("file")), bool(entry.get("text"))
+                    if has_file == has_text:
+                        raise ValueError(f"Conversation sidecar {where}: text entry takes exactly one of 'file' or 'text'")
+                    ref = entry.get("file")
+                else:
+                    raise ValueError(
+                        f"Conversation sidecar {where}: unsupported content type {kind!r} "
+                        "(this format takes images and text; video frames arrive pre-extracted)"
+                    )
+                if ref:
+                    full = os.path.join(folder, ref)
+                    if not os.path.isfile(full):
+                        raise ValueError(f"Conversation sidecar {sidecar}: referenced file {ref} does not exist beside it")
+                    referenced.add(os.path.abspath(full))
+
+        assistant_entry = messages[-1]["content"][0]
+        output_ref = assistant_entry.get("file")
+        if output_ref:
+            if not os.path.isfile(os.path.join(folder, output_ref)):
+                raise ValueError(f"Conversation sidecar {sidecar}: output file {output_ref} does not exist beside it")
+            referenced.add(os.path.abspath(os.path.join(folder, output_ref)))
+        parsed[sidecar] = messages
+
+    media_exts = image_extensions + video_extensions + audio_extensions
+    loose = []
+    for root, dirs, files in os.walk(dataset_root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fn in files:
+            if fn.startswith(".") or not fn.lower().endswith(tuple(media_exts)):
+                continue
+            full = os.path.abspath(os.path.join(root, fn))
+            if full not in referenced and "_latent_cache" not in root:
+                loose.append(full)
+    if loose:
+        shown = "\n  ".join(loose[:8])
+        more = f"\n  ... and {len(loose) - 8} more" if len(loose) > 8 else ""
+        raise ValueError(
+            f"Conversation dataset {dataset_root}: {len(loose)} media files are not "
+            f"referenced by any sidecar (loose media does not train):\n  {shown}{more}"
+        )
+    return parsed
+
+
 class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin, TextEmbeddingCachingMixin, BucketsMixin, CaptionMixin, Dataset):
 
     def __init__(
@@ -447,7 +536,13 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         # check if dataset_path is a folder or json
         if os.path.isdir(self.dataset_path):
             extensions = image_extensions
-            if self.is_audio_model:
+            uses_sidecars = getattr(self.sd, 'uses_conversation_sidecars', False) if self.sd is not None else False
+            if uses_sidecars:
+                # conversation datasets: the .json sidecars ARE the items; the
+                # segment files they reference are validated below and must
+                # never train as standalone media
+                extensions = ['.json']
+            elif self.is_audio_model:
                 # only look for audio files
                 extensions = audio_extensions
             elif self.is_multimodal_llm:
@@ -504,6 +599,16 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         dataset_folder = self.dataset_path
         if not os.path.isdir(self.dataset_path):
             dataset_folder = os.path.dirname(dataset_folder)
+
+        conversation_items = None
+        if uses_sidecars:
+            if dataset_config.buckets:
+                raise ValueError(
+                    "conversation sidecar datasets do not support buckets "
+                    f"(dataset {self.dataset_path}): the sequence geometry "
+                    "lives in the artifact, not in pixel dimensions"
+                )
+            conversation_items = _scan_conversation_sidecars(file_list, dataset_folder)
         
         dataset_size_file = os.path.join(dataset_folder, '.aitk_size.json')
         dataloader_version = "0.1.2"
@@ -554,6 +659,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 file_item = FileItemDTO(
                     sd=self.sd,
                     path=file,
+                    is_conversation=file.lower().endswith(".json") if uses_sidecars else False,
+                    conversation=conversation_items.get(file) if conversation_items is not None else None,
                     is_audio_model=self.is_audio_model or (self.is_multimodal_llm and file.lower().endswith(tuple(audio_extensions))),
                     latent_flip_is_view=self._latent_flip_view,
                     dataset_config=dataset_config,
