@@ -603,10 +603,13 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         conversation_items = None
         if uses_sidecars:
             if dataset_config.buckets:
-                raise ValueError(
-                    "conversation sidecar datasets do not support buckets "
-                    f"(dataset {self.dataset_path}): the sequence geometry "
-                    "lives in the artifact, not in pixel dimensions"
+                # bucketing groups by pixel geometry; conversation items have
+                # none (the sequence geometry lives in the artifact) and the
+                # arch trains at batch size 1 -- the plain slot path is exact
+                dataset_config.buckets = False
+                print_acc(
+                    "Conversation sidecar dataset: bucketing disabled "
+                    "(sequence geometry is per-item; batch size is 1)"
                 )
             conversation_items = _scan_conversation_sidecars(file_list, dataset_folder)
         
