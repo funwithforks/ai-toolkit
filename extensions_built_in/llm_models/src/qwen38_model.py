@@ -24,8 +24,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from fla.modules import FusedRMSNormGated
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
 from toolkit.util.convrot_w4a8_quant import apply_forward_hooks, module_hooks_only, w4a8_grouped_linear
@@ -33,6 +31,22 @@ from toolkit.util.convrot_w4a8_quant import apply_forward_hooks, module_hooks_on
 from .qwen38_kernels import _conv_step_op, _decode_attn_op, add_rmsnorm, decode_attention_fused_ok, rmsnorm, swiglu
 
 # ------------------------------------------------------------------ norms / rope
+
+_FLA_OPS = None
+
+
+def _fla_ops():
+    """fla (flash-linear-attention) is a qwen38-only dependency, imported on first
+    use. The model registry imports this package eagerly (toolkit/util/get_model.py),
+    so a module-level fla import would silently drop qwen25_omni from the registry
+    on machines without fla installed."""
+    global _FLA_OPS
+    if _FLA_OPS is None:
+        from fla.modules import FusedRMSNormGated
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+
+        _FLA_OPS = (FusedRMSNormGated, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule)
+    return _FLA_OPS
 
 
 class RMSNorm(nn.Module):
@@ -173,7 +187,8 @@ class GatedDeltaNet(nn.Module):
         )
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log = nn.Parameter(torch.zeros(self.num_v_heads))
-        self.norm = FusedRMSNormGated(self.head_v_dim, eps=cfg.rms_norm_eps, activation="silu")
+        norm_cls, _, _ = _fla_ops()
+        self.norm = norm_cls(self.head_v_dim, eps=cfg.rms_norm_eps, activation="silu")
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
         self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
         self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
@@ -233,6 +248,7 @@ class GatedDeltaNet(nn.Module):
             cache.conv.copy_(F.pad(xt, (max(ks - t, 0), 0))[:, :, -ks:])
         conv = F.silu(F.conv1d(xt, self.conv1d.weight, None, padding=self.conv_kernel_size - 1, groups=self.conv_dim)[:, :, :t])
         q, k, v = self._heads(conv.transpose(1, 2))
+        _, chunk_gated_delta_rule, _ = _fla_ops()
         core, final = chunk_gated_delta_rule(
             q, k, v, g=g, beta=beta, initial_state=None, output_final_state=cache is not None,
             use_qk_l2norm_in_kernel=True,
@@ -249,6 +265,7 @@ class GatedDeltaNet(nn.Module):
         conv = _conv_step_op(cache.conv, mixed, self.conv1d.weight, ctx.commit)  # [B, M, C]
         q, k, v = self._heads(conv)
         # the decay / beta activations run inside the recurrent kernel
+        _, _, fused_recurrent_gated_delta_rule = _fla_ops()
         core, final = fused_recurrent_gated_delta_rule(
             q, k, v, g=a_raw.float(), beta=b_raw, initial_state=cache.rec, output_final_state=True,
             use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, A_log=self.A_log.float(),
@@ -268,6 +285,7 @@ class GatedDeltaNet(nn.Module):
         full = torch.cat([cache.conv, mixed.transpose(1, 2)], dim=-1)  # [B, C, ks-1+M]
         beta, g = self._gates(a_raw, b_raw)
         keep_h = keep.view(1, -1, 1).to(g.dtype)
+        _, _, fused_recurrent_gated_delta_rule = _fla_ops()
         _, final = fused_recurrent_gated_delta_rule(
             q, k, v, g=g * keep_h, beta=beta * keep_h.to(beta.dtype), initial_state=cache.rec,
             output_final_state=True, use_qk_l2norm_in_kernel=True,
