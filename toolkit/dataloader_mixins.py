@@ -2314,10 +2314,15 @@ class LatentCachingMixin:
                     if os.path.exists(prep_latent_path):
                         cached_state_dict = load_file(prep_latent_path, device='cpu') if to_memory else None
                         return prep_item, prep_latent_path, cached_state_dict, False
+                    if prep_item.is_conversation:
+                        # the sidecar is parsed at scan time and assembled at
+                        # encode time (main thread); there is no media decode
+                        return prep_item, prep_latent_path, None, True
                     # not saved to disk, load the image/video/audio
                     prep_item.load_and_process_image(self.transform, only_load_latents=True)
                 except Exception as e:
-                    print_acc(f"Error processing image: {prep_item.path}")
+                    kind = "conversation sidecar" if prep_item.is_conversation else "image"
+                    print_acc(f"Error processing {kind}: {prep_item.path}")
                     print_acc(f"Error: {str(e)}")
                     print_acc(" - Skipping file and removing it from the dataset")
                     return prep_item, None, None, False
@@ -2525,13 +2530,13 @@ class LatentCachingMixin:
                 if first_frame_latent is not None:
                     file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
 
-            del imgs
-            del latent
-            del frames
-            del file_item.tensor
-            del state_dict
-            del first_frame_latent
-            del audio_latent
+            if file_item.is_conversation:
+                # the artifact path never binds imgs/frames/tensor
+                del latent, state_dict
+            else:
+                del imgs, latent, frames
+                del file_item.tensor
+                del state_dict, first_frame_latent, audio_latent
             file_item.cleanup()
 
 
