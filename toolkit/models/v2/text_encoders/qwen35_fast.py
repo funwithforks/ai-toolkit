@@ -69,10 +69,13 @@ def fast_chunk_gated_delta_rule(
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
+    final_state_dtype=None,
 ):
     """(B, L, H, D) in, (B, L, H, D) out -- the tower's own dtype at the
     boundary, fp32 for every matmul and the carry inside (see module
-    docstring for why)."""
+    docstring for why). final_state_dtype overrides the boundary dtype for
+    the carried state only (callers with an fp32 state cache pass
+    torch.float32; the default keeps the tower's own-dtype behavior)."""
     wd = query.dtype
     rd = torch.float32
     query, key, value = [x.to(rd) for x in (query, key, value)]
@@ -171,7 +174,7 @@ def fast_chunk_gated_delta_rule(
     if not output_final_state:
         last_recurrent_state = None
     elif last_recurrent_state is not None:
-        last_recurrent_state = last_recurrent_state.to(wd)
+        last_recurrent_state = last_recurrent_state.to(wd if final_state_dtype is None else final_state_dtype)
     core_attn_out = core_attn_out.reshape(
         core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
     )
