@@ -313,7 +313,52 @@ checkpoint, both directions, cold and warm-header, through the
 acceptance runs: no live phased run of either model has happened.
 Treat the first real training run of either as the shakedown.
 
-## 6. Where the pieces live
+## 6. Stream-time quantization (opt-in): quantize a block as it streams
+
+For checkpoints too big to hold twice (a 46 GB bf16 mono on a 32 GB box),
+the streamed loader can quantize each repeated block the moment it finishes
+streaming, so peak ram is one block instead of the model. The mechanism is
+**shared and opt-in**:
+
+- `quantize_module`'s per-block body and extras pass are extracted as
+  `_quantize_stream_block` / `_quantize_extras_pass` (`toolkit/util/quantize.py`)
+  -- the batched rail and the streamed rail run the IDENTICAL body, so
+  results are bitwise comparable by construction. `group_stream_plan_by_blocks`
+  splits a stream plan into per-block groups + extras.
+- A model opts in with the class attribute `aitk_stream_quantize = True`
+  (default off -- every other model byte-for-byte unchanged). Its loader
+  streams each block group straight onto the quantize device and runs the
+  shared body per block, then marks the module
+  `module.aitk_stream_quantized = <qtype>`.
+- `aitk_post_load` honors the marker (`toolkit/models/v2/_mixin.py`): a
+  matching request skips the now-redundant block pass (offload/placement
+  still run); a mismatched request dequantizes the quanto pieces first
+  (`dequantize_quanto_to_linear`) so it can run fresh. ARA requests route
+  to the batched rail.
+- The job-dtype cast happens exactly where the batched rail's does: inside
+  the shared block body's `.to(device, dtype)`. Do not add a second cast at
+  assign time -- one cast, one place, per rail. The extras keep an
+  assign-time cast because the shared extras pass has none.
+- Assign per owning submodule, never the root: a root-level
+  `load_state_dict` walks every child, and after a block is quantized its
+  quanto `_load_from_state_dict` pops keys unconditionally and raises on a
+  partial dict.
+
+**Hazard:** `patch_dequantization_on_save` (`toolkit/dequantize.py`) replaces
+`state_dict` with one that materializes a full-model dequantized copy in
+host ram on every call. Never call `state_dict()` on a patched module --
+completeness gates scan `named_parameters`/`named_buffers` instead
+(`stream_meta_check`), and the patch applies only after the gate.
+
+**Reference implementation:** the LTX-2.3 rail
+(`extensions_built_in/diffusion_models/ltx2/ltx23_stream.py` +
+`LTX23Model._load_transformer`). Equivalence evidence: per-block bitwise
+identity against the batched input route on first/middle/last blocks of the
+real checkpoint, plan completeness 0 missing / 0 extra on every component of
+both rails, and a real `get_noise_prediction` forward through the loaded
+model.
+
+## 7. Where the pieces live
 
 | Concern | Anchor |
 |---|---|
@@ -328,8 +373,9 @@ Treat the first real training run of either as the shakedown.
 | Reference layout-converting model (shared cache; converts at the noising/target/decode boundaries) | `ideogram4/src/latent_layout.py` + the `add_noise`/`get_loss_target`/`decode_latents` overrides in `ideogram4.py` (the `flux2` id) |
 | Reference identity/no-weights id (constructs its vae; the comfy door is never exercised) | `iris3b/iris3b_vae_id.py` + `FakeVAE.encode_images/decode_latents` (the `iris3b` id) |
 | Lifecycle phase selection (`phases`) | `config_modules.py` `TrainConfig.phases`; guards/exits in `BaseSDTrainProcess.run()` |
-| Lazy reader, per-key placement | `weight_source.py:25` `:90` |
+| Lazy reader, per-key placement | `weight_source.py:25` `:90` (mmap fallback: seek reads when the file cannot be mapped) |
 | Stream-to-meta-shell reference | `ltx2.py:1609` `_stream_load`, `:1593` `_remap_file_key` |
+| Stream-quantize reference (shared bodies, grouper, marker) | `quantize.py` `_quantize_stream_block` / `_quantize_extras_pass` / `group_stream_plan_by_blocks`; `ltx23_stream.py` `quantize_streamed_plan` |
 | Batched path only when required | `ltx2.py:1570` `_as_shipped_stream_target` |
 | Pre-quantized attach | `comfy_quant_import.py:215`, `ltx2.py:1658` |
 | Variant filtering hook | `phased_load.py:36` `select_comfy_candidates` |
