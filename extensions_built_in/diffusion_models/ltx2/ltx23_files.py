@@ -158,7 +158,7 @@ def resolve_component_source(model, component: str) -> Tuple[str, str]:
     honors an explicit ``<component>_path`` override (an explicit file always
     wins, mono or split -- its layout is detected from its own keys)."""
     overrides = model.model_config.model_kwargs or {}
-    override = overrides.get(f"{component}_path", None)
+    override = overrides.get(f"{component}_path", None) or None
     if override is not None:
         path = resolve_named_file(
             override, component=f"ltx2.3 {component}", hf_token=os.getenv("HF_TOKEN")

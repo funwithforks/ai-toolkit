@@ -6,9 +6,10 @@ from .h3_probe import SUITE as H3_PROBE
 from .h3_vae_fixtures import SUITE as H3_VAE_FIXTURES
 from .h3_latent_ab import SUITE as H3_LATENT_AB
 from .ltx2_train import SUITE as LTX2_TRAIN
+from .ltx23_train import SUITE as LTX23_TRAIN
 from .flux3_train import SUITE as FLUX3_TRAIN
 from .moss_train import SUITE as MOSS_TRAIN
 from .qwen38_train import SUITE as QWEN38_TRAIN
 
 ALL = (H3_TRAIN, ATTN_MICRO, H3_PROBE, H3_VAE_FIXTURES, H3_LATENT_AB,
-       LTX2_TRAIN, FLUX3_TRAIN, MOSS_TRAIN, QWEN38_TRAIN)
+       LTX2_TRAIN, LTX23_TRAIN, FLUX3_TRAIN, MOSS_TRAIN, QWEN38_TRAIN)
