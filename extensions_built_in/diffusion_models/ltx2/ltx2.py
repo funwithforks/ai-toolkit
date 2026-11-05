@@ -1,7 +1,7 @@
 from functools import partial
 import json
 import os
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torchaudio
@@ -22,6 +22,15 @@ from toolkit.prompt_utils import PromptEmbeds
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
+)
+from .ltx23_stream import (
+    build_stream_plan,
+    gemma3_stream_key,
+    pack_audio_latents,
+    plain_stream_load,
+    quantize_streamed_plan,
+    stream_assign,
+    stream_meta_check,
 )
 from accelerate import init_empty_weights
 from toolkit.accelerator import unwrap_model
@@ -51,6 +60,7 @@ try:
     from toolkit.models.v2.text_encoders.gemma3 import Gemma3TextEncoder
     from .convert_ltx2_to_diffusers import (
         CONNECTOR_KEY_PREFIXES,
+        QUANT_SIDE_KEY_SUFFIXES,
         get_model_state_dict_from_combined_ckpt,
         get_ltx2_audio_vae_config,
         get_ltx2_connectors_config,
@@ -67,6 +77,15 @@ try:
         convert_comfy_gemma3_to_transformers,
         convert_lora_original_to_diffusers,
         convert_lora_diffusers_to_original,
+    )
+    from .ltx23_files import (
+        LTX2_VAE_ID,
+        LTX23_TE_CANDIDATES,
+        LTX23_TE_UPSTREAM_DEFAULT,
+        LTX23_TOKENIZER_SOURCE,
+        find_local_te_file,
+        resolve_component_source,
+        text_projection_prefix,
     )
 except ImportError as e:
     print("Diffusers import error:", e)
@@ -126,7 +145,9 @@ class ComboVae(torch.nn.Module):
 
     The phased ltx2.5 path also carries the vocoder here so the whole
     audio/video decode bundle shares one lifecycle (H3 vae-bundle shape);
-    the vocoder slot stays None on the legacy 2.0/2.3 path."""
+    the vocoder slot stays None on the legacy 2.0/2.3 path -- and on the
+    phased 2.3 rail, where the vocoder is decode-only and streams on
+    demand (one vae at a time), never resident through phase 1."""
 
     def __init__(
         self,
@@ -138,6 +159,13 @@ class ComboVae(torch.nn.Module):
         self.vae = vae
         self.audio_vae = audio_vae
         self.vocoder = vocoder
+        # set by the ltx2 vae_id entry from the model config; encode_images
+        # wraps its work in the low_vram framewise-tiling flags the legacy
+        # path sets per call
+        self.low_vram_tiling = False
+        # the bundle's own mel transform (fp32); the model-level one stays
+        # None on the phased rail -- every encode routes through here
+        self.audio_processor: Optional[AudioProcessor] = None
 
     @property
     def device(self):
@@ -164,6 +192,134 @@ class ComboVae(torch.nn.Module):
         **kwargs,
     ):
         return self.vae.decode(*args, **kwargs)
+
+    # -- the vae does the vae work ------------------------------------------
+    # encode/decode for everything the ltx2 id covers. Device and precision
+    # come from the members' own shipped parameters, which is what makes one
+    # cached latent valid for every model declaring this id, and what stops
+    # a job config from rounding the latents. device/dtype say where the
+    # CALLER wants the result; they never change how it is computed. The
+    # math mirrors the legacy LTX2Model methods op for op.
+
+    @torch.no_grad()
+    def encode_images(self, image_list: List[torch.Tensor], device=None, dtype=None):
+        if self.vae is None:
+            raise RuntimeError("ltx2 vae: image encode needs the video vae")
+        vae = self.vae
+        if self.low_vram_tiling:
+            vae.tile_sample_min_num_frames = 64
+            vae.tile_sample_stride_num_frames = 16
+            # they check the wrong flat on encode currently so set both to future proof
+            vae.use_framewise_decoding = True
+            vae.use_framewise_encoding = True
+
+        # Normalize shapes
+        norm_images = []
+        for image in image_list:
+            if image.ndim == 3:
+                # (C, H, W) -> (C, 1, H, W)
+                norm_images.append(image.unsqueeze(1))
+            elif image.ndim == 4:
+                # (T, C, H, W) -> (C, T, H, W)
+                norm_images.append(image.permute(1, 0, 2, 3))
+            else:
+                raise ValueError(f"Invalid image shape: {image.shape}")
+
+        # Stack to (B, C, T, H, W)
+        images = torch.stack(norm_images).to(vae.device, dtype=vae.dtype)
+
+        latents = vae.encode(images).latent_dist.sample()
+
+        # Normalize latents across the channel dimension [B, C, F, H, W]
+        scaling_factor = 1.0
+        latents_mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents_std = vae.latents_std.view(1, -1, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = (latents - latents_mean) * scaling_factor / latents_std
+
+        if self.low_vram_tiling:
+            vae.use_framewise_decoding = False
+            vae.use_framewise_encoding = False
+
+        return latents if device is None and dtype is None else latents.to(device, dtype=dtype)
+
+    def decode_latents(self, latents, device=None, dtype=None):
+        # differentiable: pixel-space losses backprop through the video vae
+        if self.vae is None:
+            raise RuntimeError("ltx2 vae: decode needs the video vae")
+        vae = self.vae
+        batch = latents.unsqueeze(0) if latents.ndim == 4 else latents
+        batch = batch.to(vae.device, vae.dtype)
+        latents_mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(
+            batch.device, batch.dtype
+        )
+        latents_std = vae.latents_std.view(1, -1, 1, 1, 1).to(
+            batch.device, batch.dtype
+        )
+        denorm = batch * latents_std + latents_mean
+        decoded = vae.decode(denorm).sample
+        # (B, C, T, H, W) -> (T, C, H, W)
+        video = decoded.squeeze(0).permute(1, 0, 2, 3).contiguous()
+        return video if device is None and dtype is None else video.to(device, dtype=dtype)
+
+    @torch.no_grad()
+    def encode_audio(self, audio_data_list):
+        """audio_data_list: [{"waveform": [C, L], "sample_rate": int}] ->
+        packed, normalized audio latents [B, L, C * M] at the audio vae's
+        own precision. Mirrors the legacy encode_audio op for op; the mel
+        cast targets the audio vae's dtype instead of the job's (same bytes
+        whenever the job dtype matches the shipped vae, which the phased
+        contract guarantees is the only policy there is)."""
+        if self.audio_vae is None:
+            raise RuntimeError("ltx2 vae: audio encode needs the audio vae")
+        if self.audio_processor is None:
+            raise RuntimeError(
+                "ltx2 vae: no audio processor -- the vae_id entry sets one"
+            )
+        audio_vae = self.audio_vae
+        output_tensor = None
+
+        # do them seperatly for now
+        for audio_data in audio_data_list:
+            waveform = audio_data["waveform"].to(
+                device=self.audio_vae.device,
+                dtype=torch.float32,
+            )
+            sample_rate = audio_data["sample_rate"]
+
+            # Add batch dimension if needed: [channels, samples] -> [batch, channels, samples]
+            if waveform.dim() == 2:
+                waveform = waveform.unsqueeze(0)
+
+            if waveform.shape[1] == 1:
+                # make sure it is stereo
+                waveform = waveform.repeat(1, 2, 1)
+
+            # Convert waveform to mel spectrogram using AudioProcessor
+            mel_spectrogram = self.audio_processor.waveform_to_mel(
+                waveform, waveform_sample_rate=sample_rate
+            )
+            mel_spectrogram = mel_spectrogram.to(dtype=audio_vae.dtype)
+
+            # Encode mel spectrogram to latents
+            latents = audio_vae.encode(
+                mel_spectrogram.to(audio_vae.device, dtype=audio_vae.dtype)
+            ).latent_dist.sample()
+
+            packed_latents = pack_audio_latents(latents)  # [B, L, C * M]
+            if output_tensor is None:
+                output_tensor = packed_latents
+            else:
+                output_tensor = torch.cat([output_tensor, packed_latents], dim=0)
+
+        # normalize latents, opposite of (latents * latents_std) + latents_mean
+        latents_mean = audio_vae.latents_mean
+        latents_std = audio_vae.latents_std
+        output_tensor = (output_tensor - latents_mean) / latents_std
+        return output_tensor
 
 
 class AudioProcessor(torch.nn.Module):
@@ -1233,10 +1389,836 @@ class LTX2Model(BaseModel):
         return super().convert_lora_weights_before_load(state_dict)
 
 
-class LTX23Model(LTX2Model):
+class LTX23Model(PhasedLoadMixin, LTX2Model):
+    """LTX-2.3 on the phased loading rail.
+
+    Loading and caching semantics come from the upstream 2.3 path; the phase
+    contract comes from PhasedLoadMixin. The transformer streams from the mono
+    checkpoint (or the comfy split files) and -- opt-in -- quantizes each
+    block as it streams (aitk_stream_quantize), running the identical
+    per-block body the batched rail's quantize_module runs, so the quantized
+    weights are the same the legacy pass produces, bitwise. The text encoder
+    is Gemma-3 12B; the connectors are a phase-2 component freed at the
+    boundary (embed caches carry their outputs); the vae bundle is owned by
+    the "ltx2" vae_id registry entry, and the vocoder is decode-only (streams
+    on demand, one vae at a time)."""
+
     arch = "ltx2.3"
     ltx_version = "2.3"
-    ltx_te_path = base_te_path
+    ltx_te_path = LTX23_TE_UPSTREAM_DEFAULT
+    display_name = "LTX-2.3"
+    vae_id = LTX2_VAE_ID
+    # denoise and decode are separate passes (staged_sample.py): the vae
+    # bundle stays off the card for the whole denoise round, and nothing but
+    # the transformer is needed to produce latents from cached connector
+    # embeds. See BaseModel.generate_images staged dispatch.
+    staged_sampling = True
+    # quantize-as-you-stream: each transformer block quantizes as it finishes
+    # streaming, so the 46 GB bf16 checkpoint loads at a peak of one block
+    # instead of the whole model. Same extracted block body, bitwise-same
+    # result; the equivalence test against the batched rail holds the line.
+    aitk_stream_quantize = True
+
+    # The shipped int8 convrot scheme (Kijai ltx-2.3-22b-dev_transformer_only_int8_convrot,
+    # classified from its own header): every transformer-block linear is
+    # convrot EXCEPT the gate-logit projections; kept at high precision:
+    # the patchify/out projections, the adaln/time-embed families, the QK
+    # norms (not linears) and the fp32 modulation tables (not linears).
+    # Expressed as fnmatch excludes so a convrot pass on the bf16 checkpoint
+    # reproduces the shipped layer set. model_kwargs quantize_exclude=none
+    # clears it (the same-layers-as-qfloat8 run).
+    _SHIPPED_INT8_EXCLUDES = (
+        "proj_in",
+        "audio_proj_in",
+        "proj_out",
+        "audio_proj_out",
+        "*.to_gate_logits",
+        "time_embed*",
+        "audio_time_embed*",
+        "prompt_adaln*",
+        "audio_prompt_adaln*",
+        "av_cross_attn_*",
+    )
+
+    def get_quantization_exclude_modules(self):
+        override = (self.model_config.model_kwargs or {}).get(
+            "quantize_exclude", None
+        )
+        if override is not None and str(override).lower() in (
+            "none",
+            "",
+            "false",
+            "off",
+        ):
+            return []
+        return list(self._SHIPPED_INT8_EXCLUDES)
+
+    # ------------------------------------------------------------------
+    # stream targets
+    # ------------------------------------------------------------------
+    def _as_shipped_stream_target(self, role: str = "transformer"):
+        """Device the stream loader reads straight onto, or None when the
+        batched cpu load applies (low_vram parking, or an ARA request -- the
+        adapter wiring wants the batched converters). Quantization itself no
+        longer forces the batched rail: the stream-quantize path covers it."""
+        if self.low_vram:
+            return None
+        if role == "transformer":
+            qtype = self.component_load_kwargs("transformer")["qtype"]
+            if qtype is not None and "|" in qtype:
+                return None
+        return self.device_torch
+
+    def _attach_quantized(self, module, state_dict, name: str) -> int:
+        """Attach pre-quantized (int8 ConvRot) linears and load the rest of
+        the (meta-built) module. Works unchanged for bf16 checkpoints, where
+        no quant markers exist and everything strict-loads."""
+        from toolkit.models.v2._mixin import OstrisModelMixin
+        from toolkit.util.comfy_quant_import import import_comfy_quantized_layers
+
+        state_dict, num_quantized = import_comfy_quantized_layers(
+            module, state_dict, orig_dtype=self.torch_dtype
+        )
+        if num_quantized:
+            self.print_and_status_update(
+                f" - attached {num_quantized} pre-quantized ConvRot layers to {name}"
+            )
+        OstrisModelMixin._load_state_dict_with_quantized(module, state_dict)
+        return num_quantized
+
+    def _mixed_file_post_load(self, module, num_quantized):
+        if not num_quantized:
+            return
+        # mixed-precision comfy file: comfy-style per-op input casting with
+        # the stored-fp32 pieces pinned. No .to(dtype) anywhere: shipped
+        # precision is kept as-is.
+        attach_per_op_casting(module)
+        pin_stored_fp32(module)
+        # pre-quantized (ConvRot) comfy file; aitk_post_load skips quantize
+        module.aitk_is_quantized = True
+
+    # ------------------------------------------------------------------
+    # phase 3: transformer
+    # ------------------------------------------------------------------
+    def _load_transformer(self):
+        dit_path, dit_prefix_used = resolve_component_source(self, "dit")
+        self.print_and_status_update(
+            f"Loading transformer from {os.path.basename(dit_path)}"
+        )
+        stream_dev = self._as_shipped_stream_target()
+        if stream_dev is None:
+            return self._load_transformer_batched(dit_path, dit_prefix_used)
+
+        from toolkit.util.weight_source import WeightSource
+
+        t_config, t_rename, t_special = get_ltx2_transformer_config(
+            self.ltx_version
+        )
+        # same classification the batched split uses: connector keys belong
+        # to the connectors component, loaded lazily in the embedding phase
+        plan = build_stream_plan(
+            WeightSource.open(dit_path),
+            dit_prefix_used,
+            t_rename,
+            t_special,
+            skip_prefixes=CONNECTOR_KEY_PREFIXES,
+        )
+        with init_empty_weights():
+            transformer = LTX2VideoTransformer3DModel.from_config(
+                t_config["diffusers_config"]
+            )
+
+        kwargs = self.component_load_kwargs("transformer")
+        if kwargs["qtype"] is not None and self.aitk_stream_quantize:
+            # quantize as each block finishes streaming: peak memory is one
+            # block, and the per-block body is the extracted quantize_module
+            # loop iteration -- bitwise the same weights the batched rail
+            # produces
+            quantize_device = kwargs["quantize_device"]
+            keep_on_device = (
+                not kwargs["offload"]
+                and torch.device(kwargs["device"]) == torch.device(quantize_device)
+                and torch.device(kwargs["device"]).type != "cpu"
+            )
+            quantize_streamed_plan(
+                transformer,
+                plan,
+                transformer.get_transformer_block_names(),
+                qtype=kwargs["qtype"],
+                quantize_device=quantize_device,
+                dtype=kwargs["dtype"],
+                exclude=self.get_quantization_exclude_modules(),
+                quantize_kwargs=self.model_config.quantize_kwargs,
+                keep_on_device=keep_on_device,
+                status_fn=self.print_and_status_update,
+            )
+            transformer.aitk_stream_quantized = kwargs["qtype"]
+        else:
+            num_quantized = plain_stream_load(
+                transformer, plan, stream_dev, "transformer",
+                orig_dtype=self.torch_dtype,
+            )
+            self._mixed_file_post_load(transformer, num_quantized)
+        flush()
+        return transformer
+
+    def _load_transformer_batched(self, dit_path, dit_prefix_used):
+        """low_vram / ARA carve-out: the batched cpu converters (the adapter
+        wiring and the low_vram parking want the whole cpu state dict; same
+        carve-out the shared loader keeps). Mirrors the legacy body."""
+        combined = load_file(dit_path)
+        if dit_prefix_used == dit_prefix:
+            # fp8-scaled mono files dequantize here; a bf16 file is identity
+            combined = dequantize_state_dict(combined)
+        dit_sd = get_model_state_dict_from_combined_ckpt(combined, dit_prefix)
+        del combined
+
+        transformer, transformer_sd = convert_ltx2_transformer(
+            dit_sd, version=self.ltx_version, load=False
+        )
+        num_quantized = self._attach_quantized(
+            transformer, transformer_sd, "transformer"
+        )
+        del transformer_sd
+        trans_sd, _ = split_transformer_and_connector_state_dict(dit_sd)
+        for key in trans_sd:
+            dit_sd.pop(key, None)
+        del trans_sd, dit_sd
+        self._mixed_file_post_load(transformer, num_quantized)
+        flush()
+        return transformer
+
+    # ------------------------------------------------------------------
+    # connectors: a phase-2 component (the embed caches carry its outputs)
+    # ------------------------------------------------------------------
+    def _load_connectors_streamed(self, stream_dev):
+        from toolkit.util.weight_source import WeightSource
+
+        dit_path, dit_prefix_used = resolve_component_source(self, "dit")
+        proj_path, _proj_prefix = resolve_component_source(self, "text_projection")
+        dit_source = WeightSource.open(dit_path)
+        proj_source = WeightSource.open(proj_path)
+        c_config, c_rename, c_special = get_ltx2_connectors_config(
+            self.ltx_version
+        )
+        # connector blocks ride in the dit section; the per-modality
+        # projections keep their own prefix in both layouts (the rename
+        # table matches it), so the projection plan is built unstripped
+        connector_plan = build_stream_plan(
+            dit_source,
+            dit_prefix_used,
+            c_rename,
+            c_special,
+            keep_prefixes=CONNECTOR_KEY_PREFIXES,
+        )
+        connector_plan.update(
+            build_stream_plan(
+                proj_source,
+                "",
+                c_rename,
+                c_special,
+                keep_prefixes=(text_projection_prefix,),
+            )
+        )
+        with init_empty_weights():
+            connectors = LTX2TextConnectors.from_config(
+                c_config["diffusers_config"]
+            )
+        num_quantized = plain_stream_load(
+            connectors, connector_plan, stream_dev, "connectors",
+            orig_dtype=self.torch_dtype,
+        )
+        self._mixed_file_post_load(connectors, num_quantized)
+        flush()
+        return connectors
+
+    def _load_connectors_batched(self):
+        combined = load_file(
+            resolve_component_source(self, "dit")[0]
+        )
+        if resolve_component_source(self, "dit")[1] == dit_prefix:
+            combined = dequantize_state_dict(combined)
+        dit_sd = get_model_state_dict_from_combined_ckpt(combined, dit_prefix)
+        del combined
+        proj_combined = load_file(
+            resolve_component_source(self, "text_projection")[0]
+        )
+        for key in proj_combined:
+            if key.startswith(text_projection_prefix):
+                dit_sd[key] = proj_combined[key]
+        del proj_combined
+        trans_sd, conn_sd = split_transformer_and_connector_state_dict(dit_sd)
+        del trans_sd, dit_sd
+
+        connectors, connectors_sd = convert_ltx2_connectors(
+            conn_sd, version=self.ltx_version, load=False
+        )
+        del conn_sd
+        num_quantized = self._attach_quantized(
+            connectors, connectors_sd, "connectors"
+        )
+        del connectors_sd
+        self._mixed_file_post_load(connectors, num_quantized)
+        flush()
+        return connectors
+
+    def _ensure_connectors(self, reason: str):
+        # connectors run only while embeds are produced (embedding phase).
+        # They load on first use with a printed reason and stay out of every
+        # other phase.
+        if self.connectors is not None:
+            return self.connectors
+        self.print_and_status_update(f"Loading connectors - {reason}")
+        if self.low_vram:
+            connectors = self._load_connectors_batched()
+        else:
+            connectors = self._load_connectors_streamed(self.device_torch)
+        self.connectors = connectors
+        if self.pipeline is not None:
+            self.pipeline.connectors = connectors
+        flush()
+        return connectors
+
+    def release_encode_phase_components(self):
+        # end of the embedding phase: nothing in training or staged sampling
+        # consumes the connector module anymore - the embed caches carry
+        # their outputs
+        if self.connectors is None:
+            return
+        print("Connectors released - embed caches carry the connector outputs")
+        self.connectors = None
+        if self.pipeline is not None:
+            self.pipeline.connectors = None
+        flush()
+
+    def get_prompt_embeds(self, prompt: str) -> AdvancedPromptEmbeds:
+        # LTX-2.3 caches embeddings in CONNECTOR space on this rail. The raw
+        # encoder output is padded and projected while the embedding phase is
+        # up (connectors lazy-load here and are freed at the phase boundary);
+        # nothing downstream ever sees the raw stack. Same math as the legacy
+        # rail's pad-then-connect inside get_noise_prediction: the connectors
+        # are frozen with dropout 0.0, so cache-time == train-time.
+        raw = super().get_prompt_embeds(prompt)
+        padded = self.pad_embeds(raw)
+        connectors = self._ensure_connectors("embedding conversion")
+        # tokenizer is up (we just tokenized through it); load sets padding
+        # left for gemma
+        padding_side = self.tokenizer[0].padding_side
+        with torch.no_grad():
+            video, audio, mask = connectors(
+                padded.text_embeds.to(self.device_torch, self.torch_dtype),
+                padded.attention_mask.to(self.device_torch, self.torch_dtype),
+                padding_side=padding_side,
+            )
+        pe = AdvancedPromptEmbeds(
+            connector_prompt_embeds=video.detach().cpu(),
+            connector_audio_prompt_embeds=audio.detach().cpu(),
+            connector_attention_mask=mask.detach().cpu(),
+        )
+        del raw, padded
+        flush()
+        return pe
+
+    def embed_file_valid(self, path: str) -> bool:
+        # LTX-2.3 embed files are connector-space AdvancedPromptEmbeds.
+        # Anything else (plain raw-encoder caches from the legacy rail) fails
+        # and gets re-encoded through the text encoder phase. Only damaged
+        # or unreadable files are treated as invalid; both callers check
+        # existence first, so anything other than a real file error must
+        # propagate (a swallowed code bug here would silently re-encode
+        # every cache, forever, and nobody would notice).
+        from safetensors import _safetensors_rust, safe_open
+
+        try:
+            with safe_open(path, framework="pt") as f:
+                if (f.metadata() or {}).get("class_name", "") != (
+                    "AdvancedPromptEmbeds"
+                ):
+                    return False
+                keys = set(f.keys())
+        except (_safetensors_rust.SafetensorError, OSError):
+            return False
+        return {
+            "connector_prompt_embeds",
+            "connector_audio_prompt_embeds",
+            "connector_attention_mask",
+        } <= keys
+
+    # ------------------------------------------------------------------
+    # phase 2: text encoder (Gemma-3 12B)
+    # ------------------------------------------------------------------
+    def _gemma3_shell(self):
+        with init_empty_weights():
+            return Gemma3TextEncoder(
+                Gemma3Config(
+                    **{
+                        "boi_token_index": 255999,
+                        "bos_token_id": 2,
+                        "eoi_token_index": 256000,
+                        "eos_token_id": 106,
+                        "image_token_index": 262144,
+                        "initializer_range": 0.02,
+                        "mm_tokens_per_image": 256,
+                        "model_type": "gemma3",
+                        "pad_token_id": 0,
+                        "text_config": {
+                            "attention_bias": False,
+                            "attention_dropout": 0.0,
+                            "attn_logit_softcapping": None,
+                            "cache_implementation": "hybrid",
+                            "final_logit_softcapping": None,
+                            "head_dim": 256,
+                            "hidden_activation": "gelu_pytorch_tanh",
+                            "hidden_size": 3840,
+                            "initializer_range": 0.02,
+                            "intermediate_size": 15360,
+                            "max_position_embeddings": 131072,
+                            "model_type": "gemma3_text",
+                            "num_attention_heads": 16,
+                            "num_hidden_layers": 48,
+                            "num_key_value_heads": 8,
+                            "query_pre_attn_scalar": 256,
+                            "rms_norm_eps": 1e-06,
+                            "rope_local_base_freq": 10000,
+                            "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
+                            "rope_theta": 1000000,
+                            "sliding_window": 1024,
+                            "sliding_window_pattern": 6,
+                            "torch_dtype": "bfloat16",
+                            "use_cache": True,
+                            "vocab_size": 262208,
+                        },
+                        "torch_dtype": "bfloat16",
+                        "transformers_version": "4.51.3",
+                        "unsloth_fixed": True,
+                        "vision_config": {
+                            "attention_dropout": 0.0,
+                            "hidden_act": "gelu_pytorch_tanh",
+                            "hidden_size": 1152,
+                            "image_size": 896,
+                            "intermediate_size": 4304,
+                            "layer_norm_eps": 1e-06,
+                            "model_type": "siglip_vision_model",
+                            "num_attention_heads": 16,
+                            "num_channels": 3,
+                            "num_hidden_layers": 27,
+                            "patch_size": 14,
+                            "torch_dtype": "bfloat16",
+                            "vision_use_head": False,
+                        },
+                    }
+                )
+            )
+
+    def _load_gemma3_from_file(self, te_path: str):
+        """Stream a comfy gemma3 checkpoint into the meta shell. The converter
+        is a pure key remap (+ the lm_head/embed_tokens tie, which maps two
+        module keys onto one file tensor); scale-keyed (fp8) files route to
+        the batched converters instead."""
+        from toolkit.util.weight_source import WeightSource
+
+        source = WeightSource.open(te_path)
+        file_keys = list(source.keys())
+        side_keys = [
+            k
+            for k in file_keys
+            if k.endswith(QUANT_SIDE_KEY_SUFFIXES) or k.split(".")[-1] == "scaled_fp8"
+        ]
+        if side_keys:
+            raise ValueError(
+                f"LTX-2.3: {os.path.basename(te_path)} carries quantization "
+                "side keys; the streamed gemma3 route loads clean checkpoints "
+                "-- use the batched route (te_name_or_path pointing at a repo) "
+                "or a full-precision file."
+            )
+        plan = {}
+        for file_key in file_keys:
+            mapped = gemma3_stream_key(file_key)
+            if mapped is not None:
+                plan[mapped] = (source, file_key)
+        # the converter ties lm_head to the embeddings when the file lacks it:
+        # two module keys, one file tensor
+        if (
+            "lm_head.weight" not in plan
+            and "model.language_model.embed_tokens.weight" in plan
+        ):
+            plan["lm_head.weight"] = plan[
+                "model.language_model.embed_tokens.weight"
+            ]
+        text_encoder = self._gemma3_shell()
+        num_quantized = plain_stream_load(
+            text_encoder, plan, "cpu", "text encoder",
+            orig_dtype=self.torch_dtype,
+        )
+        self._mixed_file_post_load(text_encoder, num_quantized)
+        # the vision tower rode along (the legacy rail loads it the same way
+        # before discarding it)
+        text_encoder.model.vision_tower = None
+        flush()
+        return text_encoder
+
+    def _resolve_te_source(self) -> Tuple[str, str]:
+        """(source, kind) with kind in {"file", "repo"}, or (None, None) when
+        nothing is explicit and no candidate file is local -- the loader then
+        walks the quality order (higher precision first, gated last)."""
+        te_name_or_path = self.model_config.te_name_or_path
+        if te_name_or_path is not None:
+            if te_name_or_path.endswith(".safetensors"):
+                from toolkit.models.v2.resolver import resolve_named_file
+
+                return (
+                    resolve_named_file(
+                        te_name_or_path,
+                        component="ltx2.3 text encoder",
+                        hf_token=os.getenv("HF_TOKEN"),
+                    ),
+                    "file",
+                )
+            return te_name_or_path, "repo"
+        for kind, source in LTX23_TE_CANDIDATES:
+            if kind == "file":
+                found = find_local_te_file(os.path.basename(source))
+                if found:
+                    return found, "file"
+        return None, None
+
+    def _load_text_encoder(self):
+        self.print_and_status_update("Loading text encoder")
+        te_source, te_kind = self._resolve_te_source()
+        if te_kind == "file":
+            tokenizer = GemmaTokenizerFast.from_pretrained(
+                LTX23_TOKENIZER_SOURCE
+            )
+            text_encoder = self._load_gemma3_from_file(te_source)
+            return tokenizer, text_encoder, {}
+
+        # repo route (explicit, or the quality-ordered candidate walk: higher
+        # precision first, gated last -- a failure prints and falls through)
+        attempts = []
+        if te_source is not None:
+            attempts.append(te_source)
+        else:
+            attempts = [src for kind, src in LTX23_TE_CANDIDATES if kind == "repo"]
+        last_error = None
+        for repo in attempts:
+            try:
+                tokenizer = GemmaTokenizerFast.from_pretrained(repo)
+                text_encoder = Gemma3TextEncoder.load_model(
+                    repo, dtype=self.torch_dtype, subfolder=""
+                )
+                # remove the vision tower
+                text_encoder.model.vision_tower = None
+                flush()
+                return tokenizer, text_encoder, {}
+            except Exception as e:
+                last_error = e
+                self.print_and_status_update(
+                    f" - text encoder source unavailable: {repo} ({e})"
+                )
+        raise FileNotFoundError(
+            f"LTX-2.3: no text encoder source resolved (tried {attempts}): "
+            f"{last_error}. Set te_name_or_path to a local gemma3 file or repo."
+        )
+
+    def load_text_encoder(self):
+        super().load_text_encoder()
+        if self.pipeline is not None:
+            self.pipeline.text_encoder = self.text_encoder
+            self.pipeline.tokenizer = self.tokenizer
+        # the shared 2.0/2.3 code consumes these as single-element lists
+        if not isinstance(self.text_encoder, list):
+            self.text_encoder = [self.text_encoder]
+        if not isinstance(self.tokenizer, list):
+            self.tokenizer = [self.tokenizer]
+
+    # ------------------------------------------------------------------
+    # pipeline container + vae handle (the registry owns the vae load)
+    # ------------------------------------------------------------------
+    def _ensure_phase_pipeline(self):
+        if self.pipeline is None:
+            if self.noise_scheduler is None:
+                self.noise_scheduler = self.get_train_scheduler()
+            self.pipeline = self._build_pipeline()
+
+    def _build_pipeline(self):
+        # slots are filled from whatever is resident at build time and
+        # re-wired by the phases that follow (load order differs between
+        # the composed all-at-once load and the phased train load, and a
+        # fully-cached run may have no vae/te at all)
+        bundle = self._vae
+        text_encoder = self.text_encoder
+        if isinstance(text_encoder, list):
+            text_encoder = text_encoder[0] if text_encoder else None
+        tokenizer = self.tokenizer
+        if isinstance(tokenizer, list):
+            tokenizer = tokenizer[0] if tokenizer else None
+        pipe: LTX2Pipeline = LTX2Pipeline(
+            scheduler=self.noise_scheduler,
+            vae=bundle.vae if bundle is not None else None,
+            audio_vae=bundle.audio_vae if bundle is not None else None,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            connectors=self.connectors,
+            transformer=None,
+            vocoder=bundle.vocoder if bundle is not None else None,
+        )
+        pipe.transformer = self.model
+        return pipe
+
+    # The pipeline holds the vae-family modules in its own slots, so the
+    # plain holder attr would let `sd.vae = None` (the process' phase
+    # boundary / post-sample free) drop nothing while the slots kept them
+    # alive. One property keeps holder and slots in lockstep -- assign the
+    # bundle to load it, assign None to truly free it.
+    _vae = None
+
+    @property
+    def vae(self):
+        return self._vae
+
+    @vae.setter
+    def vae(self, value):
+        self._vae = value
+        pipe = self.pipeline
+        if pipe is not None:
+            pipe.vae = getattr(value, "vae", None)
+            pipe.audio_vae = getattr(value, "audio_vae", None)
+            pipe.vocoder = getattr(value, "vocoder", None)
+
+    def encode_audio(self, audio_data_list):
+        if self._vae is None:
+            raise RuntimeError(
+                "LTX-2.3: audio encode needs the vae bundle (phase 1); "
+                "uncached audio latents require a latent caching pass"
+            )
+        return self._vae.encode_audio(audio_data_list)
+
+    # ------------------------------------------------------------------
+    # staged sampling decode: one vae at a time, vocoder streams on demand
+    # ------------------------------------------------------------------
+    def _stream_video_vae(self, device):
+        from toolkit.util.weight_source import WeightSource
+
+        self.print_and_status_update("Loading video VAE")
+        video_config, video_rename, video_special = get_ltx2_video_vae_config(
+            self.ltx_version
+        )
+        video_path, video_prefix = resolve_component_source(self, "video_vae")
+        video_plan = build_stream_plan(
+            WeightSource.open(video_path), video_prefix, video_rename, video_special
+        )
+        with init_empty_weights():
+            vae = LTX2VideoVAE.from_config(video_config["diffusers_config"])
+        plain_stream_load(vae, video_plan, device, "video VAE", orig_dtype=self.torch_dtype)
+        flush()
+        return vae
+
+    def _stream_audio_vae(self, device):
+        from toolkit.util.weight_source import WeightSource
+
+        self.print_and_status_update("Loading audio VAE")
+        audio_config, audio_rename, audio_special = get_ltx2_audio_vae_config(
+            self.ltx_version
+        )
+        audio_path, audio_prefix = resolve_component_source(self, "audio_vae")
+        audio_plan = build_stream_plan(
+            WeightSource.open(audio_path), audio_prefix, audio_rename, audio_special
+        )
+        with init_empty_weights():
+            audio_vae = LTX2AudioVAE.from_config(
+                audio_config["diffusers_config"]
+            )
+        plain_stream_load(audio_vae, audio_plan, device, "audio VAE", orig_dtype=self.torch_dtype)
+        flush()
+        return audio_vae
+
+    def _stream_vocoder(self, device):
+        from toolkit.util.weight_source import WeightSource
+
+        self.print_and_status_update("Loading vocoder")
+        vocoder_config, vocoder_rename, vocoder_special = get_ltx2_vocoder_config(
+            self.ltx_version
+        )
+        # the vocoder rides in the audio vae file under "vocoder." keys
+        audio_path, _audio_prefix = resolve_component_source(self, "audio_vae")
+        vocoder_plan = build_stream_plan(
+            WeightSource.open(audio_path),
+            vocoder_prefix,
+            vocoder_rename,
+            vocoder_special,
+        )
+        with init_empty_weights():
+            vocoder = LTX2VocoderWithBWE.from_config(
+                vocoder_config["diffusers_config"]
+            )
+        plain_stream_load(vocoder, vocoder_plan, device, "vocoder", orig_dtype=self.torch_dtype)
+        flush()
+        return vocoder
+
+    def generate_single_image(
+        self,
+        pipeline,
+        gen_config: GenerateImageConfig,
+        conditional_embeds: AdvancedPromptEmbeds,
+        unconditional_embeds: AdvancedPromptEmbeds,
+        generator: torch.Generator,
+        extra: dict,
+    ):
+        # staged denoise pass: returns a latents payload, decoded later by
+        # decode_staged_samples once the vae is resident
+        if gen_config.ctrl_img is not None or gen_config.latents is not None:
+            raise NotImplementedError(
+                "LTX-2.3 staged sampling: control-image and latent-conditioned "
+                "samples are not on this rail"
+            )
+        if gen_config.num_frames != 1 and (gen_config.num_frames - 1) % 8 != 0:
+            gen_config.num_frames = ((gen_config.num_frames - 1) // 8) * 8 + 1
+        is_video = gen_config.num_frames > 1
+        if is_video:
+            gen_config._orig_save_image_function = gen_config.save_image
+            gen_config.save_image = partial(new_save_image_function, gen_config)
+            gen_config.log_image = partial(blank_log_image_function, gen_config)
+            gen_config.output_ext = "mp4"
+
+        latents, audio_latents, meta = denoise_staged(
+            transformer=unwrap_model(self.model),
+            scheduler=self.get_train_scheduler(),
+            video_connector_embeds=conditional_embeds["connector_prompt_embeds"][0].to(
+                self.device_torch, self.torch_dtype
+            ),
+            audio_connector_embeds=conditional_embeds[
+                "connector_audio_prompt_embeds"
+            ][0].to(self.device_torch, self.torch_dtype),
+            connector_attention_mask=conditional_embeds[
+                "connector_attention_mask"
+            ][0].to(self.device_torch),
+            neg_video_connector_embeds=unconditional_embeds[
+                "connector_prompt_embeds"
+            ][0].to(self.device_torch, self.torch_dtype),
+            neg_audio_connector_embeds=unconditional_embeds[
+                "connector_audio_prompt_embeds"
+            ][0].to(self.device_torch, self.torch_dtype),
+            neg_connector_attention_mask=unconditional_embeds[
+                "connector_attention_mask"
+            ][0].to(self.device_torch),
+            height=gen_config.height,
+            width=gen_config.width,
+            num_frames=gen_config.num_frames,
+            frame_rate=24.0,
+            num_inference_steps=gen_config.num_inference_steps,
+            guidance_scale=gen_config.guidance_scale,
+            # LTX-2.3 guidance (the constants the inline path sets in its extras)
+            stg_scale=1.0,
+            modality_scale=3.0,
+            guidance_rescale=0.7,
+            audio_guidance_scale=7.0,
+            audio_stg_scale=1.0,
+            audio_modality_scale=3.0,
+            audio_guidance_rescale=0.7,
+            spatio_temporal_guidance_blocks=[28],
+            use_cross_timestep=True,
+            generator=generator,
+            device=self.device_torch,
+            dtype=self.torch_dtype,
+            video_config=get_ltx2_video_vae_config(self.ltx_version)[0][
+                "diffusers_config"
+            ],
+            audio_config=get_ltx2_audio_vae_config(self.ltx_version)[0][
+                "diffusers_config"
+            ],
+        )
+        return {
+            "latents": latents,
+            "audio_latents": audio_latents,
+            "meta": meta,
+            "is_video": is_video,
+            "fps": gen_config.fps,
+        }
+
+    def decode_staged_samples(self, staged_samples):
+        """staged_sampling decode phase, one vae at a time (H3 shape): the
+        video vae streams onto the gpu, decodes every payload, and is gone
+        before the audio vae + vocoder arrive. Decoded pixels and waveforms
+        park on the cpu; the mp4s are muxed at the very end."""
+        dev = self.device_torch
+        prior = self._vae
+        if prior is not None and prior.vae is not None:
+            video_vae = prior.vae
+            own_video = False
+        else:
+            video_vae = self._stream_video_vae(dev)
+            own_video = True
+        frames = []
+        with torch.no_grad():
+            for _gc, _idx, payload in staged_samples:
+                f = decode_video_latents(
+                    video_vae,
+                    payload["latents"].to(dev),
+                    device=dev,
+                    dtype=self.torch_dtype,
+                )
+                # float (T,C,H,W) in [-1,1] -> uint8 (T,H,W,C) on cpu
+                frames.append(
+                    ((f.float() + 1) / 2)
+                    .clamp(0, 1)
+                    .mul(255)
+                    .round()
+                    .to(torch.uint8)
+                    .permute(0, 2, 3, 1)
+                    .cpu()
+                )
+        if own_video:
+            del video_vae
+            flush()
+
+        if prior is not None and prior.audio_vae is not None:
+            audio_vae = prior.audio_vae
+            own_audio = False
+        else:
+            audio_vae = self._stream_audio_vae(dev)
+            own_audio = True
+        if prior is not None and prior.vocoder is not None:
+            vocoder = prior.vocoder
+            own_vocoder = False
+        else:
+            # the vocoder is decode-only and never resident through phase 1;
+            # stream it for this decode and free it right after
+            vocoder = self._stream_vocoder(dev)
+            own_vocoder = True
+        sample_rate = int(vocoder.config.output_sampling_rate)
+        waves = []
+        with torch.no_grad():
+            for _gc, _idx, payload in staged_samples:
+                wave, _sr = decode_audio_latents(
+                    audio_vae,
+                    vocoder,
+                    payload["audio_latents"].to(dev),
+                    device=dev,
+                    dtype=self.torch_dtype,
+                )
+                waves.append(wave.cpu())
+        if own_vocoder:
+            del vocoder
+        if own_audio:
+            del audio_vae
+        flush()
+
+        # mux and save, vae-s long gone
+        for j, (gen_config, idx, payload) in enumerate(staged_samples):
+            if payload["is_video"]:
+                img = {
+                    "video": frames[j],
+                    "fps": payload["fps"],
+                    "audio": waves[j],
+                    "audio_sample_rate": sample_rate,
+                    "output_path": None,
+                }
+            else:
+                img = Image.fromarray(frames[j][0].numpy())
+            gen_config.save_image_atomic(img, idx)
+            gen_config.log_image(img, idx)
+            self._after_sample_image(idx, len(staged_samples))
+            flush()
 
 
 class LTX25Model(PhasedLoadMixin, LTX2Model):
