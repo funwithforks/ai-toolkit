@@ -1544,6 +1544,7 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
                 transformer,
                 plan,
                 transformer.get_transformer_block_names(),
+                name="transformer",
                 qtype=kwargs["qtype"],
                 quantize_device=quantize_device,
                 dtype=kwargs["dtype"],

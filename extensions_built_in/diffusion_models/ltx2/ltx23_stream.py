@@ -103,6 +103,57 @@ def build_stream_plan(
     return plan
 
 
+def _probe_load_mem(tag: str, i: int, total: int) -> None:
+    """Live rss/vram probe every 200 items (and on demand): the trajectory
+    names the culprit if a load ooms mid-stream (per-tensor paths cap at
+    largest-tensor ram; a whole-dict path ramps to model size)."""
+    if i % 200:
+        return
+    for line in open("/proc/self/status"):
+        if line.startswith("VmRSS"):
+            rss = int(line.split()[1]) / 1024
+            vram = (
+                torch.cuda.memory_allocated() / 1e9
+                if torch.cuda.is_available()
+                else 0.0
+            )
+            print(
+                f"[load-mem] {tag}: {i}/{total} rss {rss:.0f}MB vram {vram:.1f}GB",
+                flush=True,
+            )
+            break
+
+
+def _assign_to_owner(module: torch.nn.Module, mod_key: str, tensor) -> None:
+    """Assign one tensor to its owning submodule, not the root.
+
+    A root-level load_state_dict walks every child -- including modules a
+    previous stream-quantize step already converted, whose custom
+    _load_from_state_dict pops its keys unconditionally and raises on a
+    partial dict. Deeper keys are delivered to their own parent (that
+    subtree is quantization-free at assign time: blocks are fully assigned
+    before they are quantized, and the extras live outside the block
+    lists); top-level keys are assigned directly for the same reason."""
+    parent_path, _, _ = mod_key.rpartition(".")
+    if parent_path:
+        rel_key = mod_key[len(parent_path) + 1:]
+        target = module.get_submodule(parent_path)
+        target.load_state_dict({rel_key: tensor}, assign=True, strict=False)
+        return
+    if mod_key in module._parameters:
+        old = module._parameters[mod_key]
+        module._parameters[mod_key] = torch.nn.Parameter(
+            tensor, requires_grad=old.requires_grad
+        )
+    elif mod_key in module._buffers:
+        module._buffers[mod_key] = tensor
+    else:
+        raise KeyError(
+            f"{mod_key} is neither a top-level parameter nor a buffer of "
+            f"{type(module).__name__}"
+        )
+
+
 def stream_assign(
     module: torch.nn.Module,
     plan: Dict[str, Tuple[object, str]],
@@ -134,37 +185,36 @@ def stream_assign(
         remaining, n = import_comfy_quantized_layers(
             module, group, orig_dtype=orig_dtype
         )
-        if remaining:
-            # unquantized siblings of a quantized module (bias, tables)
-            module.load_state_dict(remaining, assign=True, strict=False)
+        for mod_key, tensor in remaining.items():
+            _assign_to_owner(module, mod_key, tensor)
         consumed.update(group_files)
         num_quantized += n
     assigned = set(consumed)
+    total = len(plan)
     for mod_key, (source, file_key) in plan.items():
         if file_key in assigned:
             continue
         tensor = source.get(file_key, device)
         if cast_dtype is not None and tensor.dtype != cast_dtype:
             tensor = tensor.to(cast_dtype)
-        module.load_state_dict(
-            {mod_key: tensor}, assign=True, strict=False
-        )
+        _assign_to_owner(module, mod_key, tensor)
         assigned.add(file_key)
+        _probe_load_mem(name, len(assigned), total)
     return num_quantized
 
 
 def stream_meta_check(module: torch.nn.Module, name: str) -> None:
-    """The strict=True stand-in: any module key still on meta after a stream
-    means the plan missed a tensor -- fail loudly, never ship a
-    silently-half-loaded model. Persistent entries only (state_dict):
-    quantized layers drop their weight parameter / register non-persistent
-    buffers, and computed non-persistent buffers were meta in the batch path
-    too."""
+    """The strict=True stand-in: any param/buffer still on meta after a
+    stream means the plan missed a tensor -- fail loudly, never ship a
+    silently-half-loaded model.
+
+    Deliberately NOT state_dict(): the save-dequantization patch (if applied)
+    turns that into a full-model dequantization materialized in host ram.
+    named_parameters/named_buffers walk the live tensors -- params and
+    persistent buffers, the same set the batch path's strict load covers."""
     still_meta = [
-        n
-        for n, t in module.state_dict(keep_vars=True).items()
-        if torch.is_tensor(t) and t.device.type == "meta"
-    ]
+        n for n, t in module.named_parameters() if t.is_meta
+    ] + [n for n, t in module.named_buffers() if t.is_meta]
     if still_meta:
         raise ValueError(
             f"{name} stream load left {len(still_meta)} unfilled params/"
@@ -193,6 +243,7 @@ def quantize_streamed_plan(
     plan: Dict[str, Tuple[object, str]],
     block_names,
     *,
+    name: str,
     qtype: str,
     quantize_device,
     dtype: torch.dtype,
@@ -212,7 +263,6 @@ def quantize_streamed_plan(
     skips the now-redundant block pass."""
     from toolkit.dequantize import patch_dequantization_on_save
 
-    patch_dequantization_on_save(module)
     quantization_type = get_qtype(qtype)
     exclude = list(exclude or [])
     quantize_kwargs = quantize_kwargs or {}
@@ -224,11 +274,12 @@ def quantize_streamed_plan(
         )
     skipped = 0
     for block_path, sub_plan in groups:
-        # assign straight onto the quantize device at the job dtype -- the
-        # same input the batched rail quantizes
+        # assign straight onto the quantize device at shipped precision --
+        # the shared block body's .to(device, dtype) performs the job-dtype
+        # cast at move time, exactly where the batched rail's cast lives
         stream_assign(
             module, sub_plan, quantize_device, f"{name}:{block_path}",
-            cast_dtype=dtype, orig_dtype=dtype,
+            orig_dtype=dtype,
         )
         block = module.get_submodule(block_path)
         was_skipped, _seg = _quantize_stream_block(
@@ -240,6 +291,12 @@ def quantize_streamed_plan(
             quantize_kwargs=quantize_kwargs,
             keep_on_device=keep_on_device,
         )
+        if torch.cuda.is_available():
+            print(
+                f"[load-mem] {name}:{block_path} quantized; "
+                f"vram {torch.cuda.memory_allocated()/1e9:.1f}GB",
+                flush=True,
+            )
         if was_skipped:
             skipped += 1
     if skipped:
@@ -261,8 +318,12 @@ def quantize_streamed_plan(
         quantize_kwargs=quantize_kwargs,
         keep_on_device=keep_on_device,
     )
-    # the final meta scan plays the batch path's strict=True role
+    # completeness gate FIRST: after the save-dequantization patch below, a
+    # state_dict() call would dequantize the whole model into host ram (the
+    # gate itself now avoids state_dict entirely -- this ordering keeps the
+    # two concerns from ever meeting)
     stream_meta_check(module, name)
+    patch_dequantization_on_save(module)
 
 
 def pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
