@@ -16,11 +16,88 @@ Location is queryable: tensors answer via .device; a lazy source reports
 ' disk'. Dtype is never cast; storage is exactly as shipped.
 """
 
+import json
 import os
+import struct
 
 import torch
 
 from toolkit.paths import MODELS_PATH
+
+# safetensors header dtype strings -> torch dtypes (the seek-read fallback
+# parses these straight from the header)
+_SFT_DTYPES = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+}
+
+
+def _is_unmappable(e: Exception) -> bool:
+    """True for the mmap refusals the seek-read fallback can stand in for
+    (heuristic overcommit refuses single mappings larger than ram+swap --
+    a 46 GB checkpoint on a 32 GB box -- and similar allocation failures).
+    Anything else propagates: a missing file is not this fallback's job."""
+    text = str(e)
+    return "mmap" in text or "Cannot allocate memory" in text
+
+
+class _SeekReader:
+    """Per-key seek reads for checkpoints too big to mmap. Same tensors as
+    the mmap path -- the same bytes from the same offsets, one at a time;
+    the page cache does the rest. Reads to cpu and moves when a gpu device
+    was requested (the mmap path faults directly; same result)."""
+
+    def __init__(self, file_path: str, device, owner: "WeightSource"):
+        self._file_path = file_path
+        self._device = device
+        self._owner = owner
+        self._file = None
+
+    def _ensure_open(self):
+        if self._file is None:
+            self._file = open(self._file_path, "rb")
+
+    def keys(self) -> list:
+        return list(self._header().keys())
+
+    def _header(self) -> dict:
+        return self._owner._cached_header()
+
+    def get_tensor(self, key: str) -> torch.Tensor:
+        self._ensure_open()
+        meta = self._header()[key]
+        dtype = _SFT_DTYPES[meta["dtype"]]
+        start, end = meta["data_offsets"]
+        self._file.seek(start)
+        raw = self._file.read(end - start)
+        tensor = torch.frombuffer(bytearray(raw), dtype=dtype).reshape(
+            meta["shape"]
+        )
+        if self._device is not None and torch.device(self._device).type != "cpu":
+            tensor = tensor.to(self._device)
+        return tensor
+
+    def __enter__(self):
+        self._ensure_open()
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def close(self):
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
 
 class WeightSource:
@@ -163,12 +240,34 @@ class WeightSource:
             dev = torch.device("cuda", torch.cuda.current_device())
         return dev
 
+    def _cached_header(self) -> dict:
+        """Parsed safetensors header, memoized (the seek-read fallback asks
+        for it per tensor; parsing 1 MB of json 6000 times is silly)."""
+        if getattr(self, "_header_cache", None) is None:
+            with open(self.file_path, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(n))
+            header.pop("__metadata__", None)
+            self._header_cache = header
+        return self._header_cache
+
     def _reader(self, device=None):
         from safetensors import safe_open
 
         if device is None:
             device = "cpu"  # keys()/inspection do not need a gpu
-        return safe_open(self.file_path, framework="pt", device=str(self._canon(device)))
+        try:
+            return safe_open(self.file_path, framework="pt", device=str(self._canon(device)))
+        except (RuntimeError, OSError) as e:
+            if not _is_unmappable(e):
+                raise
+            if not getattr(self, "_warned_unmappable", False):
+                self._warned_unmappable = True
+                print(
+                    f"[weight-source] {os.path.basename(self.file_path)}: mmap "
+                    f"refused ({e}); reading per-key with seek reads instead"
+                )
+            return _SeekReader(self.file_path, self._canon(device), self)
 
 
 def load_file_to_device(file_path: str, device) -> dict:

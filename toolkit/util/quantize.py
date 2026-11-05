@@ -1,7 +1,7 @@
 import os
 import time
 from fnmatch import fnmatch
-from typing import List, Optional, Union, TYPE_CHECKING
+from typing import List, Optional, Tuple, Union, TYPE_CHECKING
 import torch
 
 from optimum.quanto.quantize import _quantize_submodule
@@ -336,6 +336,190 @@ def dequantize_ostris_to_linear(module: torch.nn.Module) -> int:
     return replaced
 
 
+def _quantize_stream_block(
+    block: torch.nn.Module,
+    quantization_type,
+    *,
+    device,
+    dtype: torch.dtype,
+    exclude,
+    quantize_kwargs: Optional[dict],
+    keep_on_device: bool,
+) -> Tuple[bool, dict]:
+    """One iteration of quantize_module's block loop, extracted so a streaming
+    loader can run the IDENTICAL body on a block it just streamed into a meta
+    shell (quantize-as-you-stream, the opt-in ``aitk_stream_quantize`` rail)
+    instead of on one moved off a resident model. Same calls, same order, same
+    devices as the resident path -- results are bitwise comparable by
+    construction, and the equivalence test on real weights holds the line.
+
+    Returns (skipped, timings): skipped is True when the block was left
+    untouched as already quantized with a matching qtype; timings carries the
+    check/h2d/quant/d2h segments for the AITK_QUANT_DEBUG surface."""
+    quantize_kwargs = quantize_kwargs or {}
+    t_check = t_h2d = t_quant = t_d2h = 0.0
+    t = time.perf_counter()
+    skip = not _has_quantizable_linear(block, quantization_type, exclude)
+    t_check += time.perf_counter() - t
+    if skip:
+        if keep_on_device and device is not None:
+            block.to(device)
+        return True, {"check": t_check, "h2d": 0.0, "quant": 0.0, "d2h": 0.0}
+    t = time.perf_counter()
+    if device is not None:
+        block.to(device, dtype=dtype, non_blocking=True)
+    t_h2d += time.perf_counter() - t
+    t = time.perf_counter()
+    quantize(block, weights=quantization_type, exclude=exclude, **quantize_kwargs)
+    freeze(block)
+    t_quant += time.perf_counter() - t
+    # NOT non_blocking: an async D2H allocates the cpu destination in pinned
+    # memory, which the caching host allocator keeps forever -- that silently
+    # retained a model-sized chunk of host ram
+    t = time.perf_counter()
+    if device is not None and not keep_on_device:
+        block.to("cpu")
+    t_d2h += time.perf_counter() - t
+    return False, {"check": t_check, "h2d": t_h2d, "quant": t_quant, "d2h": t_d2h}
+
+
+def _quantize_extras_pass(
+    module: torch.nn.Module,
+    quantization_type,
+    *,
+    device,
+    exclude,
+    quantize_kwargs: Optional[dict],
+    keep_on_device: bool,
+) -> None:
+    """quantize_module's extras pass: every remaining quantizable layer
+    outside the block lists, one layer at a time on ``device``. Extracted for
+    the same reason as _quantize_stream_block -- the streamed rail runs the
+    identical pass. Caller freezes."""
+    quantize_kwargs = quantize_kwargs or {}
+    if keep_on_device:
+        # blocks already live on the gpu; quantize each remaining layer there
+        # one at a time and leave it -- the transient is one bf16 layer, never
+        # the whole unquantized remainder at once (that transient bump could
+        # exceed the model's final footprint by GBs on big-extras models)
+        quantize(
+            module,
+            weights=quantization_type,
+            exclude=exclude,
+            quantize_device=device,
+            keep_on_quantize_device=True,
+            **quantize_kwargs,
+        )
+        # non-quantized leftovers (norms, embeddings, buffers) follow -- final
+        # residency, not a transient
+        module.to(device)
+    else:
+        # cpu-resident model: quantize each extra layer with a gpu round-trip
+        quantize(
+            module,
+            weights=quantization_type,
+            exclude=exclude,
+            quantize_device=device,
+            **quantize_kwargs,
+        )
+
+
+def group_stream_plan_by_blocks(plan: dict, block_names):
+    """Split a stream plan ({module_key: payload}) into per-block groups plus
+    extras, for stream-time quantization: each block's tensors are assigned
+    and quantized before the next block streams, so peak memory is one block,
+    not the model.
+
+    block_names are repeated-block attribute paths (possibly dotted, e.g.
+    ``model.language_model.layers``). Returns (groups, extras): groups is an
+    ordered list of (block_path, sub_plan) with blocks in declaration then
+    index order; extras holds every key outside the listed block lists,
+    insertion order preserved."""
+    grouped: dict = {}
+    extras: dict = {}
+    for key, payload in plan.items():
+        placed = False
+        for bn in block_names or []:
+            prefix = bn + "."
+            if key.startswith(prefix):
+                head = key[len(prefix):].split(".", 1)[0]
+                if head.isdigit():
+                    grouped.setdefault((bn, int(head)), {})[key] = payload
+                    placed = True
+                    break
+        if not placed:
+            extras[key] = payload
+    groups = [
+        (f"{bn}.{idx}", grouped[(bn, idx)])
+        for bn in block_names or []
+        for _, idx in sorted(g for g in grouped if g[0] == bn)
+    ]
+    return groups, extras
+
+
+@torch.no_grad()
+def dequantize_quanto_to_linear(module: torch.nn.Module) -> int:
+    """Replace every quanto-quantized leaf (QLinear/QConv2d/QEmbedding) with
+    the plain module holding its dequantized weight, in place, layer by layer.
+    Used when a stream-quantized module is handed a different quantization
+    request: quanto has no requantize path and re-running quantize() on an
+    already-quantized leaf is a silent per-layer no-op. Returns the count."""
+    from optimum.quanto import QConv2d, QEmbedding, QLinear
+
+    replaced = 0
+    for parent in module.modules():
+        for child_name, child in list(parent.named_children()):
+            if isinstance(child, QLinear):
+                weight = child.weight.dequantize()
+                new = torch.nn.Linear(
+                    child.in_features,
+                    child.out_features,
+                    bias=child.bias is not None,
+                    device=weight.device,
+                    dtype=weight.dtype,
+                )
+                new.weight = torch.nn.Parameter(weight, requires_grad=False)
+                if child.bias is not None:
+                    new.bias = torch.nn.Parameter(
+                        child.bias.dequantize().to(weight.device, weight.dtype),
+                        requires_grad=False,
+                    )
+            elif isinstance(child, QConv2d):
+                weight = child.weight.dequantize()
+                new = torch.nn.Conv2d(
+                    child.in_channels,
+                    child.out_channels,
+                    child.kernel_size,
+                    stride=child.stride,
+                    padding=child.padding,
+                    dilation=child.dilation,
+                    groups=child.groups,
+                    bias=child.bias is not None,
+                    device=weight.device,
+                    dtype=weight.dtype,
+                )
+                new.weight = torch.nn.Parameter(weight, requires_grad=False)
+                if child.bias is not None:
+                    new.bias = torch.nn.Parameter(
+                        child.bias.dequantize().to(weight.device, weight.dtype),
+                        requires_grad=False,
+                    )
+            elif isinstance(child, QEmbedding):
+                weight = child.weight.dequantize()
+                new = torch.nn.Embedding(
+                    child.num_embeddings,
+                    child.embedding_dim,
+                    device=weight.device,
+                    dtype=weight.dtype,
+                )
+                new.weight = torch.nn.Parameter(weight, requires_grad=False)
+            else:
+                continue
+            setattr(parent, child_name, new)
+            replaced += 1
+    return replaced
+
+
 @torch.no_grad()
 def quantize_module(
     module: torch.nn.Module,
@@ -386,32 +570,24 @@ def quantize_module(
     debug_phases = os.environ.get("AITK_QUANT_DEBUG") == "1"
     t_check = t_h2d = t_quant = t_d2h = 0.0
     for block in tqdm(all_blocks):
-        t = time.perf_counter()
-        skip = not _has_quantizable_linear(block, quantization_type, exclude)
-        t_check += time.perf_counter() - t
-        if skip:
+        skipped, seg = _quantize_stream_block(
+            block,
+            quantization_type,
+            device=device,
+            dtype=dtype,
+            exclude=exclude,
+            quantize_kwargs=quantize_kwargs,
+            keep_on_device=keep_on_device,
+        )
+        t_check += seg["check"]
+        t_h2d += seg["h2d"]
+        t_quant += seg["quant"]
+        t_d2h += seg["d2h"]
+        if skipped:
             # pre-quantized checkpoint with a matching qtype: nothing in this
             # block would change — skip the dtype cast entirely so the load
             # stays byte-identical (placement still honors keep_on_device)
             already_quantized += 1
-            if keep_on_device:
-                block.to(device)
-            continue
-        t = time.perf_counter()
-        if device is not None:
-            block.to(device, dtype=dtype, non_blocking=True)
-        t_h2d += time.perf_counter() - t
-        t = time.perf_counter()
-        quantize(block, weights=quantization_type, exclude=exclude, **quantize_kwargs)
-        freeze(block)
-        t_quant += time.perf_counter() - t
-        # NOT non_blocking: an async D2H allocates the cpu destination in pinned
-        # memory, which the caching host allocator keeps forever — that silently
-        # retained a model-sized chunk of host ram
-        t = time.perf_counter()
-        if device is not None and not keep_on_device:
-            block.to("cpu")
-        t_d2h += time.perf_counter() - t
     if debug_phases and all_blocks:
         status_fn(
             f" - [debug] check {t_check:.1f}s h2d {t_h2d:.1f}s "
@@ -423,31 +599,14 @@ def quantize_module(
         )
 
     status_fn(" - quantizing extras")
-    if keep_on_device:
-        # blocks already live on the gpu; quantize each remaining layer there
-        # one at a time and leave it — the transient is one bf16 layer, never
-        # the whole unquantized remainder at once (that transient bump could
-        # exceed the model's final footprint by GBs on big-extras models)
-        quantize(
-            module,
-            weights=quantization_type,
-            exclude=exclude,
-            quantize_device=device,
-            keep_on_quantize_device=True,
-            **quantize_kwargs,
-        )
-        # non-quantized leftovers (norms, embeddings, buffers) follow — final
-        # residency, not a transient
-        module.to(device)
-    else:
-        # cpu-resident model: quantize each extra layer with a gpu round-trip
-        quantize(
-            module,
-            weights=quantization_type,
-            exclude=exclude,
-            quantize_device=device,
-            **quantize_kwargs,
-        )
+    _quantize_extras_pass(
+        module,
+        quantization_type,
+        device=device,
+        exclude=exclude,
+        quantize_kwargs=quantize_kwargs,
+        keep_on_device=keep_on_device,
+    )
     freeze(module)
     return module
 

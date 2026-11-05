@@ -409,6 +409,31 @@ class OstrisModelMixin:
                 self.aitk_is_quantized = False
                 self.aitk_qtype = None
 
+        # stream-quantized during load (opt-in ``aitk_stream_quantize`` loaders):
+        # the requested quantization already ran per-block while the weights
+        # streamed in; the block pass must not run again (it would no-op at
+        # best, and its dtype cast would touch quantized buffers). A matching
+        # request skips straight to offload/placement; a different request
+        # dequantizes the quanto pieces first so it can run fresh.
+        stream_done = getattr(self, "aitk_stream_quantized", None)
+        if stream_done is not None and qtype is not None:
+            requested = qtype.split("|", 1)[0]
+            if requested == stream_done and ara_path is None:
+                status_fn(
+                    f"Already stream-quantized ({stream_done}) during load; "
+                    "skipping the quantize pass"
+                )
+                qtype = None
+            else:
+                from toolkit.util.quantize import dequantize_quanto_to_linear
+
+                status_fn(
+                    f"Dequantizing stream-quantized ({stream_done}) weights "
+                    f"-> {qtype}"
+                )
+                dequantize_quanto_to_linear(self)
+                self.aitk_stream_quantized = None
+
         if qtype and not getattr(self, "aitk_is_quantized", False):
             from toolkit.util.quantize import (
                 attach_ara_and_quantize,
