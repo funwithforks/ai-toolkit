@@ -87,6 +87,33 @@ LTX23_TE_UPSTREAM_DEFAULT = "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized"
 LTX23_TOKENIZER_SOURCE = "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized"
 
 
+def resolve_te_shards(source: str, hf_token: Optional[str] = None) -> Optional[list]:
+    """Local/hub safetensors shards for a gemma3 repo source, or None when
+    the source has no safetensors files (the caller falls back to the
+    transformers loader). Shards download into MODELS_PATH at their
+    repo-relative paths, local files always win."""
+    import glob as _glob
+
+    if os.path.isdir(source):
+        shards = sorted(_glob.glob(os.path.join(source, "*.safetensors")))
+        return shards or None
+    import huggingface_hub
+
+    try:
+        files = huggingface_hub.list_repo_files(source, token=hf_token)
+    except Exception:
+        return None
+    st = sorted(f for f in files if f.endswith(".safetensors"))
+    if not st:
+        return None
+    return [
+        resolve_named_file(
+            f"{source}/{f}", component="ltx2.3 text encoder", hf_token=hf_token
+        )
+        for f in st
+    ]
+
+
 def find_local_te_file(filename: str) -> Optional[str]:
     """Any te file already on disk wins, whatever its precision: recursive
     search under the text_encoders category, then the models root."""

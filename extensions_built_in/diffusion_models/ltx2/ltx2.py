@@ -85,6 +85,7 @@ try:
         LTX23_TOKENIZER_SOURCE,
         find_local_te_file,
         resolve_component_source,
+        resolve_te_shards,
         text_projection_prefix,
     )
 except ImportError as e:
@@ -1811,6 +1812,44 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
                 )
             )
 
+    def _stream_quantize_gemma3(self, text_encoder, plan):
+        """Stream a gemma3 plan into the meta shell, quantizing per layer
+        when quantize_te is on (the shared per-block body; the TE's layer
+        lists come from the shell's own get_transformer_block_names). The
+        marker tells aitk_post_load the pass already ran."""
+        kwargs = self.component_load_kwargs("te")
+        if kwargs["qtype"] is not None and self.aitk_stream_quantize:
+            keep_on_device = self._stream_keep_on_device(kwargs)
+            quantize_streamed_plan(
+                text_encoder,
+                plan,
+                text_encoder.get_transformer_block_names(),
+                name="text encoder",
+                qtype=kwargs["qtype"],
+                quantize_device=kwargs["quantize_device"],
+                dtype=kwargs["dtype"],
+                exclude=None,
+                quantize_kwargs=self.model_config.quantize_kwargs,
+                keep_on_device=keep_on_device,
+                status_fn=self.print_and_status_update,
+            )
+            text_encoder.aitk_stream_quantized = kwargs["qtype"]
+        else:
+            plain_stream_load(
+                text_encoder, plan,
+                self._as_shipped_stream_target("te"),
+                "text encoder", orig_dtype=self.torch_dtype,
+            )
+
+    def _stream_keep_on_device(self, kwargs: dict) -> bool:
+        """quantize_module's keep_on_device formula: the final home IS the
+        quantize gpu (no offloading, no cpu parking)."""
+        return (
+            not kwargs["offload"]
+            and torch.device(kwargs["device"]) == torch.device(kwargs["quantize_device"])
+            and torch.device(kwargs["device"]).type != "cpu"
+        )
+
     def _load_gemma3_from_file(self, te_path: str):
         """Stream a comfy gemma3 checkpoint into the meta shell. The converter
         is a pure key remap (+ the lm_head/embed_tokens tie, which maps two
@@ -1847,11 +1886,36 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
                 "model.language_model.embed_tokens.weight"
             ]
         text_encoder = self._gemma3_shell()
-        num_quantized = plain_stream_load(
-            text_encoder, plan, "cpu", "text encoder",
-            orig_dtype=self.torch_dtype,
-        )
-        self._mixed_file_post_load(text_encoder, num_quantized)
+        self._stream_quantize_gemma3(text_encoder, plan)
+        # the vision tower rode along (the legacy rail loads it the same way
+        # before discarding it)
+        text_encoder.model.vision_tower = None
+        flush()
+        return text_encoder
+
+    def _stream_gemma3_shards(self, shards):
+        """Stream a sharded hub gemma3 (transformers layout) into the meta
+        shell, quantizing per layer when quantize_te is on. The shards carry
+        the older ``language_model.model.*`` layout; gemma3_stream_key
+        remaps it onto the same target the comfy route uses."""
+        from toolkit.util.weight_source import WeightSource
+
+        plan = {}
+        for shard in shards:
+            source = WeightSource.open(shard)
+            for file_key in source.keys():
+                mapped = gemma3_stream_key(file_key)
+                if mapped is not None:
+                    plan[mapped] = (source, file_key)
+        if (
+            "lm_head.weight" not in plan
+            and "model.language_model.embed_tokens.weight" in plan
+        ):
+            plan["lm_head.weight"] = plan[
+                "model.language_model.embed_tokens.weight"
+            ]
+        text_encoder = self._gemma3_shell()
+        self._stream_quantize_gemma3(text_encoder, plan)
         # the vision tower rode along (the legacy rail loads it the same way
         # before discarding it)
         text_encoder.model.vision_tower = None
@@ -1904,11 +1968,17 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
         for repo in attempts:
             try:
                 tokenizer = GemmaTokenizerFast.from_pretrained(repo)
-                text_encoder = Gemma3TextEncoder.load_model(
-                    repo, dtype=self.torch_dtype, subfolder=""
-                )
-                # remove the vision tower
-                text_encoder.model.vision_tower = None
+                shards = resolve_te_shards(repo, hf_token=os.getenv("HF_TOKEN"))
+                if shards:
+                    # sharded hub repo: stream layer-by-layer (quantized per
+                    # quantize_te) -- a CPU-resident from_pretrained load
+                    # needs the whole 24GB bf16 model in ram
+                    text_encoder = self._stream_gemma3_shards(shards)
+                else:
+                    text_encoder = Gemma3TextEncoder.load_model(
+                        repo, dtype=self.torch_dtype, subfolder=""
+                    )
+                    text_encoder.model.vision_tower = None
                 flush()
                 return tokenizer, text_encoder, {}
             except Exception as e:

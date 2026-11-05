@@ -32,16 +32,22 @@ def gemma3_stream_key(key: str) -> Optional[str]:
     Returns None for dropped keys. Mirrors the converter rule for rule:
     vision tower and projector remap into the model, language layers shift
     under model.language_model, spiece_model drops, everything else passes
-    through unchanged."""
+    through unchanged. Hub repo shards carry the older
+    ``language_model.model.*`` layout -- remapped to the same target; the
+    modern ``model.language_model.*`` form passes through untouched."""
     nk = key
     if nk.startswith("module."):
         nk = nk[len("module."):]
     if nk == "spiece_model":
         return None
+    if nk.startswith("vision_tower."):
+        return "model." + nk
     if nk.startswith("vision_model."):
         return "model.vision_tower." + nk
     if nk.startswith("multi_modal_projector."):
         return "model." + nk
+    if nk.startswith("language_model.model."):
+        return "model.language_model." + nk[len("language_model.model."):]
     if nk == "model.embed_tokens.weight":
         return "model.language_model.embed_tokens.weight"
     if nk.startswith("model.layers."):
