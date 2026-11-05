@@ -1812,11 +1812,32 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
                 )
             )
 
+    def _strip_unused_gemma3_parts(self, text_encoder):
+        """Remove the pieces the conditioning stack never runs: the vision
+        tower and mm projector (their keys are dropped from the plan, so the
+        completeness gate must not see them) and the logits head (hidden
+        states only -- and an int8 embed must never be aliased into a plain
+        lm_head)."""
+        text_encoder.model.vision_tower = None
+        if getattr(text_encoder.model, "multi_modal_projector", None) is not None:
+            text_encoder.model.multi_modal_projector = None
+        if hasattr(text_encoder, "lm_head"):
+            del text_encoder.lm_head
+
     def _stream_quantize_gemma3(self, text_encoder, plan):
-        """Stream a gemma3 plan into the meta shell, quantizing per layer
-        when quantize_te is on (the shared per-block body; the TE's layer
-        lists come from the shell's own get_transformer_block_names). The
-        marker tells aitk_post_load the pass already ran."""
+        """Stream a gemma3 plan into the meta shell. A marker-carrying
+        (pre-quantized) artifact attaches verbatim and runs no quantization
+        code -- aitk_post_load then decides keep-vs-requant from quantize_te.
+        A clean artifact follows quantize_te with the shared per-layer body."""
+        has_markers = any(k.endswith(".comfy_quant") for k in plan)
+        if has_markers:
+            device = "cpu" if self.low_vram else self.device_torch
+            num_quantized = plain_stream_load(
+                text_encoder, plan, device, "text encoder",
+                orig_dtype=self.torch_dtype,
+            )
+            self._mixed_file_post_load(text_encoder, num_quantized)
+            return
         kwargs = self.component_load_kwargs("te")
         if kwargs["qtype"] is not None and self.aitk_stream_quantize:
             keep_on_device = self._stream_keep_on_device(kwargs)
@@ -1852,44 +1873,34 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
 
     def _load_gemma3_from_file(self, te_path: str):
         """Stream a comfy gemma3 checkpoint into the meta shell. The converter
-        is a pure key remap (+ the lm_head/embed_tokens tie, which maps two
-        module keys onto one file tensor); scale-keyed (fp8) files route to
-        the batched converters instead."""
+        is a pure key remap; marker-carrying (pre-quantized int8) files
+        attach verbatim, while legacy fp8-scaled files need the dequantize
+        pass and route there loudly."""
         from toolkit.util.weight_source import WeightSource
 
         source = WeightSource.open(te_path)
         file_keys = list(source.keys())
-        side_keys = [
-            k
-            for k in file_keys
-            if k.endswith(QUANT_SIDE_KEY_SUFFIXES) or k.split(".")[-1] == "scaled_fp8"
+        marker_keys = [k for k in file_keys if k.endswith(".comfy_quant")]
+        legacy_fp8 = [
+            k for k in file_keys
+            if k.split(".")[-1] == "scaled_fp8"
+            or k.endswith((".scale_weight", ".pre_quant_scale"))
         ]
-        if side_keys:
+        if legacy_fp8 and not marker_keys:
             raise ValueError(
-                f"LTX-2.3: {os.path.basename(te_path)} carries quantization "
-                "side keys; the streamed gemma3 route loads clean checkpoints "
-                "-- use the batched route (te_name_or_path pointing at a repo) "
-                "or a full-precision file."
+                f"LTX-2.3: {os.path.basename(te_path)} is an fp8-scaled "
+                "checkpoint; the streamed gemma3 route loads clean or "
+                "comfy-marker (int8/nvfp4) files -- point te_name_or_path at "
+                "a repo for the batched dequantize route."
             )
         plan = {}
         for file_key in file_keys:
             mapped = gemma3_stream_key(file_key)
             if mapped is not None:
                 plan[mapped] = (source, file_key)
-        # the converter ties lm_head to the embeddings when the file lacks it:
-        # two module keys, one file tensor
-        if (
-            "lm_head.weight" not in plan
-            and "model.language_model.embed_tokens.weight" in plan
-        ):
-            plan["lm_head.weight"] = plan[
-                "model.language_model.embed_tokens.weight"
-            ]
         text_encoder = self._gemma3_shell()
+        self._strip_unused_gemma3_parts(text_encoder)
         self._stream_quantize_gemma3(text_encoder, plan)
-        # the vision tower rode along (the legacy rail loads it the same way
-        # before discarding it)
-        text_encoder.model.vision_tower = None
         flush()
         return text_encoder
 
@@ -1907,18 +1918,9 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
                 mapped = gemma3_stream_key(file_key)
                 if mapped is not None:
                     plan[mapped] = (source, file_key)
-        if (
-            "lm_head.weight" not in plan
-            and "model.language_model.embed_tokens.weight" in plan
-        ):
-            plan["lm_head.weight"] = plan[
-                "model.language_model.embed_tokens.weight"
-            ]
         text_encoder = self._gemma3_shell()
+        self._strip_unused_gemma3_parts(text_encoder)
         self._stream_quantize_gemma3(text_encoder, plan)
-        # the vision tower rode along (the legacy rail loads it the same way
-        # before discarding it)
-        text_encoder.model.vision_tower = None
         flush()
         return text_encoder
 

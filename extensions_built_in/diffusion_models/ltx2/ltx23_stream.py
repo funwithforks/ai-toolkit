@@ -40,12 +40,19 @@ def gemma3_stream_key(key: str) -> Optional[str]:
         nk = nk[len("module."):]
     if nk == "spiece_model":
         return None
-    if nk.startswith("vision_tower."):
-        return "model." + nk
-    if nk.startswith("vision_model."):
-        return "model.vision_tower." + nk
-    if nk.startswith("multi_modal_projector."):
-        return "model." + nk
+    # pieces the conditioning stack never uses: the vision tower and mm
+    # projector (dropped by the legacy rail after loading), the connector
+    # projections (a separate component with its own file), and embedded
+    # tokenizer assets
+    if nk.startswith((
+        "vision_model.",
+        "vision_tower.",
+        "multi_modal_projector.",
+        "text_embedding_projection.",
+        "hf_asset__",
+        "tokenizer_json",
+    )):
+        return None
     if nk.startswith("language_model.model."):
         return "model.language_model." + nk[len("language_model.model."):]
     if nk == "model.embed_tokens.weight":

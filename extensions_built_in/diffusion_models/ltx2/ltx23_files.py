@@ -75,6 +75,9 @@ LTX2_VAE_ID = "ltx2"
 # (kind, source): "repo" loads through Gemma3TextEncoder.load_model (handles
 # shards), "file" is a single comfy gemma3 safetensors for the streamed route.
 LTX23_TE_CANDIDATES = (
+    # the owner's int8 ablated gemma-3-12b-it: local, pre-quantized, loads
+    # as-shipped (no bf16 TE, no TE quantization pass)
+    ("file", "gemma-3-12b-it-heretic-v2_int8.safetensors"),
     ("repo", "unsloth/gemma-3-12b-it"),  # ungated bf16 mirror
     ("repo", "google/gemma-3-12b-it"),  # gated bf16 original
     ("repo", "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized"),  # upstream default (q4 QAT)
