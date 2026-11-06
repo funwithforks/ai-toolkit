@@ -18,7 +18,8 @@ import subprocess
 import sys
 import tempfile
 
-os.environ.setdefault("MODELS_PATH", "/run/media/computer/240gb pny/huggingface")
+# MODELS_PATH resolves through the normal chain (explicit env var, then the
+# toolkit's .env); this script adds no override of its own.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
