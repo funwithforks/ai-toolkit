@@ -159,32 +159,19 @@ def _float_color_parts(info: VideoInfo) -> str:
 def build_float_decode_vf(
     info: VideoInfo,
     *,
-    scale_to_width: int,
-    scale_to_height: int,
-    crop_x: int,
-    crop_y: int,
-    crop_width: int,
-    crop_height: int,
+    output_width: int,
+    output_height: int,
 ) -> str:
-    """Fork-geometry float decode chain: color-float -> scale -> crop.
+    """Float decode chain for a dataset clip: color-float -> resize.
 
-    The color conversion to gbrpf32le comes FIRST (as in the source repo's
-    crop -> color -> scale graph), so the lanczos scale always operates on
-    fp32 planes -- never on quantized 8-bit yuv. The crop is last because
-    the fork's bucket bookkeeping defines it in SCALED coordinates; filters
-    are emitted only when they do something, so an identity bucket decodes
-    with color management alone. The reserved-tag fixup rides the color
-    parts exactly as the source fuses it, so it precedes any scale."""
+    Dataset clips are ALREADY cropped -- the export owns framing (the
+    user's box in the player). The decode never crops: it color-converts
+    to fp32 planes and resizes to the bucket dims with lanczos, so the
+    full framed content survives. Filters are emitted only when they do
+    something -- an identity bucket decodes with color management alone."""
     parts: list[str] = [_float_color_parts(info)]
-    if scale_to_width != info.width or scale_to_height != info.height:
-        parts.append(f"scale={scale_to_width}:{scale_to_height}:flags=lanczos")
-    if not (
-        crop_x == 0
-        and crop_y == 0
-        and crop_width == scale_to_width
-        and crop_height == scale_to_height
-    ):
-        parts.append(f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y}")
+    if output_width != info.width or output_height != info.height:
+        parts.append(f"scale={output_width}:{output_height}:flags=lanczos")
     return ",".join(parts)
 
 

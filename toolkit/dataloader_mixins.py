@@ -797,15 +797,13 @@ class ImageProcessingDTOMixin:
             # Float ingest: ffprobe -> the fork's own frame-index semantics ->
             # one ffmpeg pass decoding the bucket geometry as fp32 gbrpf32le.
             # No cv2, no PIL, no uint8 anywhere between the file and the vae;
-            # geometry (scale-then-crop) happens inside the filter graph.
+            # dataset clips are already framed (the export owns any crop),
+            # so the decode only resizes to the assigned bucket -- no crop
+            # filter exists on this path.
             loaded = load_dataset_float_tensors(
                 self.path,
-                scale_to_width=self.scale_to_width,
-                scale_to_height=self.scale_to_height,
-                crop_x=self.crop_x,
-                crop_y=self.crop_y,
-                crop_width=self.crop_width,
-                crop_height=self.crop_height,
+                bucket_width=self.crop_width,
+                bucket_height=self.crop_height,
                 dataset_fps=self.dataset_config.fps,
                 num_frames=self.num_frames,
                 auto_frame_count=self.dataset_config.auto_frame_count,

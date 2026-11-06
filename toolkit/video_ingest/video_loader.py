@@ -266,12 +266,8 @@ def _decode_dataset_float(
 def load_dataset_float_tensors(
     video_path: str,
     *,
-    scale_to_width: int,
-    scale_to_height: int,
-    crop_x: int,
-    crop_y: int,
-    crop_width: int,
-    crop_height: int,
+    bucket_width: int,
+    bucket_height: int,
     dataset_fps: float,
     num_frames: int = 1,
     auto_frame_count: bool = False,
@@ -284,10 +280,11 @@ def load_dataset_float_tensors(
 ) -> LoadedVideo:
     """Float decode of a dataset clip into a fp32 [-1, 1] training tensor.
 
-    Geometry comes from the fork's bucket bookkeeping (scale-to dims + a crop
-    rect inside the scaled frame) and lands in the ffmpeg filter graph --
-    color-float, then scale, then crop. Pass ``info`` to reuse a probe (the
-    counted frame total still comes from the -count_frames probe)."""
+    Dataset clips are already framed (the export owns the crop); the decode
+    never crops -- it color-converts to fp32 planes and resizes to the
+    bucket dims the fork's bookkeeping assigned. Pass ``info`` to reuse a
+    probe (the counted frame total still comes from the -count_frames
+    probe)."""
     # two verbatim probes, one job each: the tags/color chain from
     # probe_video, the counted frame total from _probe_video_properties
     # (ffprobe -count_frames). One extra ffprobe per clip, ~50ms, buys
@@ -311,22 +308,17 @@ def load_dataset_float_tensors(
 
     vf = build_float_decode_vf(
         info,
-        scale_to_width=scale_to_width,
-        scale_to_height=scale_to_height,
-        crop_x=crop_x,
-        crop_y=crop_y,
-        crop_width=crop_width,
-        crop_height=crop_height,
+        output_width=bucket_width,
+        output_height=bucket_height,
     )
-    # the crop is defined in scaled coords and is the LAST geometry op, so
-    # the decoded frames are exactly crop_width x crop_height (== the source
-    # or scaled dims whenever no crop filter was emitted)
+    # no crop filter exists: the decode resizes straight to the bucket dims,
+    # which are exactly the tensor geometry training consumes
     tensor = _decode_dataset_float(
         video_path,
         frames_to_extract=frames_to_extract,
         vf=vf,
-        width=crop_width,
-        height=crop_height,
+        width=bucket_width,
+        height=bucket_height,
     )
     return LoadedVideo(
         tensor=tensor,
