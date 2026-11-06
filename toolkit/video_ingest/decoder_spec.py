@@ -166,18 +166,24 @@ def build_float_decode_vf(
     crop_width: int,
     crop_height: int,
 ) -> str:
-    """Fork-geometry float decode chain: fixup -> scale -> color -> crop.
+    """Fork-geometry float decode chain: color-float -> scale -> crop.
 
-    The crop rect lives in SCALED coordinates (the fork's bucket bookkeeping
-    defines it there); filters are emitted only when they do something, so an
-    identity bucket decodes with color management alone."""
+    The color conversion to gbrpf32le comes FIRST (as in the source repo's
+    crop -> color -> scale graph), so the lanczos scale always operates on
+    fp32 planes -- never on quantized 8-bit yuv. The crop is last because
+    the fork's bucket bookkeeping defines it in SCALED coordinates; filters
+    are emitted only when they do something, so an identity bucket decodes
+    with color management alone."""
     parts: list[str] = []
-    fixup = reserved_color_tag_fixup(info)
-    if fixup:
-        parts.append(fixup)
+    if needs_hdr_tonemap(info):
+        parts.append(choose_hdr_float_chain(info))
+    elif info.is_10bit:
+        parts.append(choose_sdr_10bit_float_chain(info))
+    else:
+        fixup = reserved_color_tag_fixup(info)
+        parts.append(f"{fixup},format=gbrpf32le" if fixup else "format=gbrpf32le")
     if scale_to_width != info.width or scale_to_height != info.height:
         parts.append(f"scale={scale_to_width}:{scale_to_height}:flags=lanczos")
-    parts.append(_float_color_parts(info))
     if not (
         crop_x == 0
         and crop_y == 0
