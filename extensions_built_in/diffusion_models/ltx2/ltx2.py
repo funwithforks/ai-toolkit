@@ -1297,6 +1297,10 @@ class LTX2Model(BaseModel):
 
         device = self.device_torch
         scale_factor = 8
+        # accept a bare caption string or a list (the cache pass passes the
+        # item's caption string; iterating a string yields its characters)
+        if isinstance(prompt, str):
+            prompt = [prompt]
         batch_size = len(prompt)
         # Gemma expects left padding for chat-style prompts
         self.tokenizer[0].padding_side = "left"
@@ -1817,14 +1821,13 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
     def _strip_unused_gemma3_parts(self, text_encoder):
         """Remove the pieces the conditioning stack never runs: the vision
         tower and mm projector (their keys are dropped from the plan, so the
-        completeness gate must not see them) and the logits head (hidden
-        states only -- and an int8 embed must never be aliased into a plain
-        lm_head)."""
+        completeness gate must not see them). The lm_head STAYS: the
+        transformers forward computes logits through it unconditionally, and
+        the legacy converter aliases it to the embeddings for exactly that
+        reason."""
         text_encoder.model.vision_tower = None
         if getattr(text_encoder.model, "multi_modal_projector", None) is not None:
             text_encoder.model.multi_modal_projector = None
-        if hasattr(text_encoder, "lm_head"):
-            del text_encoder.lm_head
 
     def _stream_quantize_gemma3(self, text_encoder, plan):
         """Stream a gemma3 plan into the meta shell. A marker-carrying
@@ -1900,6 +1903,15 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
             mapped = gemma3_stream_key(file_key)
             if mapped is not None:
                 plan[mapped] = (source, file_key)
+        # the converter ties lm_head to the embeddings when the file lacks it
+        # (transformers' forward computes logits unconditionally)
+        if (
+            "lm_head.weight" not in plan
+            and "model.language_model.embed_tokens.weight" in plan
+        ):
+            plan["lm_head.weight"] = plan[
+                "model.language_model.embed_tokens.weight"
+            ]
         text_encoder = self._gemma3_shell()
         self._strip_unused_gemma3_parts(text_encoder)
         self._stream_quantize_gemma3(text_encoder, plan)
@@ -1920,6 +1932,13 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
                 mapped = gemma3_stream_key(file_key)
                 if mapped is not None:
                     plan[mapped] = (source, file_key)
+        if (
+            "lm_head.weight" not in plan
+            and "model.language_model.embed_tokens.weight" in plan
+        ):
+            plan["lm_head.weight"] = plan[
+                "model.language_model.embed_tokens.weight"
+            ]
         text_encoder = self._gemma3_shell()
         self._strip_unused_gemma3_parts(text_encoder)
         self._stream_quantize_gemma3(text_encoder, plan)

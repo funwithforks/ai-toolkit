@@ -202,17 +202,15 @@ def stream_assign(
             _assign_to_owner(module, mod_key, tensor)
         consumed.update(group_files)
         num_quantized += n
-    assigned = set(consumed)
     total = len(plan)
     for mod_key, (source, file_key) in plan.items():
-        if file_key in assigned:
+        if file_key in consumed:
             continue
         tensor = source.get(file_key, device)
         if cast_dtype is not None and tensor.dtype != cast_dtype:
             tensor = tensor.to(cast_dtype)
         _assign_to_owner(module, mod_key, tensor)
-        assigned.add(file_key)
-        _probe_load_mem(name, len(assigned), total)
+        _probe_load_mem(name, len(plan), total)
     return num_quantized
 
 
