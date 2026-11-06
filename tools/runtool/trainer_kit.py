@@ -774,17 +774,34 @@ class TrainerKit:
                 cwd=manifest["cwd"],
             )
         stop.set()
+
+        def _snapshot_metrics() -> None:
+            # the structured source into the record so metrics are
+            # recomputable from the record alone (contract)
+            src_db = os.path.join(job_dir, "loss_log.db")
+            if os.path.exists(src_db):
+                import shutil
+
+                shutil.copy2(src_db, os.path.join(paths.artifacts, "metrics.db"))
+
         if rc != 0:
+            # a crashed run still owes its metrics: the live db lives
+            # machine-local (the logger mirrors to the job dir on cadence
+            # only), so pull the final copy into the job dir and snapshot
+            # it before returning -- the post-mortem needs the partial
+            # rows, and the stage_failed classification stays as-is
+            local_db = os.path.join(
+                manifest["cwd"], "output", name, "loss_log.db")
+            if os.path.isfile(local_db):
+                import shutil
+
+                os.makedirs(job_dir, exist_ok=True)
+                shutil.copy2(local_db, os.path.join(job_dir, "loss_log.db"))
+            _snapshot_metrics()
             emit(paths, "stage_failed", rc=rc)
             return rc
 
-        # snapshot the structured source into the record so metrics are
-        # recomputable from the record alone (contract)
-        src_db = os.path.join(job_dir, "loss_log.db")
-        if os.path.exists(src_db):
-            import shutil
-
-            shutil.copy2(src_db, os.path.join(paths.artifacts, "metrics.db"))
+        _snapshot_metrics()
 
         # measurement runs must leave no weights on disk (owner hard disk
         # rule): the toolkit's end-of-training save is UNCONDITIONAL, so

@@ -3,9 +3,21 @@ from PIL import Image
 
 from toolkit.config_modules import LoggingConfig
 import os
+import shutil
 import sqlite3
 import time
 from typing import Any, Dict, Tuple, List
+
+
+# The repo's default output root (the UI's defaultTrainFolder): jobs
+# configured under it write their loss_log.db directly, exactly as they
+# always have. Anywhere else, the live db stays machine-local and is
+# mirrored -- see UILogger.
+_DEFAULT_OUTPUT_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output"
+)
+# how often a mirrored job pushes a snapshot to its real destination
+_MIRROR_EVERY_SECS = 30.0
 
 
 # Base logger class
@@ -93,6 +105,28 @@ class UILogger:
         self.log_file = log_file
         self._log_to_commit: Dict[str, Any] = {}
 
+        # When the job's save_root lives under the repo's default output
+        # dir, the db is machine-local disk and is written directly (the
+        # long-standing behavior, unchanged). Anywhere else -- an
+        # overridden training folder, a network mount -- the live db
+        # stays machine-local at the default-layout path, and a snapshot
+        # is mirrored to the real destination instead: sqlite WAL
+        # memory-maps its -shm index, and a network lock loss under that
+        # mapping kills the process with SIGBUS (the owner's 2026-11-06
+        # diagnosis). The mirror is best effort by contract; the metrics
+        # file is low-value telemetry next to checkpoints/optimizer.
+        self._live_path = log_file
+        self._mirror_path: Optional[str] = None
+        _abs_dir = os.path.dirname(os.path.abspath(log_file))
+        _default_real = os.path.realpath(_DEFAULT_OUTPUT_ROOT) + os.sep
+        if not os.path.realpath(_abs_dir).startswith(_default_real):
+            job_name = os.path.basename(os.path.realpath(_abs_dir))
+            self._live_path = os.path.join(
+                _DEFAULT_OUTPUT_ROOT, job_name, os.path.basename(log_file)
+            )
+            self._mirror_path = log_file
+        self._last_mirror = 0.0
+
         self._con: Optional[sqlite3.Connection] = None
         self._started = False
 
@@ -116,11 +150,11 @@ class UILogger:
         if self._started:
             return
 
-        parent = os.path.dirname(os.path.abspath(self.log_file))
+        parent = os.path.dirname(os.path.abspath(self._live_path))
         if parent and not os.path.exists(parent):
             os.makedirs(parent, exist_ok=True)
 
-        self._con = sqlite3.connect(self.log_file, timeout=30.0, isolation_level=None)
+        self._con = sqlite3.connect(self._live_path, timeout=30.0, isolation_level=None)
         self._con.execute("PRAGMA journal_mode=WAL;")
         self._con.execute("PRAGMA synchronous=NORMAL;")
         self._con.execute("PRAGMA temp_store=MEMORY;")
@@ -193,6 +227,8 @@ class UILogger:
         ):
             self._flush()
 
+        self._mirror_if_due()
+
     # log image
     def log_image(self, *args, **kwargs):
         # this doesnt log images for now
@@ -204,6 +240,7 @@ class UILogger:
             return
 
         self._flush()
+        self._mirror()
 
         assert self._con is not None
         self._con.close()
@@ -213,6 +250,60 @@ class UILogger:
     # -------------------------
     # internal
     # -------------------------
+
+    def _mirror_if_due(self) -> None:
+        if self._mirror_path is None or not self._started:
+            return
+        if time.time() - self._last_mirror < _MIRROR_EVERY_SECS:
+            return
+        self._mirror()
+
+    def _mirror(self) -> None:
+        """Copy the live db to the real destination. Best effort by
+        contract: a failed mirror prints and is retried at the next
+        cadence tick -- logging must never be able to kill a run (the
+        destination can be a network mount whose failure modes are the
+        owner's 2026-11-06 SIGBUS diagnosis). A plain file copy is
+        enough here: the job-dir db is a records backup, not a live
+        store -- the trainer writes and reads the local one."""
+        if self._mirror_path is None or not self._started:
+            return
+        assert self._con is not None
+        try:
+            # land every buffered row, then fold the WAL into the main
+            # file, so the copy is complete (both no-ops on local disk)
+            self._flush()
+            self._con.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            parent = os.path.dirname(os.path.abspath(self._mirror_path))
+            if parent and not os.path.exists(parent):
+                os.makedirs(parent, exist_ok=True)
+            tmp = self._mirror_path + ".mirror-tmp"
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            shutil.copyfile(self._live_path, tmp)
+            os.replace(tmp, self._mirror_path)
+            # the copy inherits the live db's WAL header flag; flip the
+            # landed file back to rollback mode so no reader ever
+            # creates a -shm next to it (the NFS SIGBUS hazard, closed
+            # on the read side too), then clear any sidecars a
+            # pre-mirroring run left behind
+            norm = sqlite3.connect(self._mirror_path)
+            try:
+                norm.execute("PRAGMA journal_mode=DELETE;")
+            finally:
+                norm.close()
+            # a pre-mirroring run may have left WAL sidecars next to the
+            # destination; the backup is a single plain file and needs none
+            for sidecar in (self._mirror_path + "-wal", self._mirror_path + "-shm"):
+                if os.path.exists(sidecar):
+                    try:
+                        os.remove(sidecar)
+                    except OSError:
+                        pass
+            self._last_mirror = time.time()
+        except Exception as e:
+            print(f"[logging] metrics mirror to {self._mirror_path} failed "
+                  f"(will retry): {e}")
 
     def _init_schema(self, con: sqlite3.Connection) -> None:
         con.execute("BEGIN;")
