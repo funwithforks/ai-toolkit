@@ -207,6 +207,7 @@ class ComboVae(torch.nn.Module):
         if self.vae is None:
             raise RuntimeError("ltx2 vae: image encode needs the video vae")
         vae = self.vae
+        vae.eval()
         if self.low_vram_tiling:
             vae.tile_sample_min_num_frames = 64
             vae.tile_sample_stride_num_frames = 16
@@ -281,6 +282,7 @@ class ComboVae(torch.nn.Module):
                 "ltx2 vae: no audio processor -- the vae_id entry sets one"
             )
         audio_vae = self.audio_vae
+        audio_vae.eval()
         output_tensor = None
 
         # do them seperatly for now

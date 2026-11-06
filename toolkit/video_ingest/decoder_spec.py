@@ -104,7 +104,8 @@ def _zscale_range_in(info: VideoInfo) -> str:
 
 
 def _setparams_bt709(info: VideoInfo) -> str:
-    """Tag decoded frames bt709 so downstream consumers see explicit tags."""
+    """Tag decoded frames bt709 so libx264 -colorspace/-color_* output opts do not
+    insert a second zscale conversion (fails on untagged 10-bit sources)."""
     color_range = "pc" if _zscale_range_in(info) == "full" else "tv"
     return (
         "setparams=color_primaries=bt709:color_trc=bt709:"
@@ -147,13 +148,12 @@ def choose_sdr_10bit_float_chain(info: VideoInfo) -> str:
 
 
 def _float_color_parts(info: VideoInfo) -> str:
-    """The color chain only -- no reserved-tag fixup (the caller places that
-    before any scale; see the module docstring)."""
     if needs_hdr_tonemap(info):
         return choose_hdr_float_chain(info)
     if info.is_10bit:
         return choose_sdr_10bit_float_chain(info)
-    return "format=gbrpf32le"
+    fixup = reserved_color_tag_fixup(info)
+    return f"{fixup},format=gbrpf32le" if fixup else "format=gbrpf32le"
 
 
 def build_float_decode_vf(
@@ -173,15 +173,9 @@ def build_float_decode_vf(
     fp32 planes -- never on quantized 8-bit yuv. The crop is last because
     the fork's bucket bookkeeping defines it in SCALED coordinates; filters
     are emitted only when they do something, so an identity bucket decodes
-    with color management alone."""
-    parts: list[str] = []
-    if needs_hdr_tonemap(info):
-        parts.append(choose_hdr_float_chain(info))
-    elif info.is_10bit:
-        parts.append(choose_sdr_10bit_float_chain(info))
-    else:
-        fixup = reserved_color_tag_fixup(info)
-        parts.append(f"{fixup},format=gbrpf32le" if fixup else "format=gbrpf32le")
+    with color management alone. The reserved-tag fixup rides the color
+    parts exactly as the source fuses it, so it precedes any scale."""
+    parts: list[str] = [_float_color_parts(info)]
     if scale_to_width != info.width or scale_to_height != info.height:
         parts.append(f"scale={scale_to_width}:{scale_to_height}:flags=lanczos")
     if not (

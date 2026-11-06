@@ -56,6 +56,8 @@ def assert_identity_bucket(bucket, width: int, height: int) -> None:
 
 
 def _probe_video_properties(video_path: str) -> tuple[int, int, float, int]:
+    import json
+
     proc = subprocess.run(
         [
             "ffprobe",
@@ -71,8 +73,6 @@ def _probe_video_properties(video_path: str) -> tuple[int, int, float, int]:
         text=True,
         check=True,
     )
-    import json
-
     stream = next(
         s for s in json.loads(proc.stdout)["streams"] if s["codec_type"] == "video"
     )
@@ -286,16 +286,15 @@ def load_dataset_float_tensors(
 
     Geometry comes from the fork's bucket bookkeeping (scale-to dims + a crop
     rect inside the scaled frame) and lands in the ffmpeg filter graph --
-    scale-then-crop, per the fork's resize-then-crop PIL semantics this
-    replaces. Pass ``info`` to reuse a probe."""
+    color-float, then scale, then crop. Pass ``info`` to reuse a probe (the
+    counted frame total still comes from the -count_frames probe)."""
+    # two verbatim probes, one job each: the tags/color chain from
+    # probe_video, the counted frame total from _probe_video_properties
+    # (ffprobe -count_frames). One extra ffprobe per clip, ~50ms, buys
+    # zero parsing drift from either source.
     if info is None:
         info = probe_video(video_path)
-    width, height, video_fps, total_frames = (
-        info.width,
-        info.height,
-        info.fps,
-        _total_frames(info),
-    )
+    width, height, video_fps, total_frames = _probe_video_properties(video_path)
 
     frames_to_extract, num_frames = plan_frame_indices(
         total_frames=total_frames,
@@ -337,35 +336,3 @@ def load_dataset_float_tensors(
         total_frames=total_frames,
         pixel_loader="dataset_float",
     )
-
-
-def _total_frames(info: VideoInfo) -> int:
-    """The frame count the planner uses: ffprobe's counted total when the
-    probe carried one, else duration-based (matches _probe_video_properties)."""
-    import subprocess as _sp
-
-    proc = _sp.run(
-        [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_streams",
-            "-count_frames",
-            str(info.path),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    import json
-
-    stream = next(
-        s for s in json.loads(proc.stdout)["streams"] if s["codec_type"] == "video"
-    )
-    nb_frames = stream.get("nb_read_frames") or stream.get("nb_frames")
-    if nb_frames:
-        return int(nb_frames)
-    duration = info.duration
-    return int(round(float(duration) * info.fps)) if duration else 0
