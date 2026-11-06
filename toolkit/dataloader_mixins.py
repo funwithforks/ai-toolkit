@@ -10,7 +10,6 @@ import time
 from collections import OrderedDict, deque, namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, List, Dict, Union
-import traceback
 
 import cv2
 import numpy as np
@@ -28,6 +27,11 @@ from toolkit.dto import DTO, DISK_PREFIX
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatible
 from toolkit.prompt_utils import inject_trigger_into_prompt, extract_inline_dop_pairs, apply_inline_dop
+from toolkit.video_ingest import (
+    compute_auto_frame_count,
+    load_audio_span,
+    load_dataset_float_tensors,
+)
 from torchvision import transforms
 from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageOps import exif_transpose
@@ -758,27 +762,18 @@ class ImageProcessingDTOMixin:
         # FileItemDTO init so bucket keys carry the real frame count, so it must give
         # the same answer at bucketing time and at load time.
         # allow for any length video here but make sure it is temporally compressable.
-        vid_length_seconds = total_frames / video_fps
-
-        desired_num_frames = int(vid_length_seconds * self.dataset_config.fps)
-
-        if getattr(self, 'frame_count_snapper', None) is not None:
-            # model-specific valid-frame-count grid (e.g. minimax_h3's 17n+5)
-            desired_num_frames = self.frame_count_snapper(desired_num_frames)
-        else:
-            # make sure it is divisible by temporal_compression
-            if self.dataset_config.trim_auto_frame_count_tail:
-                # snap to the largest valid count that fits inside the video (after the
-                # key frame +1 below) so trim mode never overshoots the source, which
-                # would freeze the last frame and pad the audio tail with silence
-                desired_num_frames = max(0, desired_num_frames - 1) // self.temporal_compression * self.temporal_compression
-            else:
-                desired_num_frames = desired_num_frames // self.temporal_compression * self.temporal_compression
-
-            # TODO, all models currently add a key frame, but future models may not, update here if this changes.
-            desired_num_frames += 1  # add one for the key frame that is always added
-
-        return desired_num_frames
+        # The math lives in toolkit.video_ingest (the float-ingest port) so the
+        # bucketing and the decode share one implementation.
+        return compute_auto_frame_count(
+            total_frames=total_frames,
+            video_fps=video_fps,
+            dataset_fps=self.dataset_config.fps,
+            temporal_compression=self.temporal_compression,
+            frame_count_snapper=getattr(self, 'frame_count_snapper', None),
+            trim_auto_frame_count_tail=getattr(
+                self.dataset_config, 'trim_auto_frame_count_tail', False
+            ),
+        )
 
     def load_and_process_video(
         self: 'FileItemDTO',
@@ -798,191 +793,41 @@ class ImageProcessingDTOMixin:
         do_audio = self.dataset_config.do_audio
         
         try:
-            # Use OpenCV to capture video frames
-            cap = cv2.VideoCapture(self.path)
-            
-            if not cap.isOpened():
-                raise Exception(f"Failed to open video file: {self.path}")
-            
-            # Get video properties
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            video_fps = cap.get(cv2.CAP_PROP_FPS)
-            
-            # Calculate the max valid frame index (accounting for zero-indexing)
-            max_frame_index = total_frames - 1
-            
-            # Only log video properties if in debug mode
-            if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
-                print_acc(f"Video properties: {self.path}")
-                print_acc(f"  Total frames: {total_frames}")
-                print_acc(f"  Max valid frame index: {max_frame_index}")
-                print_acc(f"  FPS: {video_fps}")
-            
-            frames_to_extract = []
-            
-            if self.dataset_config.auto_frame_count:
-                self.num_frames = self.get_auto_frame_count(total_frames, video_fps)
+            # Float ingest: ffprobe -> the fork's own frame-index semantics ->
+            # one ffmpeg pass decoding the bucket geometry as fp32 gbrpf32le.
+            # No cv2, no PIL, no uint8 anywhere between the file and the vae;
+            # geometry (scale-then-crop) happens inside the filter graph.
+            loaded = load_dataset_float_tensors(
+                self.path,
+                scale_to_width=self.scale_to_width,
+                scale_to_height=self.scale_to_height,
+                crop_x=self.crop_x,
+                crop_y=self.crop_y,
+                crop_width=self.crop_width,
+                crop_height=self.crop_height,
+                dataset_fps=self.dataset_config.fps,
+                num_frames=self.num_frames,
+                auto_frame_count=self.dataset_config.auto_frame_count,
+                shrink_video_to_frames=self.dataset_config.shrink_video_to_frames,
+                trim_auto_frame_count_tail=getattr(
+                    self.dataset_config, "trim_auto_frame_count_tail", False
+                ),
+                temporal_compression=self.temporal_compression,
+                frame_count_snapper=getattr(self, "frame_count_snapper", None),
+            )
+            tensor = loaded.tensor
+            # flips are exact in fp32 after the decode (the kernels the graph
+            # uses are symmetric, so flip-after-geometry == flip-before)
+            if self.flip_x:
+                tensor = torch.flip(tensor, dims=[3])
+            if self.flip_y:
+                tensor = torch.flip(tensor, dims=[2])
 
-
-            # Always stretch/shrink to the requested number of frames if needed
-            if self.dataset_config.auto_frame_count and self.dataset_config.trim_auto_frame_count_tail:
-                # preserve real time: pull frames at the dataset fps from the start of the
-                # video and trim the tail that didn't fit the snapped frame count, instead of
-                # shrinking the whole video to fit (which speeds up motion / chipmunks audio).
-                # Critical for audio models (e.g. minimax_h3) where audio must stay in sync.
-                fps_ratio = video_fps / self.dataset_config.fps if video_fps and video_fps > 0 else 1.0
-                frames_to_extract = [min(round(i * fps_ratio), max_frame_index) for i in range(self.num_frames)]
-            elif self.dataset_config.shrink_video_to_frames or total_frames < self.num_frames:
-                # Distribute frames evenly across the entire video
-                interval = max_frame_index / (self.num_frames - 1) if self.num_frames > 1 else 0
-                frames_to_extract = [min(int(round(i * interval)), max_frame_index) for i in range(self.num_frames)]
-            else:
-                # Calculate frame interval based on FPS ratio
-                fps_ratio = video_fps / self.dataset_config.fps
-                frame_interval = max(1, int(round(fps_ratio)))
-                
-                # Calculate max consecutive frames we can extract at desired FPS
-                max_consecutive_frames = (total_frames // frame_interval)
-                
-                if max_consecutive_frames < self.num_frames:
-                    # Not enough frames at desired FPS, so stretch instead
-                    interval = max_frame_index / (self.num_frames - 1) if self.num_frames > 1 else 0
-                    frames_to_extract = [min(int(round(i * interval)), max_frame_index) for i in range(self.num_frames)]
-                else:
-                    # Calculate max start frame to ensure we can get all num_frames
-                    max_start_frame = max_frame_index - ((self.num_frames - 1) * frame_interval)
-                    start_frame = random.randint(0, max(0, max_start_frame))
-                    
-                    # Generate list of frames to extract
-                    frames_to_extract = [start_frame + (i * frame_interval) for i in range(self.num_frames)]
-                    
-            # Final safety check - ensure no frame exceeds max valid index
-            frames_to_extract = [min(frame_idx, max_frame_index) for frame_idx in frames_to_extract]
-            
-            # Only log frames to extract if in debug mode
-            if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
-                print_acc(f"  Frames to extract: {frames_to_extract}")
-            
-            # Extract frames -- decode sequentially in a single pass. A cap.set() seek per
-            # frame forces a keyframe seek + GOP re-decode for every extracted frame
-            # (~20x slower); frames_to_extract is always ascending, so seek once to the
-            # first frame then grab() through the gaps.
-            frames = []
-            unique_frame_idxs = sorted(set(frames_to_extract))
-            processed_frames = {}  # frame_idx -> processed frame (duplicates reuse it)
-
-            def process_frame(rgb_frame):
-                # Convert to PIL Image
-                img = Image.fromarray(rgb_frame)
-
-                # Apply the same processing as for single images
-                img = img.convert('RGB')
-
-                if self.flip_x:
-                    img = img.transpose(Image.FLIP_LEFT_RIGHT)
-                if self.flip_y:
-                    img = img.transpose(Image.FLIP_TOP_BOTTOM)
-
-                # Apply bucketing
-                img = img.resize((self.scale_to_width, self.scale_to_height), Image.BICUBIC)
-                img = img.crop((
-                    self.crop_x,
-                    self.crop_y,
-                    self.crop_x + self.crop_width,
-                    self.crop_y + self.crop_height
-                ))
-
-                # Apply transform if provided
-                if transform:
-                    img = transform(img)
-
-                return img
-
-            decode_with_pyav = False
-
-            # Set frame position
-            pos = unique_frame_idxs[0]
-            if pos > 0:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-
-                # Silently verify position was set correctly (no warnings unless debug mode)
-                if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
-                    actual_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                    if actual_pos != pos:
-                        print_acc(f"Warning: Failed to set exact frame position. Requested: {pos}, Actual: {actual_pos}")
-
-            for frame_idx in unique_frame_idxs:
-                # skip past frames between targets without decoding them to images
-                while pos < frame_idx and cap.grab():
-                    pos += 1
-
-                ret, frame = cap.read()
-                if ret:
-                    pos += 1
-                else:
-                    # Try to read the next available frame as a fallback
-                    fallback_success = False
-                    for fallback_offset in [1, -1, 5, -5, 10, -10]:
-                        fallback_pos = max(0, min(frame_idx + fallback_offset, max_frame_index))
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, fallback_pos)
-                        fallback_ret, fallback_frame = cap.read()
-                        if fallback_ret:
-                            # Only log in debug mode
-                            if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
-                                print_acc(f"Falling back to nearby frame {fallback_pos} instead of {frame_idx}")
-                            frame = fallback_frame
-                            fallback_success = True
-                            # resync sequential position after the fallback seek
-                            pos = fallback_pos + 1
-                            break
-                    else:
-                        # No fallback worked. cv2's bundled ffmpeg cannot decode some codecs
-                        # at all (e.g. AV1 has no software decoder there), so retry the
-                        # remaining frames with PyAV below.
-                        decode_with_pyav = True
-                        break
-                
-                # Convert BGR to RGB
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                processed_frames[frame_idx] = process_frame(frame)
-
-            if decode_with_pyav:
-                # cv2 could not decode this video (e.g. AV1: OpenCV's bundled ffmpeg has no
-                # software AV1 decoder). Decode the still-missing frames in one sequential
-                # PyAV pass; PyAV ships libdav1d so it handles codecs cv2 cannot.
-                import av
-
-                needed = {i for i in unique_frame_idxs if i not in processed_frames}
-                last_av_frame = None
-                with av.open(self.path) as container:
-                    decoded_idx = -1
-                    for av_frame in container.decode(video=0):
-                        decoded_idx += 1
-                        last_av_frame = av_frame
-                        if decoded_idx in needed:
-                            processed_frames[decoded_idx] = process_frame(av_frame.to_ndarray(format='rgb24'))
-                            needed.discard(decoded_idx)
-                            if not needed:
-                                break
-
-                if needed:
-                    if last_av_frame is None:
-                        video_info = f"Video: {self.path}, Total frames: {total_frames}, FPS: {video_fps}"
-                        raise Exception(f"Failed to read frames {sorted(needed)} from video with both cv2 and PyAV. {video_info}")
-                    # metadata frame count overshot the real stream; reuse the last decoded frame
-                    tail_frame = process_frame(last_av_frame.to_ndarray(format='rgb24'))
-                    for frame_idx in needed:
-                        processed_frames[frame_idx] = tail_frame
-
-            # assemble in extraction order; stretched clips repeat decoded frames
-            frames = [processed_frames[frame_idx] for frame_idx in frames_to_extract]
-
-            # Release the video capture
-            cap.release()
-            
             # Stack frames into tensor [frames, channels, height, width]
-            self.tensor = torch.stack(frames)
+            self.tensor = tensor
+            self.num_frames = loaded.num_frames
+            video_fps = loaded.video_fps
+            frames_to_extract = loaded.frames_to_extract
 
             # ------------------------------
             # Audio extraction + stretching
@@ -993,16 +838,13 @@ class ImageProcessingDTOMixin:
                 self.audio_tensor = None
 
                 try:
-                    import torchaudio
                     import torch.nn.functional as F
 
                     # Compute the time range of the selected frames in the *source* video
                     # Include the last frame by extending to the next frame boundary.
                     if video_fps and video_fps > 0 and len(frames_to_extract) > 0:
-                        clip_start_frame = int(frames_to_extract[0])
-                        clip_end_frame = int(frames_to_extract[-1])
-                        clip_start_time = clip_start_frame / float(video_fps)
-                        clip_end_time = (clip_end_frame + 1) / float(video_fps)
+                        clip_start_time = frames_to_extract[0] / float(video_fps)
+                        clip_end_time = (frames_to_extract[-1] + 1) / float(video_fps)
                         source_duration = max(0.0, clip_end_time - clip_start_time)
                     else:
                         clip_start_time = 0.0
@@ -1016,51 +858,39 @@ class ImageProcessingDTOMixin:
                     else:
                         target_duration = source_duration
 
-                    # torchcodec's AudioDecoder raises when a video has no audio
-                    # track, so probe for a stream before decoding.
-                    import av
-                    with av.open(self.path) as container:
-                        has_audio_stream = len(container.streams.audio) > 0
+                    trim_tail_audio = (
+                        self.dataset_config.auto_frame_count
+                        and getattr(self.dataset_config, "trim_auto_frame_count_tail", False)
+                    )
+
+                    # Span decode: only the requested time range leaves the
+                    # decoder (ffmpeg pcm_f32le -> torchaudio fast-seek ->
+                    # full-decode fallback), stereo-normalized fp32. The span
+                    # follows the fork's slice semantics per mode: trim cuts
+                    # exactly the training duration, everything else cuts the
+                    # selected frame span.
+                    if trim_tail_audio and target_duration > 0.0:
+                        span_start, span_duration = clip_start_time, target_duration
+                    else:
+                        span_start, span_duration = clip_start_time, source_duration
 
                     waveform = None
-                    if has_audio_stream:
-                        waveform, sample_rate = torchaudio.load(self.path)  # [channels, samples]
+                    sample_rate = None
+                    if span_duration > 0.0:
+                        decoded = load_audio_span(
+                            self.path, start_sec=span_start, duration_sec=span_duration
+                        )
+                        if decoded is not None:
+                            waveform, sample_rate = decoded
 
-                        waveform = waveform_to_stereo(waveform)  # Convert to stereo if not already
-
+                    if waveform is not None and waveform.numel() > 0:
                         if self.dataset_config.audio_normalize:
-                            peak = waveform.abs().amax()  # global peak across channels
+                            peak = waveform.abs().amax()  # span peak across channels
                             eps = 1e-9
                             target_peak = 0.999  # ~ -0.01 dBFS
                             gain = target_peak / (peak + eps)
                             waveform = waveform * gain
 
-                        trim_tail_audio = (
-                            self.dataset_config.auto_frame_count
-                            and self.dataset_config.trim_auto_frame_count_tail
-                        )
-
-                        # Slice to the selected clip region (when we have a meaningful time range)
-                        if source_duration > 0.0:
-                            start_sample = int(round(clip_start_time * sample_rate))
-                            if trim_tail_audio and target_duration > 0.0:
-                                # time must stay 1:1 with the video — cut exactly the
-                                # training duration so no stretch is needed below
-                                end_sample = start_sample + round(target_duration * sample_rate)
-                            else:
-                                end_sample = round(clip_end_time * sample_rate)
-                            start_sample = max(0, min(start_sample, waveform.shape[-1]))
-                            end_sample = max(0, min(end_sample, waveform.shape[-1]))
-                            if end_sample > start_sample:
-                                waveform = waveform[..., start_sample:end_sample]
-                            else:
-                                # No valid audio segment
-                                waveform = None
-                        else:
-                            # If we can't compute a meaningful time range, treat as no-audio
-                            waveform = None
-
-                    if waveform is not None and waveform.numel() > 0:
                         target_samples = round(target_duration * sample_rate)
                         if target_samples > 0 and waveform.shape[-1] != target_samples:
                             # Time-stretch/shrink to match the video clip duration implied by dataset FPS.
@@ -1087,48 +917,16 @@ class ImageProcessingDTOMixin:
                 except Exception as e:
                     # if issue with libtorchcodec "Could not load libtorchcodec"
                     raise Exception(f"** WARNING ** - Error Processing audio for {self.path}. Error: {e}")
-            
+
             # Only log success in debug mode
             if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
-                print_acc(f"Successfully loaded video with {len(frames)} frames: {self.path}")
-        
+                print_acc(f"Successfully loaded video with {self.tensor.shape[0]} frames: {self.path}")
+
         except Exception as e:
-            # Print full traceback
-            traceback.print_exc()
-            
-            # Provide more context about the error
             error_msg = str(e)
-            try:
-                if 'Failed to read frame' in error_msg and cap is not None:
-                    # Try to get more info about the video that failed
-                    cap_status = "Opened" if cap.isOpened() else "Closed"
-                    current_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if cap.isOpened() else "Unknown"
-                    reported_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else "Unknown"
-                    
-                    print_acc(f"Video details when error occurred:")
-                    print_acc(f"  Cap status: {cap_status}")
-                    print_acc(f"  Current position: {current_pos}")
-                    print_acc(f"  Reported total frames: {reported_total}")
-                    
-                    # Try to verify if the video is corrupted
-                    if cap.isOpened():
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Go to start
-                        start_ret, _ = cap.read()
-                        
-                        # Try to read the last frame to check if it's accessible
-                        if reported_total > 0:
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, reported_total - 1)
-                            end_ret, _ = cap.read()
-                            print_acc(f"  Can read first frame: {start_ret}, Can read last frame: {end_ret}")
-                    
-                    # Close the cap if it's still open
-                    cap.release()
-            except Exception as debug_err:
-                print_acc(f"Error during error diagnosis: {debug_err}")
-            
             print_acc(f"Error: {error_msg}")
             print_acc(f"Error loading video: {self.path}")
-            
+
             # Re-raise with more detailed information
             raise Exception(f"Video loading error ({self.path}): {error_msg}") from e
         
@@ -2052,26 +1850,6 @@ class ArgBreakMixin:
         pass
 
 
-def _latent_to_uint8(latent: torch.Tensor) -> torch.Tensor:
-    # pixel-space latents in [-1, 1] -> uint8 0..255 for compact caching
-    return ((latent.float().clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8)
-
-
-def _latent_from_uint8(latent: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    # uint8 0..255 -> pixel-space latents in [-1, 1]
-    return (latent.to(torch.float32) / 127.5 - 1.0).to(dtype)
-
-
-def _waveform_to_int16(waveform: torch.Tensor) -> torch.Tensor:
-    # audio waveform in [-1, 1] -> int16 for compact caching. 8 bits is too coarse for audio.
-    return (waveform.float().clamp(-1, 1) * 32767.0).round().to(torch.int16)
-
-
-def _waveform_from_int16(waveform: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    # int16 -> audio waveform in [-1, 1]
-    return (waveform.to(torch.float32) / 32767.0).to(dtype)
-
-
 def _dto_extras_from_state_dict(state_dict) -> dict:
     """Extra latent streams in a cache file: legacy named keys written by
     older versions plus the generic dto.<name> keys new caches write."""
@@ -2092,8 +1870,11 @@ class LatentCachingFileItemDTOMixin:
         # a plain tensor, or a DTO carrying extra streams (audio rows, ...)
         self._encoded_latent: Union[torch.Tensor, None] = None
         self._cached_first_frame_latent: Union[torch.Tensor, None] = None
-        self._cached_tensor_uint8: Union[torch.Tensor, None] = None
-        self._cached_waveform_int16: Union[torch.Tensor, None] = None
+        # pixel tensor / waveform cached alongside the latents
+        # (dataset_config.cache_tensors_to_disk), fp32, for models that need
+        # pixels at train time (require_pixel_tensor_cache)
+        self._cached_pixel_tensor: Union[torch.Tensor, None] = None
+        self._cached_waveform: Union[torch.Tensor, None] = None
         self._cached_waveform_sample_rate: Union[int, None] = None
         self._latent_path: Union[str, None] = None
         self.is_latent_cached = False
@@ -2151,7 +1932,8 @@ class LatentCachingFileItemDTOMixin:
             item["is_audio_model"] = True
             item["sample_rate"] = self.sample_rate
         if self.dataset_config.cache_tensors_to_disk:
-            # tensor is stored in the cache file, invalidate caches made without it
+            # pixel tensors / waveforms ride in the cache file; storing them
+            # changes the key so caches made without them are not reused
             item["cache_tensors_to_disk"] = True
         if self.load_rgba:
             # the encoded alpha changes the latent; only added when on so caches
@@ -2182,8 +1964,8 @@ class LatentCachingFileItemDTOMixin:
                 # we are caching on disk, don't save in memory
                 self._encoded_latent = None
                 self._cached_first_frame_latent = None
-                self._cached_tensor_uint8 = None
-                self._cached_waveform_int16 = None
+                self._cached_pixel_tensor = None
+                self._cached_waveform = None
                 self._cached_waveform_sample_rate = None
             else:
                 # move it back to cpu (a DTO carries its extras along)
@@ -2203,30 +1985,46 @@ class LatentCachingFileItemDTOMixin:
             )
             self._encoded_latent = state_dict['latent']
             if self._encoded_latent.dtype == torch.uint8:
-                # pixel-space latents cached as uint8
-                self._encoded_latent = _latent_from_uint8(self._encoded_latent)
+                # uint8 compact caches are gone (lossy truncation of the
+                # vae's output); the remedy is clearing this dataset's
+                # _latent_cache directory so the float path re-encodes
+                raise ValueError(
+                    f"{self.path}: latent cache file holds a uint8 latent -- "
+                    "the uint8/int16 compact-cache options were removed; "
+                    "delete this dataset's _latent_cache directory and "
+                    "re-run the latent caching phase."
+                )
             if 'first_frame_latent' in state_dict:
                 self._cached_first_frame_latent = state_dict['first_frame_latent']
-                if self._cached_first_frame_latent.dtype == torch.uint8:
-                    self._cached_first_frame_latent = _latent_from_uint8(self._cached_first_frame_latent)
             extras = _dto_extras_from_state_dict(state_dict)
             if extras:
                 self._encoded_latent = DTO(self._encoded_latent, **extras)
             if 'num_frames' in state_dict:
                 self.num_frames = int(state_dict['num_frames'].item())
             if 'tensor' in state_dict:
-                self._cached_tensor_uint8 = state_dict['tensor']
+                self._cached_pixel_tensor = state_dict['tensor']
+                if self._cached_pixel_tensor.dtype == torch.uint8:
+                    # a pre-fp32 cache file (the uint8 era); the remedy is
+                    # clearing this dataset's _latent_cache directory
+                    raise ValueError(
+                        f"{self.path}: cached pixel tensor is uint8 -- the "
+                        "uint8/int16 compact-cache era is gone; delete this "
+                        "dataset's _latent_cache directory and re-run the "
+                        "latent caching phase."
+                    )
             if 'waveform' in state_dict:
-                self._cached_waveform_int16 = state_dict['waveform']
-                self._cached_waveform_sample_rate = int(state_dict['waveform_sample_rate'].item())
-        tensor_rebuilt_from_cache = False
-        if self._cached_tensor_uint8 is not None and getattr(self, 'tensor', None) is None:
+                self._cached_waveform = state_dict['waveform']
+                self._cached_waveform_sample_rate = int(
+                    state_dict['waveform_sample_rate'].item()
+                )
+        pixel_tensor_rebuilt_from_cache = False
+        if self._cached_pixel_tensor is not None and getattr(self, 'tensor', None) is None:
             # rebuild the pixel tensor as it would be if loaded without caching
-            self.tensor = _latent_from_uint8(self._cached_tensor_uint8)
-            tensor_rebuilt_from_cache = True
-        if self._cached_waveform_int16 is not None and self.audio_data is None:
+            self.tensor = self._cached_pixel_tensor
+            pixel_tensor_rebuilt_from_cache = True
+        if self._cached_waveform is not None and self.audio_data is None:
             # rebuild the audio waveform as it would be if loaded without caching
-            waveform = _waveform_from_int16(self._cached_waveform_int16)
+            waveform = self._cached_waveform
             self.audio_tensor = waveform
             self.audio_data = {"waveform": waveform, "sample_rate": self._cached_waveform_sample_rate}
             if self.is_audio_model:
@@ -2253,7 +2051,7 @@ class LatentCachingFileItemDTOMixin:
                     self._cached_first_frame_latent = torch.flip(
                         self._cached_first_frame_latent, [-1]
                     )
-                if tensor_rebuilt_from_cache:
+                if pixel_tensor_rebuilt_from_cache:
                     self.tensor = torch.flip(self.tensor, [-1])
             if self.flip_y:
                 self._encoded_latent = torch.flip(self._encoded_latent, [-2])
@@ -2261,7 +2059,7 @@ class LatentCachingFileItemDTOMixin:
                     self._cached_first_frame_latent = torch.flip(
                         self._cached_first_frame_latent, [-2]
                     )
-                if tensor_rebuilt_from_cache:
+                if pixel_tensor_rebuilt_from_cache:
                     self.tensor = torch.flip(self.tensor, [-2])
         return self._encoded_latent
 
@@ -2410,33 +2208,36 @@ class LatentCachingMixin:
                 state_dict = cached_state_dict
                 cached_latent = state_dict['latent']
                 if cached_latent.dtype == torch.uint8:
-                    # pixel-space latents cached as uint8
-                    cached_latent = _latent_from_uint8(cached_latent)
+                    # uint8 compact caches are gone; the remedy is clearing
+                    # this dataset's _latent_cache directory (see get_latent)
+                    raise ValueError(
+                        f"{file_item.path}: latent cache holds a uint8 latent "
+                        "-- delete the dataset's _latent_cache directory and "
+                        "re-run the latent caching phase."
+                    )
                 extras = _dto_extras_from_state_dict(state_dict)
                 if extras:
                     cached_latent = DTO(cached_latent, **extras)
-                file_item._encoded_latent = cached_latent.to('cpu', dtype=self.sd.torch_dtype)
+                file_item._encoded_latent = cached_latent.to('cpu')
                 if 'first_frame_latent' in state_dict:
                     cached_first_frame = state_dict['first_frame_latent']
-                    if cached_first_frame.dtype == torch.uint8:
-                        cached_first_frame = _latent_from_uint8(cached_first_frame)
-                    file_item._cached_first_frame_latent = cached_first_frame.to('cpu', dtype=self.sd.torch_dtype)
+                    file_item._cached_first_frame_latent = cached_first_frame.to('cpu')
                 if 'tensor' in state_dict:
-                    file_item._cached_tensor_uint8 = state_dict['tensor']
+                    file_item._cached_pixel_tensor = state_dict['tensor']
                 if 'waveform' in state_dict:
-                    file_item._cached_waveform_int16 = state_dict['waveform']
-                    file_item._cached_waveform_sample_rate = int(state_dict['waveform_sample_rate'].item())
+                    file_item._cached_waveform = state_dict['waveform']
+                    file_item._cached_waveform_sample_rate = int(
+                        state_dict['waveform_sample_rate'].item()
+                    )
         else:
             # not saved to disk, calculate
             # the image/video/audio was already loaded by the prep thread
-            dtype = self.sd.torch_dtype
             device = self.sd.device_torch
             state_dict = OrderedDict()
             first_frame_latent = None
             audio_latent = None
             frames = None
             # add batch dimension
-            cache_uint8 = getattr(self.sd, 'cache_latents_as_uint8', False)
             try:
                 if file_item.is_conversation:
                     # the conversation artifact: the holder assembles the mixed
@@ -2445,25 +2246,10 @@ class LatentCachingMixin:
                     with torch.no_grad():
                         latent = self.sd.encode_conversation(file_item)
                 else:
-                    if self.dataset_config.cache_tensors_to_disk:
-                        if not file_item.is_audio_model:
-                            tensor_uint8 = _latent_to_uint8(file_item.tensor).cpu()
-                            if to_disk:
-                                state_dict['tensor'] = tensor_uint8
-                            if to_memory:
-                                file_item._cached_tensor_uint8 = tensor_uint8
-                        if file_item.audio_data is not None:
-                            # audio-only models: tensor IS the waveform, stored here as int16 instead of uint8
-                            waveform_int16 = _waveform_to_int16(file_item.audio_data['waveform']).cpu()
-                            sample_rate = int(file_item.audio_data['sample_rate'])
-                            if to_disk:
-                                state_dict['waveform'] = waveform_int16
-                                state_dict['waveform_sample_rate'] = torch.tensor(sample_rate, dtype=torch.int32)
-                            if to_memory:
-                                file_item._cached_waveform_int16 = waveform_int16
-                                file_item._cached_waveform_sample_rate = sample_rate
-                    # waveforms stay fp32 into the audio encoder (bf16 mantissa is ~48 dB of noise)
-                    imgs = file_item.tensor.unsqueeze(0).to(device, dtype=torch.float32 if file_item.is_audio_model else dtype)
+                    # pristine fp32 pixels into the encoder -- the vae decides
+                    # its own compute dtype (the bundle casts at its boundary);
+                    # waveforms were already fp32
+                    imgs = file_item.tensor.unsqueeze(0).to(device, dtype=torch.float32)
                     # caching is inference by definition: the no_grad lives here so
                     # models with grad-capable encoders (future tower-LoRA) don't
                     # retain graphs during the pass
@@ -2473,10 +2259,27 @@ class LatentCachingMixin:
                 latent = latent.map(lambda t: t.squeeze(0)) if isinstance(latent, DTO) else latent.squeeze(0)
                 if to_disk:
                     main_latent = latent.tensor if isinstance(latent, DTO) else latent
-                    if cache_uint8:
-                        state_dict['latent'] = _latent_to_uint8(main_latent).cpu()
-                    else:
-                        state_dict['latent'] = main_latent.clone().detach().cpu()
+                    state_dict['latent'] = main_latent.clone().detach().cpu()
+                if self.dataset_config.cache_tensors_to_disk:
+                    # the decoded pixels + waveform ride in the cache file at
+                    # full fp32 (the float-ingest output) -- models that need
+                    # pixels at train time read them from here. No compaction:
+                    # the former uint8/int16 storage truncated the vae input.
+                    if not file_item.is_audio_model and file_item.tensor is not None:
+                        pixel_tensor = file_item.tensor.detach().to('cpu')
+                        if to_disk:
+                            state_dict['tensor'] = pixel_tensor
+                        if to_memory:
+                            file_item._cached_pixel_tensor = pixel_tensor
+                    if file_item.audio_data is not None:
+                        waveform = file_item.audio_data['waveform'].detach().to('cpu', dtype=torch.float32)
+                        sample_rate = int(file_item.audio_data['sample_rate'])
+                        if to_disk:
+                            state_dict['waveform'] = waveform
+                            state_dict['waveform_sample_rate'] = torch.tensor(sample_rate, dtype=torch.int32)
+                        if to_memory:
+                            file_item._cached_waveform = waveform
+                            file_item._cached_waveform_sample_rate = sample_rate
                     if isinstance(latent, DTO):
                         for k, v in latent.extras.items():
                             if torch.is_tensor(v):
@@ -2491,7 +2294,7 @@ class LatentCachingMixin:
             # do first frame
             is_video = file_item.is_video
             if is_video and self.dataset_config.do_i2v:
-                frames = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
+                frames = file_item.tensor.unsqueeze(0).to(device, dtype=torch.float32)
                 if len(frames.shape) == 4:
                     first_frames = frames
                 elif len(frames.shape) == 5:
@@ -2501,10 +2304,7 @@ class LatentCachingMixin:
                 with torch.no_grad():
                     first_frame_latent = self.sd.encode_images(first_frames).squeeze(0)
                 if to_disk:
-                    if cache_uint8:
-                        state_dict['first_frame_latent'] = _latent_to_uint8(first_frame_latent).cpu()
-                    else:
-                        state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
+                    state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
 
             # audio (video+audio models only — audio-only models already encoded above via encode_images)
             if not file_item.is_audio_model and file_item.audio_data is not None:
@@ -2526,9 +2326,9 @@ class LatentCachingMixin:
                 # keep it in memory; audio rides inside the latent DTO
                 if audio_latent is not None:
                     latent = DTO(latent, audio=audio_latent)
-                file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
+                file_item._encoded_latent = latent.to('cpu')
                 if first_frame_latent is not None:
-                    file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
+                    file_item._cached_first_frame_latent = first_frame_latent.to('cpu')
 
             if file_item.is_conversation:
                 # the artifact path never binds imgs/frames/tensor

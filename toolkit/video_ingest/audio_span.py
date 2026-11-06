@@ -165,6 +165,46 @@ def load_audio_from_video(video_path: str) -> tuple[torch.Tensor, int, str]:
         return waveform, sample_rate, "ffmpeg"
 
 
+def load_audio_span(
+    video_path: str,
+    *,
+    start_sec: float,
+    duration_sec: float,
+) -> tuple[torch.Tensor, int] | None:
+    """Decode only the requested span, with the full fallback chain:
+    ffmpeg pcm_f32le seek -> torchaudio fast-seek -> full decode + slice.
+    Returns stereo fp32 waveform + sample rate, or None when the video has
+    no usable audio stream."""
+    try:
+        return _load_audio_segment_ffmpeg(
+            video_path, start_sec=start_sec, duration_sec=duration_sec
+        )
+    except Exception:
+        pass
+    try:
+        return _load_audio_segment_torchaudio(
+            video_path, start_sec=start_sec, duration_sec=duration_sec
+        )
+    except Exception:
+        pass
+    try:
+        waveform, sample_rate, _backend = load_audio_from_video(video_path)
+        waveform = waveform_to_stereo(waveform)
+        start_sample = max(0, min(int(round(start_sec * sample_rate)), waveform.shape[-1]))
+        end_sample = max(
+            0,
+            min(
+                int(round((start_sec + duration_sec) * sample_rate)),
+                waveform.shape[-1],
+            ),
+        )
+        if end_sample <= start_sample:
+            return None
+        return waveform[..., start_sample:end_sample], sample_rate
+    except Exception:
+        return None
+
+
 def load_clip_audio(
     video_path: str,
     *,

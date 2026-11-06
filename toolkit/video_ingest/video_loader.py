@@ -319,13 +319,15 @@ def load_dataset_float_tensors(
         crop_width=crop_width,
         crop_height=crop_height,
     )
-    # the crop is defined in scaled coords; the decode outputs scaled dims
+    # the crop is defined in scaled coords and is the LAST geometry op, so
+    # the decoded frames are exactly crop_width x crop_height (== the source
+    # or scaled dims whenever no crop filter was emitted)
     tensor = _decode_dataset_float(
         video_path,
         frames_to_extract=frames_to_extract,
         vf=vf,
-        width=scale_to_width if (scale_to_width, scale_to_height) != (info.width, info.height) else width,
-        height=scale_to_height if (scale_to_width, scale_to_height) != (info.width, info.height) else height,
+        width=crop_width,
+        height=crop_height,
     )
     return LoadedVideo(
         tensor=tensor,

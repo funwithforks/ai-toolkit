@@ -43,11 +43,13 @@ from .video_loader import (
     LatentPixelMismatchError,
     assert_identity_bucket,
     bucket_is_identity,
+    compute_auto_frame_count,
     load_dataset_float_tensors,
     plan_frame_indices,
 )
 from .audio_span import (
     load_audio_from_video,
+    load_audio_span,
     load_clip_audio,
     set_encode_seed,
     waveform_to_stereo,
