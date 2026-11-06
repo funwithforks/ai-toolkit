@@ -54,3 +54,9 @@ from .audio_span import (
     set_encode_seed,
     waveform_to_stereo,
 )
+from .image_pixel_loader import (
+    LoadedImage,
+    _resize_lanczos,
+    load_dataset_image_tensor,
+    load_image_training_tensor,
+)

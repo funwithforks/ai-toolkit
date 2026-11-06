@@ -32,6 +32,7 @@ from toolkit.video_ingest import (
     load_audio_span,
     load_dataset_float_tensors,
 )
+from toolkit.video_ingest.image_pixel_loader import _resize_lanczos
 from torchvision import transforms
 from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageOps import exif_transpose
@@ -1006,8 +1007,10 @@ class ImageProcessingDTOMixin:
             img = img.transpose(Image.FLIP_TOP_BOTTOM)
 
         if self.dataset_config.buckets:
-            # scale and crop based on file item
-            img = img.resize((self.scale_to_width, self.scale_to_height), Image.BICUBIC)
+            # scale and crop based on file item -- the resize is the vendored
+            # lanczos (with its same-size no-op guard), replacing BICUBIC;
+            # the crop coords stay the fork's scaled-frame bookkeeping
+            img = _resize_lanczos(img, self.scale_to_width, self.scale_to_height)
             # crop to x_crop, y_crop, x_crop + crop_width, y_crop + crop_height
             if img.width < self.crop_x + self.crop_width or img.height < self.crop_y + self.crop_height:
                 # todo look into this. This still happens sometimes
