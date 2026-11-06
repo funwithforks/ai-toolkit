@@ -1959,6 +1959,10 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
                 LTX23_TOKENIZER_SOURCE
             )
             text_encoder = self._load_gemma3_from_file(te_source)
+            # eval is load-bearing: gemma3's mask code raises when a training-mode
+            # forward lacks token_type_ids, and the embed pass never passes it
+            text_encoder.requires_grad_(False)
+            text_encoder.eval()
             return tokenizer, text_encoder, {}
 
         # repo route (explicit, or the quality-ordered candidate walk: higher
@@ -1983,6 +1987,8 @@ class LTX23Model(PhasedLoadMixin, LTX2Model):
                         repo, dtype=self.torch_dtype, subfolder=""
                     )
                     text_encoder.model.vision_tower = None
+                text_encoder.requires_grad_(False)
+                text_encoder.eval()
                 flush()
                 return tokenizer, text_encoder, {}
             except Exception as e:
