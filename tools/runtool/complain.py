@@ -15,9 +15,13 @@ import json
 import os
 import time
 
-from .runner import RUNS_ROOT, _read_json  # noqa: F401 (RUNS_ROOT for path)
+from .runner import get_runs_root, _read_json
 
-COMPLAINTS_PATH = os.path.join(RUNS_ROOT, "complaints.jsonl")
+
+def complaints_path():
+    # re-resolved on every call: the runs root follows the UI's
+    # TRAINING_FOLDER setting live
+    return os.path.join(get_runs_root(), "complaints.jsonl")
 
 CATEGORIES = ("api-confusion", "misleading-output", "missing-measurement",
               "ergonomics", "doc-gap", "other")
@@ -40,7 +44,7 @@ def file_complaint(text, category, run_id=None, cost=None, agent=None):
                          f"one of {' | '.join(CATEGORIES)}")
     suite = variant = None
     if run_id is not None:
-        manifest = _read_json(os.path.join(RUNS_ROOT, run_id,
+        manifest = _read_json(os.path.join(get_runs_root(), run_id,
                                            "manifest.json"))
         if manifest is None:
             raise ParamError(f"complain: no run record for {run_id!r}")
@@ -53,15 +57,15 @@ def file_complaint(text, category, run_id=None, cost=None, agent=None):
         entry["cost"] = cost
     if agent:
         entry["agent"] = agent
-    os.makedirs(RUNS_ROOT, exist_ok=True)
-    with open(COMPLAINTS_PATH, "a") as f:
+    os.makedirs(get_runs_root(), exist_ok=True)
+    with open(complaints_path(), "a") as f:
         f.write(json.dumps(entry) + "\n")
-    return {"filed": True, "path": COMPLAINTS_PATH, "entry": entry}
+    return {"filed": True, "path": complaints_path(), "entry": entry}
 
 
 def _all():
     try:
-        with open(COMPLAINTS_PATH) as f:
+        with open(complaints_path()) as f:
             return [json.loads(ln) for ln in f if ln.strip()]
     except FileNotFoundError:
         return []
@@ -70,7 +74,7 @@ def _all():
 def complaints(stats=False, limit=20):
     rows = _all()
     newest = sorted(rows, key=lambda r: r.get("t", 0), reverse=True)
-    out = {"path": COMPLAINTS_PATH, "total": len(rows),
+    out = {"path": complaints_path(), "total": len(rows),
            "newest": newest[:limit]}
     if stats:
         agg = {}

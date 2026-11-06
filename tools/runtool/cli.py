@@ -237,7 +237,7 @@ def main(argv=None):
                 res = datasets.add(a.add, a.folder,
                                    tool_created=a.tool_created)
             else:
-                res = {"registry": datasets.REGISTRY_PATH,
+                res = {"registry": datasets.registry_path(),
                        "datasets": datasets.list_entries(
                            show_paths=a.show_paths)}
         elif a.op == "config-schema":

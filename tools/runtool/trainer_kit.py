@@ -49,7 +49,7 @@ def load_map(dataset):
         data = dsets._load()
     except FileNotFoundError:
         raise ParamError(
-            f"dataset registry {dsets.REGISTRY_PATH} does not exist; register "
+            f"dataset registry {dsets.registry_path()} does not exist; register "
             f"folders with 'runtool datasets --add KEY --folder PATH' or "
             f"create a tool dataset with 'runtool datasets --create KEY "
             f"--synthetic N'"
@@ -67,14 +67,14 @@ def tool_dataset_check(dataset, folders):
     # tool (copy source via 'datasets --create --from-key' is the one use).
     # The refusal names only the KEY: a real folder's basename must never
     # reach agent-facing output, errors included.
-    root = os.path.realpath(dsets.DATASETS_ROOT) + os.sep
+    root = os.path.realpath(dsets._tool_datasets_root()) + os.sep
     for folder in folders:
         rp = os.path.realpath(folder)
         # ownership = first path segment under the tool root is rt_-
         # prefixed (create() may keep folder structure inside it);
         # a manually-placed real folder never qualifies.
         owned = rp.startswith(root) and os.path.relpath(
-            rp, os.path.realpath(dsets.DATASETS_ROOT)).split(
+            rp, os.path.realpath(dsets._tool_datasets_root())).split(
                 os.sep)[0].startswith(dsets.TOOL_PREFIX)
         if not owned:
             raise ParamError(
@@ -569,7 +569,7 @@ class TrainerKit:
                  extra_params=None, extra_markers=None, build_env=None,
                  extra_flags=None, jobs_root=None, switches=None,
                  parse=None, spawn_job=None):
-        from .runner import RUNS_ROOT  # no cycle: runner never imports kit
+        from .runner import get_runs_root  # no cycle: runner never imports kit
 
         self.namespace = namespace
         self.module = module
@@ -587,7 +587,7 @@ class TrainerKit:
         # custom inner job spawn for probe-shaped harnesses; default
         # spawns run.py with the derived config
         self.spawn_job = spawn_job
-        self.jobs_root = jobs_root or os.path.join(RUNS_ROOT, "jobs")
+        self.jobs_root = jobs_root or os.path.join(get_runs_root(), "jobs")
         self.job_name = job_name_base(namespace)
         self.patchable = patchable(prefix)
 

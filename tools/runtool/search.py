@@ -21,10 +21,14 @@ import os
 import re
 import time
 
-from .runner import (RUNS_ROOT, _all_record_ids, _last_judgment, _pid_alive,
-                     _read_json, _run_dir)
+from .runner import (get_runs_root, _all_record_ids, _last_judgment,
+                     _pid_alive, _read_json, _run_dir)
 
-JOBS_ROOT = os.path.join(RUNS_ROOT, "jobs")
+
+def jobs_root():
+    # re-resolved on every call: the runs root follows the UI's
+    # TRAINING_FOLDER setting live
+    return os.path.join(get_runs_root(), "jobs")
 FINAL = ("done", "failed", "crash", "cancelled")
 
 # what every row carries when the record has it
@@ -183,9 +187,9 @@ def jobs():
         if jd:
             owner[os.path.realpath(jd)] = rid
     out = []
-    if os.path.isdir(JOBS_ROOT):
-        for entry in sorted(os.listdir(JOBS_ROOT)):
-            path = os.path.join(JOBS_ROOT, entry)
+    if os.path.isdir(jobs_root()):
+        for entry in sorted(os.listdir(jobs_root())):
+            path = os.path.join(jobs_root(), entry)
             if not os.path.isdir(path):
                 continue
             real = os.path.realpath(path)
@@ -203,5 +207,5 @@ def jobs():
                 row["retention"] = manifest.get("retention")
             out.append(row)
     total = sum(r["size_mb"] for r in out)
-    return {"jobs_root": JOBS_ROOT, "count": len(out),
+    return {"jobs_root": jobs_root(), "count": len(out),
             "total_size_mb": round(total, 1), "dirs": out}

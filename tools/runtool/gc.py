@@ -24,9 +24,13 @@ import os
 import shutil
 import time
 
-from .runner import RUNS_ROOT, _read_json
+from .runner import get_runs_root, _read_json
 
-JOBS_ROOT = os.path.join(RUNS_ROOT, "jobs")
+
+def jobs_root():
+    # re-resolved on every call: the runs root follows the UI's
+    # TRAINING_FOLDER setting live
+    return os.path.join(get_runs_root(), "jobs")
 CACHE_DIR = ".prompt_embed_cache"
 FINAL = ("done", "failed", "crash", "cancelled")
 
@@ -45,24 +49,24 @@ def _size(path):
 def _inside_jobs(path):
     real = os.path.realpath(path)
     try:
-        return os.path.commonpath([os.path.realpath(JOBS_ROOT), real]) \
-            == os.path.realpath(JOBS_ROOT) and real != os.path.realpath(
-                JOBS_ROOT)
+        return os.path.commonpath([os.path.realpath(jobs_root()), real]) \
+            == os.path.realpath(jobs_root()) and real != os.path.realpath(
+                jobs_root())
     except ValueError:
         return False
 
 
 def candidates(days=7.0):
     """Everything gc would reap, with reasons; nothing is deleted here."""
-    if not os.path.isdir(JOBS_ROOT):
-        return {"jobs_root": JOBS_ROOT, "candidates": [], "orphans": [],
+    if not os.path.isdir(jobs_root()):
+        return {"jobs_root": jobs_root(), "candidates": [], "orphans": [],
                 "embed_caches": []}
     cutoff = time.time() - days * 86400
 
     # index job dirs -> their run record
     referenced = {}
-    for name in sorted(os.listdir(RUNS_ROOT)):
-        rec = os.path.join(RUNS_ROOT, name)
+    for name in sorted(os.listdir(get_runs_root())):
+        rec = os.path.join(get_runs_root(), name)
         if not os.path.isdir(rec) or name == "jobs" or name == "datasets":
             continue
         manifest = _read_json(os.path.join(rec, "manifest.json"))
@@ -83,8 +87,8 @@ def candidates(days=7.0):
                 break
         except Exception:
             pass
-    for entry in sorted(os.listdir(JOBS_ROOT)):
-        path = os.path.join(JOBS_ROOT, entry)
+    for entry in sorted(os.listdir(jobs_root())):
+        path = os.path.join(jobs_root(), entry)
         if not os.path.isdir(path):
             continue
         real = os.path.realpath(path)
@@ -131,7 +135,7 @@ def candidates(days=7.0):
             "size_bytes": _size(path),
             "age_days": round((time.time() - mtime) / 86400, 1),
         })
-    return {"jobs_root": JOBS_ROOT, "days": days, "candidates": cands,
+    return {"jobs_root": jobs_root(), "days": days, "candidates": cands,
             "orphans": orphans, "embed_caches": caches,
             "total_bytes": sum(c["size_bytes"] for c in cands)
             + sum(o["size_bytes"] for o in orphans)

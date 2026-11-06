@@ -37,9 +37,62 @@ from .registry import ParamError, RunPaths, get_suite
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
-RUNS_ROOT = os.environ.get("RUNTOOL_HOME") or os.path.join(
-    REPO_ROOT, "output", "runtool"
-)
+
+
+def _ui_db_path():
+    """The UI's prisma schema names its database with a file: url relative
+    to the schema directory. Parsing it (instead of hardcoding a db path)
+    keeps runtool on the same database the UI writes, whatever it is."""
+    import re
+
+    schema = os.path.join(REPO_ROOT, "ui", "prisma", "schema.prisma")
+    try:
+        with open(schema) as f:
+            m = re.search(r'url\s*=\s*"file:([^"]+)"', f.read())
+    except OSError:
+        return None
+    if not m:
+        return None
+    rel = m.group(1)
+    if os.path.isabs(rel):
+        return rel
+    return os.path.normpath(os.path.join(os.path.dirname(schema), rel))
+
+
+def get_ui_setting(key):
+    """Read one value from the UI's Settings table, fresh on every call:
+    the owner can change the setting in the UI while a runtool process is
+    alive, and the next access must see it. Returns None when the db or
+    table is unavailable."""
+    db = _ui_db_path()
+    if db is None or not os.path.exists(db):
+        return None
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute(
+                "SELECT value FROM Settings WHERE key = ?", (key,)
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    if row is None or row[0] is None or str(row[0]).strip() == "":
+        return None
+    return str(row[0])
+
+
+def get_runs_root():
+    """The runtool record root: the UI's configured output folder plus the
+    runtool subtree, re-read on every call so a setting changed in the UI
+    is honored by the next access. When the setting is unset, the app's
+    own default applies (the repo-local output dir) -- there is no third
+    path and no missing-config state."""
+    training_folder = get_ui_setting("TRAINING_FOLDER") or os.path.join(
+        REPO_ROOT, "output")
+    return os.path.join(training_folder, "runtool")
 
 
 # ----------------------------------------------------------------- records
@@ -73,7 +126,7 @@ def emit(paths: RunPaths, event: str, **fields):
 
 
 def _run_dir(run_id):
-    return RunPaths(run_id=run_id, root=os.path.join(RUNS_ROOT, run_id))
+    return RunPaths(run_id=run_id, root=os.path.join(get_runs_root(), run_id))
 
 
 def _git(*args):
@@ -94,12 +147,12 @@ def _git(*args):
 
 def _all_record_ids():
     try:
-        names = sorted(os.listdir(RUNS_ROOT))
+        names = sorted(os.listdir(get_runs_root()))
     except FileNotFoundError:
         return []
     return [n for n in names
             if n not in ("jobs", "datasets")
-            and os.path.isdir(os.path.join(RUNS_ROOT, n))]
+            and os.path.isdir(os.path.join(get_runs_root(), n))]
 
 
 def _live_state(run_id):
@@ -145,8 +198,8 @@ def _acquire_submit_lock():
     """Serialise exclusivity-check + spawn so two same-instant submits
     cannot both pass the guard. Stale locks (holder died mid-submit)
     are stealable after a window."""
-    lock = os.path.join(RUNS_ROOT, ".submit.lock")
-    os.makedirs(RUNS_ROOT, exist_ok=True)
+    lock = os.path.join(get_runs_root(), ".submit.lock")
+    os.makedirs(get_runs_root(), exist_ok=True)
     deadline = time.time() + 10
     while True:
         try:
@@ -215,7 +268,7 @@ def submit(suite_id, variant, overrides, note="", expect=None,
         if not jobs_subtree:
             raise ParamError("after is only valid for suites that "
                              "reserve job dirs")
-        if not os.path.isdir(os.path.join(RUNS_ROOT, after)):
+        if not os.path.isdir(os.path.join(get_runs_root(), after)):
             raise ParamError(f"after: no run record for {after!r}")
         if _live_state(after) == "finished":
             raise ParamError(
@@ -504,7 +557,7 @@ def classify(run_id):
     paths = _run_dir(run_id)
     manifest = _read_json(paths.manifest)
     if manifest is None:
-        raise FileNotFoundError(f"no run record for {run_id!r} under {RUNS_ROOT}")
+        raise FileNotFoundError(f"no run record for {run_id!r} under {get_runs_root()}")
     manifest = _attach_start_mark(paths, manifest)
     # F6 pump: an unstarted queued run advances on any status touch
     queued_hold = False
@@ -633,7 +686,7 @@ def _pid_of(paths):
 def wait(run_id, timeout_s=None, poll_s=0.75):
     manifest = _read_json(_run_dir(run_id).manifest)
     if manifest is None:
-        raise FileNotFoundError(f"no run record for {run_id!r} under {RUNS_ROOT}")
+        raise FileNotFoundError(f"no run record for {run_id!r} under {get_runs_root()}")
     if timeout_s is None:
         timeout_s = manifest.get("timeout_s", 3600)
     deadline = _now() + timeout_s
@@ -692,7 +745,7 @@ def cancel(run_id, grace_s=8.0):
 
 def list_runs(limit=15):
     try:
-        names = sorted(os.listdir(RUNS_ROOT), reverse=True)
+        names = sorted(os.listdir(get_runs_root()), reverse=True)
     except FileNotFoundError:
         return []
     out = []
@@ -700,7 +753,7 @@ def list_runs(limit=15):
         # the runs root also hosts subtrees (jobs/, datasets/, the
         # registry file): only real run records qualify
         if name in ("jobs", "datasets") or not os.path.isdir(
-                os.path.join(RUNS_ROOT, name)):
+                os.path.join(get_runs_root(), name)):
             continue
         try:
             out.append(classify(name))
@@ -746,7 +799,7 @@ def judge(run_id, verdict=None, note=None):
         raise ParamError(f"--verdict must be one of {VERDICTS}")
     paths = _run_dir(run_id)
     if not os.path.exists(paths.manifest):
-        raise FileNotFoundError(f"no run record for {run_id!r} under {RUNS_ROOT}")
+        raise FileNotFoundError(f"no run record for {run_id!r} under {get_runs_root()}")
     entry = {"at": _now(), "verdict": verdict}
     if note:
         entry["note"] = note

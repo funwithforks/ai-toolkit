@@ -27,14 +27,50 @@ import shutil
 import time
 
 from .registry import ParamError, safe_run_component
-from .runner import RUNS_ROOT
+from .runner import REPO_ROOT, get_runs_root, get_ui_setting
 
 TOOL_PREFIX = "rt_"
 CACHE_DIRNAMES = {"_t_e_cache", "_latent_cache", "_clip_vision_cache"}
-DATASETS_ROOT = os.path.join(RUNS_ROOT, "datasets")
-REGISTRY_PATH = os.environ.get(
-    "RUNTOOL_DATASETS", os.path.join(RUNS_ROOT, "datasets.json")
-)
+
+
+def _tool_datasets_root():
+    """Tool-dataset (rt_) root, under the runtool subtree of the
+    configured output folder; re-resolved on every call (the UI setting
+    can change between accesses)."""
+    return os.path.join(get_runs_root(), "datasets")
+
+
+def datasets_folder():
+    """The UI's configured datasets folder (Settings, DATASETS_FOLDER),
+    re-read on every call; when unset, the app default (the repo-local
+    datasets dir) applies."""
+    return get_ui_setting("DATASETS_FOLDER") or os.path.join(
+        REPO_ROOT, "datasets")
+
+
+def registry_path():
+    """The dataset registry file, under the runs root; re-resolved on
+    every call."""
+    return os.path.join(get_runs_root(), "datasets.json")
+
+
+def _store_path(p):
+    """Registry entries are stored relative to the configured datasets
+    folder when the folder lives under it -- so moving the datasets root
+    (the UI setting) carries every entry with it -- and absolute
+    otherwise (tool datasets on the output volume, anything outside)."""
+    p = os.path.abspath(p)
+    root = os.path.abspath(datasets_folder())
+    if os.path.commonpath([root, p]) == root:
+        return os.path.relpath(p, root)
+    return p
+
+
+def _resolve_stored(p):
+    # relative entries are anchored to the configured datasets folder
+    if os.path.isabs(p):
+        return p
+    return os.path.join(datasets_folder(), p)
 
 # solid palette cycled by the synthetic generator -- content is generic by
 # design (never dataset-derived)
@@ -45,33 +81,47 @@ _PALETTE = [
 _PALETTE_NAMES = ["red", "green", "blue", "gray", "yellow"]
 
 
-def _load():
+def _load(missing_ok=False):
     try:
-        with open(REGISTRY_PATH) as f:
-            return json.load(f)
+        with open(registry_path()) as f:
+            data = json.load(f)
     except FileNotFoundError:
-        return {}
+        if missing_ok:
+            # the write path (add/create) bootstraps an absent registry;
+            # only readers treat a missing registry as a misconfiguration
+            return {}
+        # a missing registry is a misconfiguration, not an empty one:
+        # fail loudly instead of presenting zero keys (the silent empty
+        # fallback is how a wiped registry read as "unconfigured")
+        raise ParamError(
+            f"no dataset registry at {registry_path()!r}: register "
+            "folders with 'runtool datasets --add KEY --folder PATH'"
+        )
     except json.JSONDecodeError as e:
-        raise ParamError(f"registry {REGISTRY_PATH} is corrupt: {e}")
+        raise ParamError(f"registry {registry_path()} is corrupt: {e}")
+    for entry in data.values():
+        if isinstance(entry, dict) and entry.get("folders"):
+            entry["folders"] = [_resolve_stored(p) for p in entry["folders"]]
+    return data
 
 
 def _save(data):
-    os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
-    tmp = REGISTRY_PATH + ".tmp"
+    os.makedirs(os.path.dirname(registry_path()), exist_ok=True)
+    tmp = registry_path() + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=1)
-    os.replace(tmp, REGISTRY_PATH)
+    os.replace(tmp, registry_path())
 
 
 def _tool_folder(key):
-    return os.path.join(DATASETS_ROOT, f"{TOOL_PREFIX}{key}")
+    return os.path.join(_tool_datasets_root(), f"{TOOL_PREFIX}{key}")
 
 
 def is_tool_folder(path):
     """A deletable folder: under the tool datasets root, prefixed."""
+    root = os.path.realpath(_tool_datasets_root())
     real = os.path.realpath(path)
-    return (os.path.commonpath([os.path.realpath(DATASETS_ROOT), real])
-            == os.path.realpath(DATASETS_ROOT)
+    return (os.path.commonpath([root, real]) == root
             and os.path.basename(real).startswith(TOOL_PREFIX))
 
 
@@ -94,7 +144,7 @@ def list_entries(show_paths=False):
 
 def add(key, folders, tool_created=False):
     key = safe_run_component(key)
-    data = _load()
+    data = _load(missing_ok=True)
     if key in data:
         raise ParamError(
             f"key {key!r} already maps {len(data[key].get('folders', []))} "
@@ -104,7 +154,7 @@ def add(key, folders, tool_created=False):
     if missing:
         # count only -- the message must not echo real folder paths
         raise ParamError(f"{len(missing)} of {len(folders)} folder(s) do not exist")
-    entry = {"folders": [os.path.abspath(p) for p in folders]}
+    entry = {"folders": [_store_path(p) for p in folders]}
     if tool_created:
         entry["created_by"] = "runtool"
         entry["created_at"] = round(time.time(), 1)
@@ -149,7 +199,7 @@ def create(key, from_key=None, from_path=None, synthetic=0,
         raise ParamError(
             "exactly one source: --from-key | --from-path | --synthetic N"
         )
-    data = _load()
+    data = _load(missing_ok=True)
     if key in data:
         raise ParamError(f"key {key!r} already exists")
     dst = _tool_folder(key)
