@@ -155,9 +155,11 @@ def _resolve_split_file(
 ) -> Optional[str]:
     """Resolve one component through the shared comfy door (the class's
     candidate table, the per-component model_kwargs override, local roots,
-    MODELS_PATH layout, hub)."""
+    MODELS_PATH layout, hub). The candidate table is keyed by the 2.3 comfy
+    repo regardless of the job's name_or_path (which may be the mono hub
+    ref); a local split-file dir still rides extra_roots."""
     return component_cls.resolve_comfy_weights(
-        model.model_config.name_or_path,
+        LTX23_COMFY_REPO,
         subfolder="",
         hf_token=os.getenv("HF_TOKEN"),
         status_fn=model.print_and_status_update,
@@ -196,17 +198,42 @@ def _resolve_local_mono_file(filename: str) -> Optional[str]:
 def resolve_component_source(model, component: str) -> Tuple[str, str]:
     """Resolve a 2.3 component to (path, key_prefix).
 
-    Mono checkpoint: every component streams from the one file under its
-    comfy prefix. Split files: the dit and the audio vae carry prefixes, the
+    The video vae, audio vae and vocoder ALWAYS come from the separate
+    comfy bf16 files (the production-proven encode sources): the mono
+    checkpoint's embedded ``vae.``/``audio_vae.`` sections hold entirely
+    different weights than those files (measured: all 170 video-vae
+    tensors differ, and their per_channel_statistics would normalize with
+    a corrupt std averaging 0.0053 including negative entries) --
+    encoding from them produces latents at an erroneous scale. The mono
+    supplies the transformer, the connectors and the text projection
+    only.
+
+    Split-file key layouts: the dit and the audio vae carry prefixes, the
     video vae and the text projection are bare-key. The mono route also
-    honors an explicit ``<component>_path`` override (an explicit file always
-    wins, mono or split -- its layout is detected from its own keys)."""
+    honors an explicit ``<component>_path`` override (an explicit file
+    always wins -- its layout is detected from its own keys)."""
     overrides = model.model_config.model_kwargs or {}
     override = overrides.get(f"{component}_path", None) or None
     if override is not None:
         path = resolve_named_file(
             override, component=f"ltx2.3 {component}", hf_token=os.getenv("HF_TOKEN")
         )
+        return path, _detect_prefix(path, component)
+
+    if component in ("video_vae", "audio_vae"):
+        # never the mono's embedded vae sections -- see the docstring
+        component_cls, override_key = {
+            "video_vae": (LTX23VideoVAE, "video_vae_path"),
+            "audio_vae": (LTX23AudioVAE, "audio_vae_path"),
+        }[component]
+        path = _resolve_split_file(model, component_cls, component, override_key)
+        if path is None:
+            raise FileNotFoundError(
+                f"LTX-2.3: no bf16 vae file resolved for '{component}' -- "
+                f"the mono checkpoint's embedded vae weights do not match "
+                f"the production encode source. Set '{component}_path' to "
+                f"the split bf16 file."
+            )
         return path, _detect_prefix(path, component)
 
     if is_mono_checkpoint(model):
@@ -217,8 +244,6 @@ def resolve_component_source(model, component: str) -> Tuple[str, str]:
         if local is not None:
             return local, {
                 "dit": dit_prefix,
-                "video_vae": vae_prefix,
-                "audio_vae": audio_vae_prefix,
                 "text_projection": text_projection_prefix,
             }[component]
         path = resolve_named_file(
