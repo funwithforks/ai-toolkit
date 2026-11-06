@@ -29,7 +29,7 @@ from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatib
 from toolkit.prompt_utils import inject_trigger_into_prompt, extract_inline_dop_pairs, apply_inline_dop
 from toolkit.video_ingest import (
     compute_auto_frame_count,
-    load_audio_span,
+    load_clip_audio,
     load_dataset_float_tensors,
 )
 from toolkit.video_ingest.image_pixel_loader import _resize_lanczos
@@ -836,86 +836,38 @@ class ImageProcessingDTOMixin:
                 self.audio_data = None
                 self.audio_tensor = None
 
-                try:
-                    import torch.nn.functional as F
-
-                    # Compute the time range of the selected frames in the *source* video
-                    # Include the last frame by extending to the next frame boundary.
-                    if video_fps and video_fps > 0 and len(frames_to_extract) > 0:
-                        clip_start_time = frames_to_extract[0] / float(video_fps)
-                        clip_end_time = (frames_to_extract[-1] + 1) / float(video_fps)
-                        source_duration = max(0.0, clip_end_time - clip_start_time)
-                    else:
-                        clip_start_time = 0.0
-                        clip_end_time = 0.0
-                        source_duration = 0.0
-
-                    # Target duration is how this sampled/stretched clip is interpreted for training
-                    # (i.e. num_frames at the configured dataset FPS).
-                    if hasattr(self.dataset_config, "fps") and self.dataset_config.fps and self.dataset_config.fps > 0:
-                        target_duration = float(self.num_frames) / float(self.dataset_config.fps)
-                    else:
-                        target_duration = source_duration
-
-                    trim_tail_audio = (
-                        self.dataset_config.auto_frame_count
-                        and getattr(self.dataset_config, "trim_auto_frame_count_tail", False)
+                if (self.dataset_config.auto_frame_count
+                        and getattr(self.dataset_config, "trim_auto_frame_count_tail", False)):
+                    # the imported audio path implements the plain
+                    # slice-and-stretch contract only; the trim-tail audio
+                    # variant is a fork feature the owner has not ruled on
+                    raise NotImplementedError(
+                        f"{self.path}: trim_auto_frame_count_tail audio is not "
+                        "supported by the float ingest -- raise with the owner"
                     )
 
-                    # Span decode: only the requested time range leaves the
-                    # decoder (ffmpeg pcm_f32le -> torchaudio fast-seek ->
-                    # full-decode fallback), stereo-normalized fp32. The span
-                    # follows the fork's slice semantics per mode: trim cuts
-                    # exactly the training duration, everything else cuts the
-                    # selected frame span.
-                    if trim_tail_audio and target_duration > 0.0:
-                        span_start, span_duration = clip_start_time, target_duration
-                    else:
-                        span_start, span_duration = clip_start_time, source_duration
-
-                    waveform = None
-                    sample_rate = None
-                    if span_duration > 0.0:
-                        decoded = load_audio_span(
-                            self.path, start_sec=span_start, duration_sec=span_duration
-                        )
-                        if decoded is not None:
-                            waveform, sample_rate = decoded
-
-                    if waveform is not None and waveform.numel() > 0:
-                        if self.dataset_config.audio_normalize:
-                            peak = waveform.abs().amax()  # span peak across channels
-                            eps = 1e-9
-                            target_peak = 0.999  # ~ -0.01 dBFS
-                            gain = target_peak / (peak + eps)
-                            waveform = waveform * gain
-
-                        target_samples = round(target_duration * sample_rate)
-                        if target_samples > 0 and waveform.shape[-1] != target_samples:
-                            # Time-stretch/shrink to match the video clip duration implied by dataset FPS.
-                            if trim_tail_audio:
-                                # never stretch/contract in trim mode. The waveform can only be
-                                # short here (audio/video ended a hair before the target) —
-                                # pad the tail with silence, or cut any rounding overshoot
-                                pad = target_samples - waveform.shape[-1]
-                                if pad > 0:
-                                    waveform = F.pad(waveform, (0, pad))
-                                else:
-                                    waveform = waveform[..., :target_samples]
-                            elif self.dataset_config.audio_preserve_pitch:
-                                waveform = time_stretch_preserve_pitch(waveform, sample_rate, target_samples)  # waveform is [C, L]
-                            else:
-                                # Use linear interpolation over the time axis.
-                                wf = waveform.unsqueeze(0)  # [1, C, L]
-                                wf = F.interpolate(wf, size=target_samples, mode="linear", align_corners=False)
-                                waveform = wf.squeeze(0)  # [C, L]
-
-                        self.audio_tensor = waveform
-                        self.audio_data = {"waveform": waveform, "sample_rate": int(sample_rate)}
+                try:
+                    audio = load_clip_audio(
+                        self.path,
+                        frames_to_extract=frames_to_extract,
+                        video_fps=video_fps,
+                        num_frames=self.num_frames,
+                        dataset_fps=self.dataset_config.fps,
+                        normalize=self.dataset_config.audio_normalize,
+                        preserve_pitch=self.dataset_config.audio_preserve_pitch,
+                        preserve_pitch_fn=(
+                            lambda wf, sr, target: time_stretch_preserve_pitch(wf, sr, target)
+                        ),
+                    )
 
                 except Exception as e:
                     # if issue with libtorchcodec "Could not load libtorchcodec"
                     raise Exception(f"** WARNING ** - Error Processing audio for {self.path}. Error: {e}")
+
+                if audio is not None:
+                    waveform = audio["waveform"]
+                    self.audio_tensor = waveform
+                    self.audio_data = {"waveform": waveform, "sample_rate": int(audio["sample_rate"])}
 
             # Only log success in debug mode
             if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
