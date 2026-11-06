@@ -13,6 +13,7 @@ a tensor value), so the same tables that drive the batched converters drive a
 per-key plan. The closing meta scan plays the batch path's strict=True role.
 """
 
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -119,7 +120,10 @@ def build_stream_plan(
 def _probe_load_mem(tag: str, i: int, total: int) -> None:
     """Live rss/vram probe every 200 items (and on demand): the trajectory
     names the culprit if a load ooms mid-stream (per-tensor paths cap at
-    largest-tensor ram; a whole-dict path ramps to model size)."""
+    largest-tensor ram; a whole-dict path ramps to model size). Gated behind
+    AITK_LOAD_DEBUG=1 -- per-block prints flood a normal run's output."""
+    if not os.environ.get("AITK_LOAD_DEBUG") == "1":
+        return
     if i % 200:
         return
     for line in open("/proc/self/status"):
@@ -302,7 +306,7 @@ def quantize_streamed_plan(
             quantize_kwargs=quantize_kwargs,
             keep_on_device=keep_on_device,
         )
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and os.environ.get("AITK_LOAD_DEBUG") == "1":
             print(
                 f"[load-mem] {name}:{block_path} quantized; "
                 f"vram {torch.cuda.memory_allocated()/1e9:.1f}GB",
