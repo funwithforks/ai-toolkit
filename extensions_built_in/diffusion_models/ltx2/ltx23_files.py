@@ -33,6 +33,7 @@ from toolkit.models.v2.resolver import (
 )
 from toolkit.models.v2.vae.ltx2 import LTX2AudioVAE, LTX2VideoVAE
 from toolkit.paths import MODELS_PATH
+from toolkit.paths import MODELS_PATH
 
 # ---------------------------------------------------------------------------
 # sources
@@ -179,6 +180,19 @@ def is_mono_checkpoint(model) -> bool:
     return bool(name_or_path) and name_or_path.endswith(".safetensors")
 
 
+def _resolve_local_mono_file(filename: str) -> Optional[str]:
+    """Local-first search for a mono checkpoint file: the comfy category
+    folders (diffusion_models/ etc.) and the models root, recursive. The
+    hub download in resolve_named_file must never fire for a file that is
+    already on disk in the comfy layout."""
+    for cat in ("diffusion_models", "text_encoders", "vae", ""):
+        root = os.path.join(MODELS_PATH, cat) if cat else MODELS_PATH
+        found = find_file_recursive(root, filename)
+        if found:
+            return found
+    return None
+
+
 def resolve_component_source(model, component: str) -> Tuple[str, str]:
     """Resolve a 2.3 component to (path, key_prefix).
 
@@ -196,6 +210,17 @@ def resolve_component_source(model, component: str) -> Tuple[str, str]:
         return path, _detect_prefix(path, component)
 
     if is_mono_checkpoint(model):
+        # local-first: the comfy category folders hold the file even when
+        # name_or_path is the hub ref; only a true miss may download
+        filename = os.path.basename(model.model_config.name_or_path)
+        local = _resolve_local_mono_file(filename)
+        if local is not None:
+            return local, {
+                "dit": dit_prefix,
+                "video_vae": vae_prefix,
+                "audio_vae": audio_vae_prefix,
+                "text_projection": text_projection_prefix,
+            }[component]
         path = resolve_named_file(
             model.model_config.name_or_path,
             component=f"ltx2.3 {component}",
