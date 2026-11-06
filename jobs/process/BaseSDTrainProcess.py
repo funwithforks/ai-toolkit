@@ -2245,6 +2245,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if _phase2:
             for dataset in all_dataset_objs:
                 if dataset.is_caching_text_embeddings:
+                    if not getattr(self.sd, 'has_text_encoder', True):
+                        # same refusal as cache_pre_train_text_embeddings
+                        # below, raised before the dataset pass crashes
+                        # inside encode_prompt on an arch with no prompt
+                        # embeddings to cache
+                        raise ValueError(
+                            f"{type(self.sd).__name__} declares no text "
+                            "encoder: cache_text_embeddings has nothing to "
+                            "encode. This arch's embeddings are produced by "
+                            "the phase-1 latent cache; remove the flag from "
+                            "the dataset config."
+                        )
                     dataset.cache_text_embeddings()
                 if dataset.is_generating_controls:
                     # always do this last

@@ -119,12 +119,22 @@ loads fine and poisons training silently.
 
 ## 5. What makes a warm run skip the TE entirely
 
-`needs_text_encoder_load` (`SDTrainer.py:308`), in order: any dataset
-incomplete → load; `train_text_encoder` / `embed_config` / `is_llm` → load;
-validation items → load (**frozen clause**, `:321`-`:328`); live-encoding
-mode → load; live-embed needs (`_compute_live_text_encoder_needed`, `:174`) →
-load; fixed targets missing/invalid → load; otherwise skip and every embed is
-loaded from disk instead.
+`needs_text_encoder_load` (`SDTrainer.needs_text_encoder_load`), in order: an
+arch declaring no text encoder (`has_text_encoder=False` — an llm whose loss
+consumes token ids from the cached artifact) → skip, prints; any dataset
+incomplete → load; `train_text_encoder` / `embed_config` → load; validation
+items → load (**frozen clause**); live-encoding mode → load; live-embed needs
+(`_compute_live_text_encoder_needed`) → load; fixed targets missing/invalid →
+load; otherwise skip and every embed is loaded from disk instead (the serve
+branch in `cache_pre_train_text_embeddings`).
+
+The encoderless refusal is keyed on the arch declaration (`has_text_encoder`),
+never on the caching flags themselves: flags-set is the *normal* state of a
+warm caching run, so a refusal keyed on the flags refuses every with-TE warm
+resume (the Nov 2026 regression, `355c5fb1` — fixed by restoring the
+arch-keyed form). An encoderless arch that sets the flags is refused loudly,
+and the phase-2 dataset pass raises the same refusal before
+`cache_text_embeddings` can crash inside `encode_prompt`.
 
 ## 6. New-model checklist
 

@@ -77,7 +77,7 @@ still evaluates latent completeness correctly
 | Gate | Anchor | Forces load when |
 |---|---|---|
 | VAE phase-1 | `BaseSDTrainProcess.py:1916` | `vae_training_mode == 'keep'`, or any dataset needs live/cached latents, or validation items exist (frozen paired clause `:1925`) |
-| TE phase-2 | `SDTrainer.py:308` | any dataset `text_embedding_complete()` false; `train_text_encoder`; embed_config; `is_llm`; validation items (frozen clause); live-encoding mode; `_compute_live_text_encoder_needed()` (`:174`); `fixed_embeds_cached()` false (`:290`) |
+| TE phase-2 | `SDTrainer.needs_text_encoder_load` | arch declares no text encoder (`has_text_encoder=False`) → **skip, prints**; any dataset `text_embedding_complete()` false; `train_text_encoder`; embed_config; validation items (frozen clause); live-encoding mode; `_compute_live_text_encoder_needed()`; `fixed_embeds_cached()` false. The encoderless refusal (`cache_pre_train_text_embeddings`, mirrored in the phase-2 dataset pass) keys on `has_text_encoder`, never on the caching flags |
 | Sampling vae preload | `BaseSDTrainProcess.py:382` | `vae_training_mode == 'reload'` and vae absent and not `staged_sampling` |
 
 Rules learned the hard way in this repo (regressions, not theory):
