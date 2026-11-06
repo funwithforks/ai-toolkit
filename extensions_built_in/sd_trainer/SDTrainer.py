@@ -547,16 +547,14 @@ class SDTrainer(BaseSDTrainProcess):
         self.live_text_encoder_needed = self._compute_live_text_encoder_needed()
 
         if self.sd.text_encoder is None:
-            # the text encoder phase was skipped or a prior pass already
-            # unloaded it: needs_text_encoder_load() verified every embed
-            # this run needs is cached -- unless the run asks for live
-            # text-encoding work an encoderless state cannot serve, which
-            # is refused here instead of silently doing nothing
-            if self.live_text_encoder_needed:
+            # the text encoder phase was skipped: needs_text_encoder_load()
+            # already verified every embed this run needs is cached -- unless
+            # the run asks for text-embedding work an encoderless arch cannot
+            # do, which is refused here instead of silently doing nothing
+            if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
                 raise ValueError(
-                    f"{type(self.sd).__name__} has no text encoder, but this "
-                    "run needs live text encoding (prompt dropout, negative "
-                    "prompt pool, or inline dop): it cannot run encoderless."
+                    f"{type(self.sd).__name__} has no text encoder: "
+                    "unload_text_encoder and text-embedding caching do not apply to it."
                 )
             self._load_fixed_embeds_from_cache()
             return
