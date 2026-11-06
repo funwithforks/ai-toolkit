@@ -78,7 +78,9 @@ class _SeekReader:
         meta = self._header()[key]
         dtype = _SFT_DTYPES[meta["dtype"]]
         start, end = meta["data_offsets"]
-        self._file.seek(start)
+        # data_offsets are relative to the data section (8 + header length),
+        # not the file start -- the base is memoized on the owner
+        self._file.seek(self._owner._data_start + start)
         raw = self._file.read(end - start)
         tensor = torch.frombuffer(bytearray(raw), dtype=dtype).reshape(
             meta["shape"]
@@ -242,13 +244,15 @@ class WeightSource:
 
     def _cached_header(self) -> dict:
         """Parsed safetensors header, memoized (the seek-read fallback asks
-        for it per tensor; parsing 1 MB of json 6000 times is silly)."""
+        for it per tensor; parsing 1 MB of json 6000 times is silly). Also
+        records the data-section base: data_offsets are relative to it."""
         if getattr(self, "_header_cache", None) is None:
             with open(self.file_path, "rb") as f:
                 n = struct.unpack("<Q", f.read(8))[0]
                 header = json.loads(f.read(n))
             header.pop("__metadata__", None)
             self._header_cache = header
+            self._data_start = 8 + n
         return self._header_cache
 
     def _reader(self, device=None):
