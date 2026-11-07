@@ -1,6 +1,7 @@
 import { JobConfig } from '@/types';
 import { Job } from '@prisma/client';
 import { apiClient } from '@/utils/api';
+import { perfCount } from '@/utils/perfLog';
 
 export const startJob = (jobID: string) => {
   return new Promise<void>((resolve, reject) => {
@@ -98,8 +99,34 @@ export const markJobAsStopped = (jobID: string) => {
   });
 };
 
-export const getJobConfig = (job: Job) => {
-  return JSON.parse(job.job_config) as JobConfig;
+// Parsed job_config cache, keyed by job id + config string. A jobs-list
+// render used to JSON.parse the same ~3 KB config twice per row per render;
+// with the cache each distinct config is parsed once.
+const jobConfigCache = new Map<string, JobConfig | null>();
+const JOB_CONFIG_CACHE_MAX = 500;
+
+export const getJobConfig = (job: Job): JobConfig | null => {
+  const key = `${job.id}|${job.job_config}`;
+  const hit = jobConfigCache.get(key);
+  if (jobConfigCache.has(key)) {
+    perfCount('jobConfig.cacheHit');
+    return hit ?? null;
+  }
+  perfCount('jobConfig.parse');
+  let parsed: JobConfig | null = null;
+  try {
+    parsed = JSON.parse(job.job_config) as JobConfig;
+  } catch (e) {
+    // A corrupt config must not crash a render; callers treat null as
+    // "config unreadable" and degrade the affected feature only.
+    console.error('Error parsing job config for job', job.id, e);
+    parsed = null;
+  }
+  if (jobConfigCache.size >= JOB_CONFIG_CACHE_MAX) {
+    jobConfigCache.clear();
+  }
+  jobConfigCache.set(key, parsed);
+  return parsed;
 };
 
 export const getAvaliableJobActions = (job: Job) => {
@@ -111,7 +138,11 @@ export const getAvaliableJobActions = (job: Job) => {
   const canStop = job.status === 'running' && !isStopping;
   let canStart = ['stopped', 'error'].includes(job.status) && !isStopping;
   // can resume if more steps were added
-  if (job.status === 'completed' && (jobConfig.config.process[0].train?.steps || 0) > job.step && !isStopping) {
+  if (
+    job.status === 'completed' &&
+    (jobConfig?.config.process[0].train?.steps || 0) > job.step &&
+    !isStopping
+  ) {
     canStart = true;
   }
   return { canDelete, canEdit, canStop, canStart, canRemoveFromQueue };
@@ -119,7 +150,7 @@ export const getAvaliableJobActions = (job: Job) => {
 
 export const getNumberOfSamples = (job: Job) => {
   const jobConfig = getJobConfig(job);
-  return jobConfig.config.process[0].sample?.prompts?.length || 0;
+  return jobConfig?.config.process[0].sample?.prompts?.length || 0;
 };
 
 export const getTotalSteps = (job: Job) => {
@@ -127,5 +158,5 @@ export const getTotalSteps = (job: Job) => {
     return job.total_steps;
   }
   const jobConfig = getJobConfig(job);
-  return jobConfig.config.process[0].train?.steps || 0;
+  return jobConfig?.config.process[0].train?.steps || 0;
 };

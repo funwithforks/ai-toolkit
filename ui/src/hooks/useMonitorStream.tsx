@@ -70,6 +70,30 @@ function emit(next: MonitorStreamState) {
   }
 }
 
+/**
+ * Subscribe directly to the shared monitor stream without per-sample state
+ * updates. Use this (via useGPUStructure) when a component only needs the
+ * GPU list (names/indices) and must not re-render on every 500 ms sample.
+ */
+export function subscribeMonitorStream(listener: (s: MonitorStreamState) => void): () => void {
+  listeners.add(listener);
+  refCount++;
+  if (refCount === 1) {
+    start();
+  }
+  return () => {
+    listeners.delete(listener);
+    refCount--;
+    if (refCount <= 0) {
+      stop();
+    }
+  };
+}
+
+export function getMonitorStreamState(): MonitorStreamState {
+  return state;
+}
+
 function post(msg: ChannelMessage) {
   try {
     channel?.postMessage(msg);

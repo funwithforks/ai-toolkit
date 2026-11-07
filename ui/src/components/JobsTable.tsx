@@ -1,18 +1,18 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import useJobsList from '@/hooks/useJobsList';
 import Link from 'next/link';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
-import { GpuInfo } from '@/types';
+import { GpuStructure, useGPUStructure } from '@/hooks/useGPUInfo';
 import JobActionBar from './JobActionBar';
 import { Job, Queue } from '@prisma/client';
 import useQueueList from '@/hooks/useQueueList';
 import classNames from 'classnames';
 import { startQueue, stopQueue } from '@/utils/queue';
 import { CgSpinner } from 'react-icons/cg';
-import useGPUInfo from '@/hooks/useGPUInfo';
 import { openConfirm } from '@/components/ConfirmModal';
 import { deleteJob, getTotalSteps, stopJob } from '@/utils/jobs';
 import { Trash2 } from 'lucide-react';
+import { perfCount } from '@/utils/perfLog';
 
 interface JobsTableProps {
   autoStartQueue?: boolean;
@@ -23,19 +23,42 @@ interface JobsTableProps {
 export default function JobsTable({ onlyActive = false, job_type = null }: JobsTableProps) {
   const { jobs, status, refreshJobs } = useJobsList({ onlyActive, reloadInterval: 5000, job_type });
   const { queues, status: queueStatus, refreshQueues } = useQueueList();
-  const { gpuList, isGPUInfoLoaded } = useGPUInfo();
+  // Structure only (index/name): the page must not re-render on every 500 ms
+  // monitor sample just to know GPU names for grouping.
+  const { gpuList, isGPUInfoLoaded } = useGPUStructure();
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteProgress, setDeleteProgress] = useState<{ done: number; total: number } | null>(null);
 
-  const refresh = () => {
+  const refresh = useCallback(() => {
     refreshJobs();
     refreshQueues();
-  };
+  }, [refreshJobs, refreshQueues]);
 
   const isDeleting = deleteProgress !== null;
   const allSelected = jobs.length > 0 && jobs.every(job => selectedIds.has(job.id));
 
-  const toggleRow = (id: string) => {
+  // Perf diagnostics: count committed renders and attribute each to a cause
+  // by comparing prop/state identities with the previous commit.
+  const prevRenderRef = useRef<{ jobs?: Job[]; gpuList?: GpuStructure[] }>({});
+  useEffect(() => {
+    const prev = prevRenderRef.current;
+    let cause = 'first';
+    if (prev.jobs !== undefined) {
+      if (prev.gpuList !== gpuList) cause = 'gpu';
+      else if (prev.jobs !== jobs) cause = 'jobs';
+      else cause = 'state';
+    }
+    prevRenderRef.current = { jobs, gpuList };
+    perfCount('JobsTable.render');
+    perfCount(`JobsTable.render.${cause}`);
+  });
+
+  // jobs through a ref: keeps toggleAll (and therefore the columns array and
+  // every memoized row) identity-stable across data changes.
+  const jobsRef = useRef(jobs);
+  jobsRef.current = jobs;
+
+  const toggleRow = useCallback((id: string) => {
     setSelectedIds(prev => {
       const next = new Set(prev);
       if (next.has(id)) {
@@ -45,13 +68,13 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
       }
       return next;
     });
-  };
+  }, []);
 
-  const toggleAll = () => {
-    setSelectedIds(allSelected ? new Set() : new Set(jobs.map(job => job.id)));
-  };
+  const toggleAll = useCallback(() => {
+    setSelectedIds(allSelected ? new Set() : new Set(jobsRef.current.map(job => job.id)));
+  }, [allSelected]);
 
-  const onMassDelete = () => {
+  const onMassDelete = useCallback(() => {
     const jobsToDelete = jobs.filter(job => selectedIds.has(job.id));
     if (jobsToDelete.length === 0) return;
     const runningCount = jobsToDelete.filter(job => job.status === 'running').length;
@@ -90,15 +113,14 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
             console.error('Error deleting job:', job.name, e);
           }
           setDeleteProgress({ done: i + 1, total: jobsToDelete.length });
-          refreshJobs();
         }
         setDeleteProgress(null);
         refresh();
       },
     });
-  };
+  }, [jobs, selectedIds, refresh]);
 
-  const columns: TableColumn[] = [
+  const columns: TableColumn[] = useMemo(() => [
     {
       title: (
         <input
@@ -206,18 +228,20 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
         return <JobActionBar job={row} onRefresh={refreshJobs} autoStartQueue={false} />;
       },
     },
-  ];
+  ], [allSelected, isDeleting, selectedIds, toggleAll, toggleRow, refreshJobs]);
 
   const jobsDict = useMemo(() => {
+    perfCount('jobsDict.compute');
     if (!isGPUInfoLoaded) return {};
     if (jobs.length === 0) return {};
     let jd: { [key: string]: { name: string; jobs: Job[] } } = {};
-    gpuList.forEach(gpu => {
+    gpuList.forEach((gpu: GpuStructure) => {
       jd[`${gpu.index}`] = { name: `${gpu.name}`, jobs: [] };
     });
     jd['Idle'] = { name: 'Idle', jobs: [] };
     jobs.forEach(job => {
-      const gpu = gpuList.find(gpu => job.gpu_ids?.split(',').includes(gpu.index.toString())) as GpuInfo;
+      const gpuIndexIds = job.gpu_ids ? job.gpu_ids.split(',') : [];
+      const gpu = gpuList.find(g => gpuIndexIds.includes(String(g.index)));
       const key = `${gpu?.index || '0'}`;
       if (['queued', 'running', 'stopping'].includes(job.status) && key in jd) {
         jd[key].jobs.push(job);
@@ -241,7 +265,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
       }
     });
     return jd;
-  }, [jobs, queues, isGPUInfoLoaded]);
+  }, [jobs, gpuList, isGPUInfoLoaded]);
 
   let isLoading = status === 'loading' || queueStatus === 'loading' || !isGPUInfoLoaded;
 

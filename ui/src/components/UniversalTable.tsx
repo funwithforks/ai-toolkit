@@ -1,5 +1,7 @@
 import Loading from './Loading';
 import classNames from 'classnames';
+import { memo, useEffect } from 'react';
+import { perfCount } from '@/utils/perfLog';
 
 export interface TableColumn {
   title: React.ReactNode;
@@ -11,6 +13,33 @@ export interface TableColumn {
 interface TableRow {
   [key: string]: any;
 }
+
+/**
+ * Memoized row: skips re-rendering when the row object or the column set is
+ * unchanged. Relies on useJobsList reusing job objects across no-op polls so
+ * unchanged rows keep a stable identity. Striping is done in CSS (nth-child)
+ * rather than by row index so a sort-order change can't re-render every row.
+ */
+const MemoizedTableRow = memo(function MemoizedTableRow({
+  row,
+  columns,
+}: {
+  row: TableRow;
+  columns: TableColumn[];
+}) {
+  useEffect(() => {
+    perfCount('TableRow.render');
+  });
+  return (
+    <tr className="odd:bg-gray-900 even:bg-gray-800 border-b border-gray-700 hover:bg-gray-700">
+      {columns.map(column => (
+        <td key={column.key} className={classNames('px-3 py-2', column.className)}>
+          {column.render ? column.render(row) : row[column.key]}
+        </td>
+      ))}
+    </tr>
+  );
+});
 
 interface TableProps {
   columns: TableColumn[];
@@ -27,6 +56,11 @@ export default function UniversalTable({
   theadClassName = 'text-gray-400',
   onRefresh = () => {},
 }: TableProps) {
+  // Perf diagnostics: count committed renders of the table. Actual row
+  // renders are counted inside MemoizedTableRow.
+  useEffect(() => {
+    perfCount('UniversalTable.render');
+  });
   return (
     <div className="w-full bg-gray-900 rounded-md shadow-md">
       {isLoading ? (
@@ -56,20 +90,9 @@ export default function UniversalTable({
               </tr>
             </thead>
             <tbody>
-              {rows?.map((row, index) => {
-                // Style for alternating rows
-                const rowClass = index % 2 === 0 ? 'bg-gray-900' : 'bg-gray-800';
-
-                return (
-                  <tr key={row.id ?? index} className={`${rowClass} border-b border-gray-700 hover:bg-gray-700`}>
-                    {columns.map(column => (
-                      <td key={column.key} className={classNames('px-3 py-2', column.className)}>
-                        {column.render ? column.render(row) : row[column.key]}
-                      </td>
-                    ))}
-                  </tr>
-                );
-              })}
+              {rows?.map((row, index) => (
+                <MemoizedTableRow key={row.id ?? index} row={row} columns={columns} />
+              ))}
             </tbody>
           </table>
         </div>

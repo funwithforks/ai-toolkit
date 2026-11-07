@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { Eye, Trash2, Pen, Play, Pause, Cog, X, Copy, Save, OctagonX, Image } from 'lucide-react';
 import { LuLoader } from 'react-icons/lu';
 import { Button } from '@headlessui/react';
@@ -18,6 +18,7 @@ import { startQueue } from '@/utils/queue';
 import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
 import { redirect } from 'next/navigation';
 import { openCaptionDatasetModal } from '@/components/CaptionDatasetModal';
+import { perfCount } from '@/utils/perfLog';
 
 interface JobActionBarProps {
   job: Job;
@@ -37,7 +38,7 @@ type PendingAction = 'start' | 'remove' | 'stop' | 'delete' | 'save' | 'sample' 
 // server-side), unlock the bar after this long so it can't stay stuck.
 const PENDING_TIMEOUT_MS = 30_000;
 
-export default function JobActionBar({
+function JobActionBar({
   job,
   onRefresh,
   afterDelete,
@@ -58,6 +59,11 @@ export default function JobActionBar({
   // action does not change job state and clears as soon as the request resolves.
   const pendingStateKeyRef = useRef<string | null>(null);
   const jobStateKey = `${job.status}|${job.stop ? 1 : 0}`;
+
+  // Perf diagnostics: count committed renders of the action bar.
+  useEffect(() => {
+    perfCount('JobActionBar.render');
+  });
 
   const clearPending = () => {
     pendingStateKeyRef.current = null;
@@ -306,3 +312,9 @@ export default function JobActionBar({
     </div>
   );
 }
+
+// Memoized: with a jobs list the bar is rendered once per row; without this,
+// every parent render (e.g. a 500 ms GPU tick) rebuilt every bar's whole
+// subtree. `job` keeps a stable identity across no-op polls (see
+// useJobsList), so unchanged rows skip re-rendering entirely.
+export default memo(JobActionBar);
