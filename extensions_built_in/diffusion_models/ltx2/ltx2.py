@@ -386,6 +386,13 @@ class LTX2Model(BaseModel):
     arch = "ltx2"
     ltx_version = "2.0"
     ltx_te_path = None
+    # Adapter-parity with the last known-good upstream training state:
+    # the LoRA masters train at fp32 (fp32 params, fp32 LoRA GEMMs, fp32
+    # runtime scale -- the input cast and the scale buffer both follow
+    # the parameter dtype), so qfloat8-base gradient math matches the
+    # pre-adapter-dtype-change contract exactly. Opt-in per model class;
+    # every other model keeps the train-dtype adapter.
+    aitk_fp32_lora_masters = True
 
     def __init__(
         self,

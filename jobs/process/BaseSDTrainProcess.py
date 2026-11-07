@@ -2495,7 +2495,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # kernels every step for no information gain on bf16/int8
                 # bases. Optimizer precision for bf16 params is handled by
                 # the optimizers (e.g. automagic2 stochastic rounding).
-                self.network.force_to(self.device_torch, dtype=dtype)
+                # A model class may opt back into fp32 adapter masters
+                # (aitk_fp32_lora_masters) for exact upstream parity; the
+                # fp32 params also restore the fp32 LoRA GEMMs and the
+                # fp32 runtime scale (the input cast and the scale buffer
+                # both follow the parameter dtype).
+                network_dtype = (
+                    torch.float32
+                    if getattr(self.sd, "aitk_fp32_lora_masters", False)
+                    else dtype
+                )
+                if network_dtype != dtype:
+                    print_acc(
+                        f" - {self.sd.__class__.__name__}: LoRA masters at "
+                        "fp32 (aitk_fp32_lora_masters)"
+                    )
+                self.network.force_to(self.device_torch, dtype=network_dtype)
                 # give network to sd so it can use it
                 self.sd.network = self.network
                 self.network._update_torch_multiplier()
