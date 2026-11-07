@@ -623,6 +623,7 @@ def classify(run_id):
         "progress": progress,
         "record": paths.root,
         "started_at": manifest.get("submitted_at"),
+        "timeout_s": manifest.get("timeout_s", 3600),
     }
     if result is not None:
         out["metrics"] = result.get("metrics", {})

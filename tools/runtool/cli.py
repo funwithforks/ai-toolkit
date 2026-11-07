@@ -1,5 +1,10 @@
 """JSON CLI for runtool. Every subcommand prints one JSON object.
 
+Every op accepts --machine NAME (before or after the op): the op is
+forwarded to that machine's web server and its response is printed
+verbatim, with the remote exit code. Without it, everything is local.
+Machines live in <runs_root>/machines.json (hand-edited, gitignored).
+
   suites                      registry (params, bounds, metrics)
   config-schema [--section S] [--key K] [--class C]
                               config vocabulary derived from the real
@@ -60,19 +65,32 @@ from .registry import ParamError, RunPaths, get_suite, registry
 
 
 def main(argv=None):
+    raw = list(sys.argv[1:]) if argv is None else list(argv)
     ap = argparse.ArgumentParser(prog="runtool")
+    # --machine is accepted before or after the op: the top-level parser
+    # covers `runtool --machine NAME <op> ...`, the shared parent covers
+    # `runtool <op> ... --machine NAME`. The subparser value wins when both
+    # are given (standard argparse: explicit beats earlier default).
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--machine", default=None, metavar="NAME",
+        help="run the op on a registered machine over its web server and "
+             "print its response verbatim (registry: <runs_root>/"
+             "machines.json, hand-edited, gitignored)")
+    ap.add_argument("--machine", default=None, metavar="NAME",
+                    help="same as the per-op --machine")
     sub = ap.add_subparsers(dest="op", required=True)
 
-    sub.add_parser("suites")
+    sub.add_parser("suites", parents=[common])
 
-    p = sub.add_parser("config-schema")
+    p = sub.add_parser("config-schema", parents=[common])
     p.add_argument("--section", default=None,
                    help="config section, e.g. train, model, datasets[]")
     p.add_argument("--key", default=None, help="one key, within --section")
     p.add_argument("--class", dest="cls", default=None,
                    help="config class name (overrides --section)")
 
-    p = sub.add_parser("datasets")
+    p = sub.add_parser("datasets", parents=[common])
     p.add_argument("--list", action="store_true")
     p.add_argument("--show-paths", action="store_true",
                    help="include folder paths (owner-side; kept out of "
@@ -95,7 +113,7 @@ def main(argv=None):
     p.add_argument("--rm", default=None, metavar="KEY")
     p.add_argument("--delete-files", action="store_true")
 
-    p = sub.add_parser("submit")
+    p = sub.add_parser("submit", parents=[common])
     p.add_argument("--suite", required=True)
     p.add_argument("--variant", required=True)
     p.add_argument("--params", default="{}", help="JSON object of params")
@@ -114,12 +132,12 @@ def main(argv=None):
     ))
 
     for name in ("wait", "status", "cancel", "recompute"):
-        p = sub.add_parser(name)
+        p = sub.add_parser(name, parents=[common])
         p.add_argument("run_id")
         if name == "wait":
             p.add_argument("--timeout-s", type=float, default=None)
 
-    p = sub.add_parser("inspect")
+    p = sub.add_parser("inspect", parents=[common])
     p.add_argument("run_id")
     p.add_argument("--tail", type=int, default=30,
                    help="tail lines from each log; 0 or negative = whole "
@@ -132,10 +150,11 @@ def main(argv=None):
                    help="inline the derived config (registered real dataset "
                         "paths mechanically replaced by their keys)")
 
-    p = sub.add_parser("list")
+    p = sub.add_parser("list", parents=[common])
     p.add_argument("--limit", type=int, default=15)
 
-    p = sub.add_parser("search", help="query the run history (read-only)")
+    p = sub.add_parser("search", parents=[common],
+                       help="query the run history (read-only)")
     p.add_argument("--suite", default=None)
     p.add_argument("--variant", default=None)
     p.add_argument("--status", default=None,
@@ -165,7 +184,7 @@ def main(argv=None):
                         "(owner, run status, size, age)")
     p.add_argument("--limit", type=int, default=25)
 
-    p = sub.add_parser("judge",
+    p = sub.add_parser("judge", parents=[common],
                        help="attach the owner's verdict/note to a record")
     p.add_argument("run_id")
     p.add_argument("--verdict",
@@ -173,12 +192,13 @@ def main(argv=None):
                    default=None)
     p.add_argument("--note", default=None)
 
-    p = sub.add_parser("gc")
+    p = sub.add_parser("gc", parents=[common])
     p.add_argument("--days", type=float, default=7.0)
     p.add_argument("--apply", action="store_true")
     p.add_argument("--include-judged", action="store_true")
 
-    p = sub.add_parser("complain", help="file a complaint about the tool")
+    p = sub.add_parser("complain", parents=[common],
+                       help="file a complaint about the tool")
     p.add_argument("--run-id", default=None)
     p.add_argument("--category", required=True,
                    help="api-confusion | misleading-output | "
@@ -188,12 +208,17 @@ def main(argv=None):
                    help="what the workaround cost (time, wrong conclusion)")
     p.add_argument("--agent", default=None, help="who filed it")
 
-    p = sub.add_parser("complaints", help="read the complaint channel")
+    p = sub.add_parser("complaints", parents=[common],
+                       help="read the complaint channel")
     p.add_argument("--stats", action="store_true",
                    help="aggregate by category x suite (the tool agenda)")
     p.add_argument("--limit", type=int, default=20)
 
     a = ap.parse_args(argv)
+    if getattr(a, "machine", None):
+        from . import transport
+
+        return transport.delegate(a.machine, a.op, raw, a)
     try:
         if a.op == "suites":
             reg = registry()
