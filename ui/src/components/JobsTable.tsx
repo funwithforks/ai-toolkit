@@ -51,6 +51,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
     prevRenderRef.current = { jobs, gpuList };
     perfCount('JobsTable.render');
     perfCount(`JobsTable.render.${cause}`);
+    perfCount(isGPUInfoLoaded ? 'JobsTable.render.loaded' : 'JobsTable.render.unloaded');
   });
 
   // jobs through a ref: keeps toggleAll (and therefore the columns array and

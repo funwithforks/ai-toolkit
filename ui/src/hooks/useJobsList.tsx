@@ -31,6 +31,7 @@ interface JobsStore {
   listeners: Set<(jobs: Job[], status: Status) => void>;
   fetching: boolean;
   loopRunning: boolean;
+  lastFetchedAt: number;
 }
 
 const stores = new Map<string, JobsStore>();
@@ -42,8 +43,7 @@ function storeKey(onlyActive: boolean, job_type: string | null) {
 function getStore(
   key: string,
   opts: { onlyActive: boolean; job_type: string | null; reloadInterval: number | null },
-): JobsStore {
-  let store = stores.get(key);
+): JobsStore {  let store = stores.get(key);
   if (!store) {
     const params: Record<string, string> = {};
     if (opts.job_type) {
@@ -60,6 +60,7 @@ function getStore(
       listeners: new Set(),
       fetching: false,
       loopRunning: false,
+      lastFetchedAt: 0,
     };
     stores.set(key, store);
   } else if (store.reloadInterval === null && opts.reloadInterval !== null) {
@@ -145,6 +146,7 @@ async function fetchStore(store: JobsStore): Promise<void> {
     notify(store);
   } finally {
     store.fetching = false;
+    store.lastFetchedAt = Date.now();
   }
 }
 
@@ -168,14 +170,25 @@ function ensureLoop(store: JobsStore) {
   })();
 }
 
+/**
+ * Existing store for a key, without creating one. Used to seed hook state
+ * synchronously during the first render so a revisited page never paints an
+ * empty frame while waiting for the mount effect to run.
+ */
+function peekStore(key: string): JobsStore | null {
+  return stores.get(key) ?? null;
+}
+
 export default function useJobsList({
   onlyActive = false,
   reloadInterval = null,
   job_type = null,
 }: UseJobsListProps = {}) {
   const key = storeKey(onlyActive, job_type);
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [status, setStatus] = useState<Status>('idle');
+  // Sync seed from the shared cache (survives client-side navigation).
+  const [seed] = useState(() => peekStore(key));
+  const [jobs, setJobs] = useState<Job[]>(seed?.jobs ?? []);
+  const [status, setStatus] = useState<Status>(seed ? seed.status : 'idle');
   const storeRef = useRef<JobsStore | null>(null);
 
   useEffect(() => {
@@ -194,6 +207,12 @@ export default function useJobsList({
       setStatus('loading');
     }
     ensureLoop(store);
+    // Revisiting a page must not show stale data for up to a full interval:
+    // if the shared cache is older than one poll, refresh right away. (The
+    // fetching guard makes this safe when the loop is mid-request.)
+    if (Date.now() - store.lastFetchedAt > (store.reloadInterval ?? 0)) {
+      void fetchStore(store);
+    }
     return () => {
       store.listeners.delete(listener);
     };
