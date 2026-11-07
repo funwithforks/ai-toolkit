@@ -36,6 +36,7 @@ const OPS = new Set([
   'complain',
   'complaints',
   'recompute',
+  'machines',
 ]);
 
 export async function POST(request: Request) {

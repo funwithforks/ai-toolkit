@@ -148,6 +148,27 @@ def _emit(payload):
     return code
 
 
+def list_machines():
+    """Agent-facing registry view: names, urls, notes — never tokens.
+    The registry path is included so the owner can be pointed at the
+    exact file; a missing registry is a loud teaching error, matching
+    the datasets registry discipline (the silent empty fallback is how a
+    wiped registry once read as 'unconfigured')."""
+    registry = _load_registry()  # ParamError propagates: teaching message
+    machines = []
+    for name in sorted(registry):
+        entry = registry[name]
+        if not isinstance(entry, dict):
+            continue
+        machines.append({
+            "name": name,
+            "url": entry.get("url"),
+            "auth": "set" if entry.get("token") else "unset",
+            **({"note": entry["note"]} if entry.get("note") else {}),
+        })
+    return {"registry": registry_path(), "machines": machines}
+
+
 def _strip_machine_tokens(tokens):
     """The exact user tokens, minus --machine / --machine=... — the remote
     does its own json.loads on --params/--expect/--config-patch, so no

@@ -52,6 +52,8 @@ Machines live in <runs_root>/machines.json (hand-edited, gitignored).
                               file a complaint about the tool itself;
                               cheap on purpose -- file before working
                               around a tool gap
+  machines                    registered machines for --machine (names,
+                              urls, auth set/unset; tokens never shown)
   complaints [--stats]        read the channel; --stats aggregates by
                               category x suite (the tool-session agenda)
 """
@@ -214,6 +216,9 @@ def main(argv=None):
                    help="aggregate by category x suite (the tool agenda)")
     p.add_argument("--limit", type=int, default=20)
 
+    p = sub.add_parser("machines", parents=[common],
+                       help="list registered machines (tokens never shown)")
+
     a = ap.parse_args(argv)
     if getattr(a, "machine", None):
         from . import transport
@@ -319,6 +324,9 @@ def main(argv=None):
         elif a.op == "complaints":
             from . import complain as complain_mod
             res = complain_mod.complaints(stats=a.stats, limit=a.limit)
+        elif a.op == "machines":
+            from . import transport
+            res = transport.list_machines()
         elif a.op == "recompute":
             res = runner.recompute(a.run_id)
         elif a.op == "list":
