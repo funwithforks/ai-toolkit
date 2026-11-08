@@ -2043,6 +2043,19 @@ class MinimaxH3FlashModel(MinimaxH3Model):
 
     arch = "minimax_h3_flash"
 
+    @classmethod
+    def select_comfy_candidates(cls, component, candidates, model_kwargs):
+        """The flash repack is not a base-H3 partition: this arch owns its
+        transformer file outright and never joins the base fl2va/ref2va
+        candidate pools (the base fl2va needle is a substring of the flash
+        filename, so a shared pool could hand base jobs the flash weights).
+        Other components pass through unfiltered."""
+        if component != "transformer":
+            return None
+        return [
+            "diffusion_models/minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors"
+        ]
+
     def _load_transformer(self) -> MiniMaxH3Transformer:
         transformer = super()._load_transformer()
         if transformer.params.hyperflow_gate is None:

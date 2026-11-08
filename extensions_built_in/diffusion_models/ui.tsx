@@ -1535,6 +1535,101 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     ),
   },
   {
+    name: "minimax_h3_flash",
+    label: "MiniMax-H3 Flash (HyperFlow)",
+    group: "video",
+    isVideoModel: true,
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      "config.name": ["H3Flash__lora_v1", "my_first_lora_v1"],
+      "config.process[0].model.name_or_path": [
+        "Comfy-Org/MiniMax-H3",
+        defaultNameOrPath,
+      ],
+      // the repack is pre-quantized int8 ConvRot; the default qtypes match it
+      "config.process[0].model.quantize": [false, false],
+      "config.process[0].model.qtype": ["convrot8", "qfloat8"],
+      "config.process[0].model.quantize_te": [false, false],
+      "config.process[0].model.qtype_te": ["nvfp4", "qfloat8"],
+      "config.process[0].model.low_vram": [false, false],
+      "config.process[0].sample.sampler": ["flowmatch", "flowmatch"],
+      "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
+      "config.process[0].train.cache_text_embeddings": [true, false],
+      "config.process[0].network.linear": [16, defaultLinearRank],
+      "config.process[0].network.linear_alpha": [16, defaultLinearRank],
+      "config.process[0].network.network_kwargs.ignore_if_contains": [
+        ["adaln_proj"],
+        [],
+      ],
+      "config.process[0].sample.num_frames": [107, 1],
+      "config.process[0].sample.fps": [24, 1],
+      "config.process[0].sample.width": [768, 1024],
+      "config.process[0].sample.height": [768, 1024],
+      "config.process[0].sample.guidance_scale": [1, 4],
+      "config.process[0].sample.sample_steps": [6, 25],
+      "config.process[0].train.audio_loss_multiplier": [1.0, undefined],
+      "config.process[0].train.timestep_type": ["shift", "sigmoid"],
+      "config.process[0].datasets[x].do_i2v": [false, undefined],
+      "config.process[0].datasets[x].do_audio": [true, undefined],
+      "config.process[0].datasets[x].cache_latents_to_disk": [true, false],
+      "config.process[0].datasets[x].fps": [24, undefined],
+      "config.process[0].datasets[x].num_frames": [39, undefined],
+      "config.process[0].datasets[x].auto_frame_count": [true, undefined],
+    },
+    disableSections: ["network.conv"],
+    additionalSections: [
+      "sample.ctrl_img",
+      "datasets.num_frames",
+      "model.layer_offloading",
+      "model.low_vram",
+      "datasets.do_audio",
+      "datasets.audio_normalize",
+      "datasets.audio_preserve_pitch",
+      "datasets.do_i2v",
+      "train.audio_loss_multiplier",
+      "datasets.auto_frame_count",
+    ],
+    modelNotes: (
+      <div className="space-y-2">
+        <p>
+          HyperFlow H3 Flash is Video Rebirth&apos;s few-step compressed
+          MiniMax-H3 (13.7B: dropped blocks, low-rank linears, int8 ConvRot,
+          two-time (t,&nbsp;r) conditioning, no CFG). This arch resolves its
+          own DiT file from the Models Folder Path —{" "}
+          <code>diffusion_models/minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors</code>
+          {" "}— so it never touches the base model&apos;s fl2va/ref2va
+          candidates (override with{" "}
+          <code>model_kwargs.transformer_path</code> if needed). The
+          Qwen3-VL text encoder and both VAEs are the base model&apos;s files,
+          resolved from <code>Comfy-Org/MiniMax-H3</code>.
+        </p>
+        <pre className="bg-gray-900 border border-gray-700 rounded-lg p-3 text-xs overflow-x-auto">
+          <code>{`<MODELS_PATH>/
+├── diffusion_models/
+│   └── minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors
+├── text_encoders/
+│   └── qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+└── vae/
+    ├── minimax_h3_video_vae_fp16.safetensors
+    └── minimax_h3_audio_vae_fp32.safetensors`}</code>
+        </pre>
+        <p>
+          The repack is pre-quantized and loads as-shipped: the default qtypes
+          (<code>convrot8</code> / <code>nvfp4</code>) match the files exactly,
+          so nothing is re-quantized on load. Training samples whole 6-step
+          deployment steps — the trainer noises at a grid sigma and conditions
+          every row on its (t, r) pair toward the next grid point, so{" "}
+          <code>timestep_type</code> is ignored for this arch. Sample with 6
+          steps and guidance scale 1 (the trained schedule; 4 and 8 steps also
+          exist). Video is fixed 24 fps and frame counts snap down to the 17n+5
+          grid (5, 22, 39, 56, ..., 107, 124 ≈ 5s). Image datasets
+          (num_frames 1) train as single frames, and a sample with num_frames 1
+          renders a single image.
+        </p>
+      </div>
+    ),
+  },
+  {
     name: "ltx2",
     label: "LTX-2",
     group: "video",
