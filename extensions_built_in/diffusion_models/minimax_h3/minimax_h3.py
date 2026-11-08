@@ -2091,10 +2091,13 @@ class MinimaxH3FlashModel(MinimaxH3Model):
             dtype=torch.float32,
             device=sigma_v.device,
         )
-        # each item's sigma is a grid point by construction (the trainer
-        # samples whole steps); recover the index and step to the endpoint
-        idx = torch.argmin((grid.unsqueeze(0) - sigma_v.unsqueeze(1)).abs(), dim=1)
-        sigma_next = grid[(idx + 1).clamp(max=grid.shape[0] - 1)]
+        # the endpoint is the next deployment sigma strictly below each row's
+        # sigma: exact grid hits (deployment_grid sampling) step to the
+        # following point, off-grid sigmas (sigmoid/continuous sampling) step
+        # to the first point below -- the jump the model makes at inference
+        # from that noise level
+        k = (grid >= sigma_v.unsqueeze(1)).sum(dim=1).clamp(max=grid.shape[0] - 1)
+        sigma_next = grid[k]
         sigma_a_next = remap_sigma(
             sigma_next, self.video_sigma_shift, packing.AUDIO_SIGMA_SHIFT
         )

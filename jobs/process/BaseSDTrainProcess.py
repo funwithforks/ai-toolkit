@@ -1472,13 +1472,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if is_reg:
                     content_or_style = self.train_config.content_or_style_reg
 
-                # arch-declared deployment sigma grid (few-step distilled
-                # models, e.g. HyperFlow flash): sample whole grid steps so
-                # the noising sigma and the (t, r) endpoint pair land exactly
-                # on the schedule the model was distilled for. Everything
-                # below assumes the shared 1000-step grid.
-                sigma_grid = getattr(self.sd, "train_sigma_grid", None)
-                if sigma_grid is not None:
+                # "deployment_grid": sample whole steps of the sigma grid the
+                # loaded model exposes (few-step distilled models, e.g.
+                # HyperFlow flash), so the noising sigma and the (t, r)
+                # endpoint pair land exactly on the schedule the model was
+                # distilled for. Selected explicitly via timestep_type -- the
+                # arch never overrides the config's own timestep type. Every
+                # other value (sigmoid, shift, ...) samples continuously and
+                # the endpoint column pairs each sigma with the next
+                # deployment point below it.
+                sigma_grid = None
+                if self.train_config.timestep_type == "deployment_grid":
+                    sigma_grid = getattr(self.sd, "train_sigma_grid", None)
+                    if sigma_grid is None:
+                        raise ValueError(
+                            "timestep_type deployment_grid needs a model that "
+                            "exposes a sigma grid (this arch has none)"
+                        )
                     step_idx = torch.randint(
                         0,
                         len(sigma_grid) - 1,
