@@ -207,6 +207,17 @@ class MiniMaxH3Pipeline:
             video_shift,
             t1000_ladder=getattr(model, "t1000_sample_ladder", False),
         ).to(device)
+        # two-time (HyperFlow flash) checkpoints sample on their own stored
+        # schedule and need the endpoint column below; the base path is unchanged
+        two_time = (
+            getattr(getattr(transformer, "params", None), "hyperflow_gate", None)
+            is not None
+        )
+        stored_sigmas = getattr(transformer, "hyperflow_sigmas", None)
+        if two_time and stored_sigmas is not None and stored_sigmas.numel() == (
+            num_inference_steps + 1
+        ):
+            sigmas_v = stored_sigmas.detach().float().to(device)
         # the audio schedule follows the video grid through the closed-form
         # shift remap so both streams sit at the same underlying position
         sigmas_a = remap_sigma(sigmas_v, video_shift, AUDIO_SIGMA_SHIFT)
@@ -227,6 +238,18 @@ class MiniMaxH3Pipeline:
 
             row_t = build_row_timesteps(layout, t_v, t_a)[None].to(device)
 
+            # two-time checkpoints: the endpoint r each row's step aims at --
+            # generated video/audio rows step to the next schedule sigma,
+            # conditioning anchors keep r = t (the clone default)
+            row_r = None
+            if two_time:
+                row_r = row_t.clone()
+                row_r[:, video_indices[num_cond:]] = 1.0 - float(sv_next)
+                if audio_indices.shape[0] > layout.num_condition_audio_rows:
+                    row_r[:, audio_indices[layout.num_condition_audio_rows :]] = (
+                        1.0 - float(sa_next)
+                    )
+
             video_in = video_rows
             if cond_rows is not None:
                 video_in = torch.cat([cond_rows, video_rows], dim=1)
@@ -239,6 +262,7 @@ class MiniMaxH3Pipeline:
                 audio_hidden_states=audio_in.to(dtype),
                 encoder_hidden_states=text_embeds[None],
                 row_timesteps=row_t,
+                row_endpoints=row_r,
                 token_tags=tags,
                 position_ids=position_ids,
                 video_indices=video_indices,
