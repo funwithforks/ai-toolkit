@@ -69,22 +69,6 @@
       "ver": "0.44.0"
     }
   },
-  "6": {
-    "inputs": {
-      "steps": 6,
-      "model": [
-        "1",
-        0
-      ]
-    },
-    "class_type": "HyperFlowSigmas",
-    "_meta": {
-      "title": "HyperFlow Sigmas (4 / 6 / 8 steps)",
-      "cnr_id": "comfyui-hyperflow-flash",
-      "aux_id": "Video-Rebirth/ComfyUI-HyperFlow-Flash",
-      "ver": "20a22ab2b075f3c948eb5dba62637ff89fc0f363"
-    }
-  },
   "7": {
     "inputs": {
       "sampler_name": "euler"
@@ -98,29 +82,11 @@
   },
   "8": {
     "inputs": {
-      "noise_seed": 42
+      "noise_seed": 884405999754009
     },
     "class_type": "RandomNoise",
     "_meta": {
       "title": "Seed",
-      "cnr_id": "comfy-core",
-      "ver": "0.44.0"
-    }
-  },
-  "9": {
-    "inputs": {
-      "model": [
-        "23",
-        0
-      ],
-      "conditioning": [
-        "5",
-        0
-      ]
-    },
-    "class_type": "BasicGuider",
-    "_meta": {
-      "title": "Guider (CFG 1, no negative prompt)",
       "cnr_id": "comfy-core",
       "ver": "0.44.0"
     }
@@ -132,7 +98,7 @@
         0
       ],
       "guider": [
-        "9",
+        "26",
         0
       ],
       "sampler": [
@@ -140,7 +106,7 @@
         0
       ],
       "sigmas": [
-        "6",
+        "25",
         0
       ],
       "latent_image": [
@@ -245,6 +211,41 @@
     "class_type": "LoraLoaderModelOnly",
     "_meta": {
       "title": "Load LoRA",
+      "cnr_id": "comfy-core",
+      "ver": "0.44.2"
+    }
+  },
+  "25": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 8,
+      "denoise": 1,
+      "model": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler",
+      "cnr_id": "comfy-core",
+      "ver": "0.44.2"
+    }
+  },
+  "26": {
+    "inputs": {
+      "model": [
+        "23",
+        0
+      ],
+      "conditioning": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "Basic Guider",
       "cnr_id": "comfy-core",
       "ver": "0.44.2"
     }
