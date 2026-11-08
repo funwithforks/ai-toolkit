@@ -264,6 +264,12 @@ def patchable(prefix):
         f"{prefix}.sample.sample_every",
         f"{prefix}.sample.comfy",
         f"{prefix}.sample.seed",
+        # checkpoint policy (owner 2026-11-07): the agent sets how many
+        # checkpoints a run keeps and at what interval ("the last 3
+        # checkpoints") on ANY run; the measurement pin yields to an
+        # explicit save patch, and end-of-run cleanup defers the same way
+        f"{prefix}.save.save_every",
+        f"{prefix}.save.max_step_saves_to_keep",
         f"{prefix}.datasets[0].caption_dropout_rate",
         f"{prefix}.datasets[0].num_repeats",
     )
@@ -380,14 +386,28 @@ def merge_plan(params, overrides, config_patch, name, *, prefix,
                 row["against_template"] = old
             prov.append(row)
     if not bool(params.get("sample", False)):
-        proc = cfg["config"]["process"][0]
-        save = proc.setdefault("save", {})
-        save["save_every"] = int(params["steps"]) + 1
-        save["max_step_saves_to_keep"] = 1
-        prov.append({"path": f"{prefix}.save",
-                     "source": "suite-policy(measurement-never-saves)",
-                     "value": {"save_every": save["save_every"],
-                               "max_step_saves_to_keep": 1}})
+        # measurement-never-saves is the DEFAULT for normal runs, not a
+        # prohibition: an explicit save patch wins (same rule as explicit
+        # params vs templates -- agent intent is never silently clobbered).
+        # "If I say I want the last 3 checkpoints saved then that's what
+        # we should end up with" -- owner 2026-11-07.
+        claimed = {f"{prefix}.save.save_every",
+                   f"{prefix}.save.max_step_saves_to_keep"} \
+                  & set(config_patch or ())
+        if claimed:
+            prov.append({"path": f"{prefix}.save",
+                         "source": "suite-policy(measurement-never-saves)",
+                         "value": "agent save override(s) take precedence: "
+                                  + ", ".join(sorted(claimed))})
+        else:
+            proc = cfg["config"]["process"][0]
+            save = proc.setdefault("save", {})
+            save["save_every"] = int(params["steps"]) + 1
+            save["max_step_saves_to_keep"] = 1
+            prov.append({"path": f"{prefix}.save",
+                         "source": "suite-policy(measurement-never-saves)",
+                         "value": {"save_every": save["save_every"],
+                                   "max_step_saves_to_keep": 1}})
 
     if conflicts:
         raise ParamError(
@@ -667,6 +687,14 @@ class TrainerKit:
 
     # -- launch ------------------------------------------------------------
 
+    def _saves_claimed(self, manifest):
+        """True when the submit explicitly claimed the save block via
+        config_patch: those checkpoints are the deliverable the agent
+        asked for, on any run -- end-of-run cleanup defers to it."""
+        return bool({f"{self.prefix}.save.save_every",
+                     f"{self.prefix}.save.max_step_saves_to_keep"}
+                    & set(manifest.get("config_patch") or {}))
+
     def build(self, params, paths: RunPaths):
         argv = [sys.executable, "-m", self.module, "--run-dir", paths.root]
         env = {
@@ -807,9 +835,14 @@ class TrainerKit:
         # rule): the toolkit's end-of-training save is UNCONDITIONAL, so
         # the harness deletes what it just made. Metrics live in the db
         # snapshot; quality runs (sample=true) keep their saves because
-        # the saves ARE the deliverable.
+        # the saves ARE the deliverable -- and so do runs where the agent
+        # explicitly claimed a save block: "if I say I want the last 3
+        # checkpoints saved then that's what we should end up with"
+        # (owner 2026-11-07).
         removed = []
-        if not params.get("sample", False) and os.path.isdir(job_dir):
+        if not params.get("sample", False) \
+                and not self._saves_claimed(manifest) \
+                and os.path.isdir(job_dir):
             for fname in sorted(os.listdir(job_dir)):
                 if fname.endswith(".safetensors") or fname == "optimizer.pt":
                     os.remove(os.path.join(job_dir, fname))
