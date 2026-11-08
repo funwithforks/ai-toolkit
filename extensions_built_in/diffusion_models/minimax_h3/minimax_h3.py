@@ -1074,6 +1074,22 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         )
         return patchify_video_latents(first_latents).to(dtype), None, ("first",), ()
 
+    def _row_endpoints(
+        self,
+        row_t: torch.Tensor,
+        sigma_v: torch.Tensor,
+        sigma_a: torch.Tensor,
+        video_indices: torch.Tensor,
+        audio_indices: torch.Tensor,
+        num_cond: int,
+        num_cond_audio: int,
+    ):
+        """Optional per-row endpoint column r for two-time (t, r) checkpoints
+        (HyperFlow flash). Built next to the row_timestep table so anchors and
+        generated rows stay consistent. Returns None on single-time models
+        (the default); the transformer treats None as single-time."""
+        return None
+
     def get_noise_prediction(
         self,
         latent_model_input: torch.Tensor,  # (B, 24, t, h, w) noisy latents
@@ -1230,6 +1246,13 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                     [cond_audio_rows.to(audio_rows.dtype), audio_rows], dim=1
                 )
 
+            # two-time (t, r) checkpoints add the endpoint column here; None
+            # on single-time models
+            row_endpoints = self._row_endpoints(
+                row_t, sigma_v, sigma_a, video_indices, audio_indices,
+                num_cond, num_cond_audio,
+            )
+
             # pad text embeds to the batch max length
             max_text = int(text_indices.shape[0])
             text_batch = torch.zeros(
@@ -1253,6 +1276,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             audio_hidden_states=audio_rows.to(dtype),
             encoder_hidden_states=text_batch,
             row_timesteps=row_t.to(device),
+            row_endpoints=None if row_endpoints is None else row_endpoints.to(device),
             token_tags=token_tags.to(device),
             position_ids=position_ids.to(device),
             video_indices=video_indices.to(device),
@@ -1997,3 +2021,75 @@ class MinimaxH3FastModel(MinimaxH3Model):
     def text_embedding_space_version(self):
         # same Qwen3-VL presentation as the base model: share the embed cache
         return "minimax_h3"
+
+
+class MinimaxH3FlashModel(MinimaxH3Model):
+    """HyperFlow H3 Flash: Video Rebirth's few-step compressed MiniMax-H3
+    (13.7B fl2va partition: blocks dropped, 102 low-rank factorized linears,
+    180 INT8 convrot linears, two-time (t, r) conditioning, no CFG).
+
+    Checkpoints are the ComfyUI-layout repack of VideoRebirthAI/
+    hyperflow-h3-flash; the transformer loads through model_kwargs
+    ``transformer_path``. Training samples whole deployment steps: the
+    trainer noises at a grid sigma (see ``train_sigma_grid``) and
+    ``_row_endpoints`` builds the endpoint column toward the next grid
+    point, conditioning anchors keeping r = t. Sample with the checkpoint's
+    own step count and guidance_scale 1 — in-training sample rounds are not
+    wired for two-time models yet, so leave sampling off.
+
+    model_kwargs:
+      - transformer_path (required): the converted flash checkpoint
+    """
+
+    arch = "minimax_h3_flash"
+
+    def _load_transformer(self) -> MiniMaxH3Transformer:
+        transformer = super()._load_transformer()
+        if transformer.params.hyperflow_gate is None:
+            raise ValueError(
+                "minimax_h3_flash needs a HyperFlow flash two-time checkpoint "
+                "(hyperflow_gate in the file); this checkpoint is single-time. "
+                "Use arch minimax_h3 for the base H3 partitions."
+            )
+        return transformer
+
+    @property
+    def train_sigma_grid(self):
+        """Deployment sigma grid the trainer samples whole steps from (the
+        transformer's params carry it; None before load or on other archs)."""
+        params = getattr(self.model, "params", None)
+        sigmas = getattr(params, "hyperflow_sigmas", None)
+        if not sigmas:
+            return None
+        return torch.tensor(sigmas, dtype=torch.float32)
+
+    def _row_endpoints(
+        self,
+        row_t: torch.Tensor,
+        sigma_v: torch.Tensor,
+        sigma_a: torch.Tensor,
+        video_indices: torch.Tensor,
+        audio_indices: torch.Tensor,
+        num_cond: int,
+        num_cond_audio: int,
+    ):
+        grid = torch.tensor(
+            self.model.params.hyperflow_sigmas,
+            dtype=torch.float32,
+            device=sigma_v.device,
+        )
+        # each item's sigma is a grid point by construction (the trainer
+        # samples whole steps); recover the index and step to the endpoint
+        idx = torch.argmin((grid.unsqueeze(0) - sigma_v.unsqueeze(1)).abs(), dim=1)
+        sigma_next = grid[(idx + 1).clamp(max=grid.shape[0] - 1)]
+        sigma_a_next = remap_sigma(
+            sigma_next, self.video_sigma_shift, packing.AUDIO_SIGMA_SHIFT
+        )
+        # generated video rows step toward the next grid sigma, generated
+        # audio rows on the remapped audio schedule; conditioning anchors
+        # keep r = t (the clone default)
+        row_r = row_t.clone()
+        row_r[:, video_indices[num_cond:]] = (1.0 - sigma_next).view(-1, 1)
+        if audio_indices.shape[0] > num_cond_audio:
+            row_r[:, audio_indices[num_cond_audio:]] = (1.0 - sigma_a_next).view(-1, 1)
+        return row_r

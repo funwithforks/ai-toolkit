@@ -28,7 +28,7 @@ and both heads predict the data-ward velocity ``clean - noise``.
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from toolkit.models.v2._mixin import OstrisModelMixin
 
@@ -74,6 +74,14 @@ class MiniMaxH3TransformerParams:
     # and add a bias to the block AdaLN linears, which the original weights
     # lack (the final layer's AdaLN carries a bias in both variants).
     adaln_t_table_size: Optional[int] = None
+    # HyperFlow flash two-time checkpoints: a second (endpoint) time embedder
+    # blended as ``emb_t + gate * (emb_r - emb_t)``, checkpoint-native low-rank
+    # factorized linears (module path -> rank), and the deployment sigma grid
+    # the trainer samples (t, r) pairs on. All absent on base checkpoints;
+    # sniffed by aitk_config_from_state_dict.
+    lowrank_ranks: Optional[Dict[str, int]] = None
+    hyperflow_gate: Optional[float] = None
+    hyperflow_sigmas: Optional[Tuple[float, ...]] = None
 
     @property
     def adaln_apply_silu(self) -> bool:
@@ -81,7 +89,9 @@ class MiniMaxH3TransformerParams:
 
     @property
     def adaln_bias(self) -> bool:
-        return self.adaln_t_table_size is not None
+        # pruned checkpoints and the HyperFlow flash both carry a block AdaLN
+        # bias; the flash keeps the MLP embedder (and its SiLU) as well
+        return self.adaln_t_table_size is not None or self.hyperflow_gate is not None
 
 
 class MiniMaxH3Rope(nn.Module):
@@ -196,7 +206,13 @@ class MiniMaxH3Attention(nn.Module):
         vsa=None,  # H3VSAContext or None (dense)
     ) -> torch.Tensor:
         b, s, _ = x.shape
-        q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
+        if self.qkv_proj is not None:
+            q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
+        else:
+            # checkpoint-native split low-rank projections (HyperFlow flash)
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
         q = q.view(b, s, self.heads, self.head_dim)
         k = k.view(b, s, self.heads, self.head_dim)
         v = v.view(b, s, self.heads, self.head_dim)
@@ -440,6 +456,22 @@ class MiniMaxH3FinalLayer(nn.Module):
         return self.video_out(h), self.audio_out(h)
 
 
+class MiniMaxH3LowRankLinear(nn.Module):
+    """Checkpoint-native low-rank factorized linear (HyperFlow flash):
+    ``y = up(down(x))``, neither factor biased."""
+
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
+
+
 class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
     # comfy checkpoints carry a deliberate bf16/fp16/fp32 mix
     aitk_cast_on_load = False
@@ -467,7 +499,67 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
             params.adaln_t_table_size = table.shape[0]
             params.time_embed_dim = table.shape[1]
         params.gate_compress = "blocks.0.attn.to_gate_compress.weight" in state_dict
+        # block count varies by repack (the flash repack renumbers past its
+        # dropped blocks down to 47); derive it from the block keys
+        block_indices = set()
+        for key in state_dict.keys():
+            if key.startswith("blocks."):
+                parts = key.split(".")
+                if len(parts) > 2 and parts[1].isdigit():
+                    block_indices.add(int(parts[1]))
+        if block_indices:
+            params.num_layers = max(block_indices) + 1
+        # the time embedder's output width varies by variant (2688 base, 16
+        # flash); sniff it from the MLP's output projection
+        proj_out = state_dict.get("time_embedder.proj_out.weight", None)
+        if proj_out is not None:
+            params.time_embed_dim = int(proj_out.shape[0])
+        gate = state_dict.get("hyperflow_gate", None)
+        if gate is not None:
+            # HyperFlow flash: two-time (t, r) conditioning; the deployment
+            # sigma grid rides along for the trainer's step sampling
+            params.hyperflow_gate = float(gate.item()) if torch.is_tensor(gate) else float(gate)
+            sigmas = state_dict.get("hyperflow_sigmas", None)
+            if sigmas is not None:
+                params.hyperflow_sigmas = tuple(float(x) for x in sigmas.tolist())
+        ranks = {}
+        for key in state_dict.keys():
+            if key.endswith(".down.weight"):
+                ranks[key[: -len(".down.weight")]] = int(state_dict[key].shape[0])
+        if ranks:
+            params.lowrank_ranks = ranks
         return params
+
+    def _apply_lowrank_ranks(self, ranks: Dict[str, int], p: MiniMaxH3TransformerParams):
+        """Replace plain linears with `MiniMaxH3LowRankLinear` per the
+        checkpoint's factorization map. q/k/v arrive as separate factored
+        projections, so the fused ``qkv_proj`` is dropped on those blocks and
+        the attention branches on its absence."""
+        split_attns = set()
+        for prefix, rank in ranks.items():
+            parent_path, attr = prefix.rsplit(".", 1)
+            if attr in ("q_proj", "k_proj", "v_proj"):
+                inner = p.num_attention_heads * p.attention_head_dim
+                in_features, out_features = p.hidden_size, inner
+                split_attns.add(parent_path)
+            elif attr == "out_proj":
+                inner = p.num_attention_heads * p.attention_head_dim
+                in_features, out_features = inner, p.hidden_size
+            elif attr == "fc1":
+                in_features, out_features = p.hidden_size, p.ffn_hidden_size * 2
+            elif attr == "fc2":
+                in_features, out_features = p.ffn_hidden_size, p.hidden_size
+            else:
+                raise ValueError(f"unsupported low-rank target {prefix!r}")
+            setattr(
+                self.get_submodule(parent_path),
+                attr,
+                MiniMaxH3LowRankLinear(in_features, out_features, rank),
+            )
+        for attn_path in split_attns:
+            attn = self.get_submodule(attn_path)
+            if getattr(attn, "qkv_proj", None) is not None:
+                attn.qkv_proj = None
 
     @classmethod
     def aitk_from_config(cls, config):
@@ -512,6 +604,26 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         self.blocks = nn.ModuleList([MiniMaxH3Block(p) for _ in range(p.num_layers)])
         self.final_layer = MiniMaxH3FinalLayer(p)
 
+        if p.hyperflow_gate is not None:
+            # HyperFlow flash: endpoint embedder for the step endpoint r,
+            # blended against the base embedder by the gate in the forward.
+            # The gate and the deployment sigma grid ride in the checkpoint
+            # as tensors, so they are persistent buffers the loader maps.
+            self.endpoint_time_embedder = MiniMaxH3TimeEmbedder(
+                p.timestep_input_dim, p.time_embed_hidden_size, p.time_embed_dim
+            )
+            self.register_buffer(
+                "hyperflow_gate", torch.tensor([p.hyperflow_gate]), persistent=True
+            )
+            if p.hyperflow_sigmas is not None:
+                self.register_buffer(
+                    "hyperflow_sigmas",
+                    torch.tensor(p.hyperflow_sigmas, dtype=torch.float32),
+                    persistent=True,
+                )
+        if p.lowrank_ranks:
+            self._apply_lowrank_ranks(p.lowrank_ranks, p)
+
         self.gradient_checkpointing = False
         # None = dense attention. Set by the FastH3 model wrapper; only takes
         # effect on gate_compress checkpoints when the caller passes the grid.
@@ -523,6 +635,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         "video_patch_proj",
         "audio_patch_proj",
         "time_embedder",
+        "endpoint_time_embedder",
         "final_layer.video_out",
         "final_layer.audio_out",
         "rope",
@@ -569,6 +682,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         video_indices: torch.Tensor,  # (Nv,) long positions of video rows in the pack
         audio_indices: torch.Tensor,  # (Na,) long
         text_indices: torch.Tensor,  # (L,) long
+        row_endpoints: Optional[torch.Tensor] = None,  # (B, S) endpoint r for two-time checkpoints
         vsa_video_grid: Optional[
             Tuple[int, int, int]
         ] = None,  # target-video token grid (t, h, w)
@@ -623,10 +737,39 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         x = x.index_copy(1, audio_indices, audio_embeds.to(x.dtype))
 
         # one timestep embedding per distinct noise level across the batch
-        unique_t, inverse = torch.unique(
-            row_timesteps.to(torch.float32), sorted=True, return_inverse=True
-        )
-        temb = self._time_embedding(unique_t)
+        if self.params.hyperflow_gate is not None:
+            # two-time (t, r) checkpoints (HyperFlow flash): one embedding per
+            # distinct (t, r) pair, blended emb_t + gate * (emb_r - emb_t).
+            # Conditioning anchors keep r = t, so their pair collapses onto
+            # the single-time table.
+            if row_endpoints is None:
+                raise ValueError(
+                    "two-time (HyperFlow flash) checkpoints require "
+                    "row_endpoints; they have no single-time mode"
+                )
+            pairs = torch.stack(
+                (
+                    row_timesteps.to(torch.float32),
+                    row_endpoints.to(torch.float32),
+                ),
+                dim=-1,
+            ).reshape(-1, 2)
+            unique_t, inverse = torch.unique(
+                pairs, sorted=True, return_inverse=True, dim=0
+            )
+            inverse = inverse.view(row_timesteps.shape)
+            temb_t = self._time_embedding(unique_t[:, 0])
+            temb_r = self.endpoint_time_embedder(unique_t[:, 1])
+            temb = temb_t + float(self.params.hyperflow_gate) * (temb_r - temb_t)
+        else:
+            if row_endpoints is not None:
+                raise ValueError(
+                    "row_endpoints passed to a single-time checkpoint"
+                )
+            unique_t, inverse = torch.unique(
+                row_timesteps.to(torch.float32), sorted=True, return_inverse=True
+            )
+            temb = self._time_embedding(unique_t)
         adaln_indices = inverse * MODALITY_NUM + token_tags.clamp(min=0)
 
         vsa_ctx = None

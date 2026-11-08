@@ -1472,7 +1472,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if is_reg:
                     content_or_style = self.train_config.content_or_style_reg
 
-                if self.train_config.timestep_type in ['two_step', 'four_step', 'eight_step']:
+                # arch-declared deployment sigma grid (few-step distilled
+                # models, e.g. HyperFlow flash): sample whole grid steps so
+                # the noising sigma and the (t, r) endpoint pair land exactly
+                # on the schedule the model was distilled for. Everything
+                # below assumes the shared 1000-step grid.
+                sigma_grid = getattr(self.sd, "train_sigma_grid", None)
+                if sigma_grid is not None:
+                    step_idx = torch.randint(
+                        0,
+                        len(sigma_grid) - 1,
+                        (batch_size,),
+                        device=self.device_torch,
+                    )
+                    timestep_indices = step_idx
+                    timesteps = (
+                        sigma_grid.to(device=self.device_torch, dtype=torch.float32)
+                        * 1000.0
+                    )[step_idx]
+                elif self.train_config.timestep_type in ['two_step', 'four_step', 'eight_step']:
                     if self.train_config.timestep_type == 'two_step':
                         indice_choices = [0, 499]
                     elif self.train_config.timestep_type == 'four_step':
@@ -1540,13 +1558,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     raise ValueError(f"Unknown content_or_style {content_or_style}")
 
-                if self.train_config.first_timestep_chance > 0.0:
+                if sigma_grid is None and self.train_config.first_timestep_chance > 0.0:
                     # index 0 is full noise; per-sample chance to force it
                     force_first = torch.rand((batch_size,), device=timestep_indices.device) < self.train_config.first_timestep_chance
                     timestep_indices = torch.where(force_first, torch.zeros_like(timestep_indices), timestep_indices)
             with self.timer('convert_timestep_indices_to_timesteps'):
-                # convert the timestep_indices to a timestep
-                timesteps = self.sd.noise_scheduler.timesteps[timestep_indices.long()]
+                # convert the timestep_indices to a timestep (grid sampling
+                # built timesteps directly above)
+                if sigma_grid is None:
+                    timesteps = self.sd.noise_scheduler.timesteps[timestep_indices.long()]
                 
             with self.timer('prepare_noise'):
                 # get noise
