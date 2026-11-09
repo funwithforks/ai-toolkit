@@ -94,7 +94,11 @@ from .src.text_encoder import (
     load_video_ref,
     trim_caption_tokens,
 )
-from .src.transformer import MiniMaxH3Transformer, MiniMaxH3TransformerParams
+from .src.transformer import (
+    FLASH_REPO,
+    MiniMaxH3Transformer,
+    MiniMaxH3TransformerParams,
+)
 from .src.vae import MiniMaxH3VideoVAE
 
 # registers the minimax_h3 vae_id entry (its load imports this module's
@@ -2045,16 +2049,25 @@ class MinimaxH3FlashModel(MinimaxH3Model):
 
     @classmethod
     def select_comfy_candidates(cls, component, candidates, model_kwargs):
-        """The flash repack is not a base-H3 partition: this arch owns its
-        transformer file outright and never joins the base fl2va/ref2va
-        candidate pools (the base fl2va needle is a substring of the flash
-        filename, so a shared pool could hand base jobs the flash weights).
-        Other components pass through unfiltered."""
-        if component != "transformer":
-            return None
-        return [
-            "diffusion_models/minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors"
-        ]
+        """The flash DiT lives in its own repo/subfolder (the tuple-keyed
+        aitk_comfy_weight_names entry), so its candidate pool needs no
+        filtering -- return None and let the dedicated entry resolve. The
+        base fl2va/ref2va pools never see the flash weights."""
+        return None
+
+    def _resolve_transformer_path(self) -> str:
+        """The flash DiT resolves from Video Rebirth's own repo/subfolder --
+        the config's name_or_path stays the text-encoder/VAE source and
+        never feeds the transformer lookup."""
+        return MiniMaxH3Transformer.resolve_comfy_weights(
+            FLASH_REPO,
+            subfolder="fl2va_int8_convrot_comfyui",
+            component="transformer",
+            model_kwargs=self.model_config.model_kwargs,
+            candidate_filter=self.select_comfy_candidates,
+            hf_token=os.getenv("HF_TOKEN"),
+            status_fn=self.print_and_status_update,
+        )
 
     def _load_transformer(self) -> MiniMaxH3Transformer:
         transformer = super()._load_transformer()

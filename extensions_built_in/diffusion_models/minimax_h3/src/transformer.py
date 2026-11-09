@@ -472,13 +472,21 @@ class MiniMaxH3LowRankLinear(nn.Module):
         return self.up(self.down(x))
 
 
+# The HyperFlow flash ComfyUI-layout repack is hosted by Video Rebirth in
+# its own repo/subfolder (see the tuple key in MiniMaxH3Transformer's
+# candidate table).
+FLASH_REPO = "VideoRebirthAI/hyperflow-h3-flash"
+
+
 class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
     # comfy checkpoints carry a deliberate bf16/fp16/fp32 mix
     aitk_cast_on_load = False
 
     # every H3 DiT variant ships in the Comfy-Org repack; which one a job
     # uses is chosen by the model's partition filter (see
-    # MinimaxH3Model.select_comfy_candidates), not a separate lookup
+    # MinimaxH3Model.select_comfy_candidates), not a separate lookup.
+    # The HyperFlow flash repack is the exception: Video Rebirth hosts it
+    # in its own repo/subfolder (see the tuple key below).
     aitk_comfy_repo = "Comfy-Org/MiniMax-H3"
     aitk_comfy_weight_names = {
         "Comfy-Org/MiniMax-H3": [
@@ -488,6 +496,15 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
             "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
             "diffusion_models/fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors",
         ],
+        # the HyperFlow flash ComfyUI-layout repack: its own repo/subfolder,
+        # resolved only when a job asks for this source explicitly
+        (FLASH_REPO, "fl2va_int8_convrot_comfyui"): {
+            "repo": FLASH_REPO,
+            "files": [
+                "fl2va_int8_convrot_comfyui/"
+                "minimax_h3_fl2va_hyperflow_flash_14b-int8_convrot.safetensors",
+            ],
+        },
     }
 
     @classmethod
