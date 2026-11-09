@@ -29,6 +29,7 @@ User/agent guide: docs/guide/comfy-remote-sampling.md
 import copy
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -263,6 +264,40 @@ def _signal_pid(pid: int, sig):
         os.kill(pid, sig)
     except (ProcessLookupError, PermissionError, OSError):
         pass
+
+
+# The minimax_h3_flash save layout stores factored q/k/v adapters at
+# blocks.N.attn.{q,k,v}_proj.*, while ComfyUI's HyperFlow INT8 loader nests
+# them under the SplitQKV wrapper it installs
+# (blocks.N.attn.qkv_proj.{q,k,v}_proj.*). ComfyUI binds LoRA keys by exact
+# module path, so those adapters silently drop on load. When the job enables
+# sample.comfy_rekey_lora_keys, the snapshot is rekeyed in place before
+# upload; remove once the loader or the save format handles the layout
+# natively.
+_FLASH_QKV_KEY = re.compile(
+    r"^(diffusion_model\.blocks\.\d+\.attn\.)([qkv])_proj\.((?:down|up)\.lora_[AB]\.weight)$"
+)
+
+
+def _rekey_flash_lora_snapshot(path: str) -> None:
+    from safetensors.torch import load_file, save_file
+
+    sd = load_file(path)
+    out = {}
+    renamed = 0
+    for key, tensor in sd.items():
+        match = _FLASH_QKV_KEY.match(key)
+        if match:
+            out[f"{match.group(1)}qkv_proj.{match.group(2)}_proj.{match.group(3)}"] = (
+                tensor.contiguous()
+            )
+            renamed += 1
+        else:
+            out[key] = tensor.contiguous()
+    if not renamed:
+        return  # not a flash snapshot (or already rekeyed): leave it alone
+    save_file(out, path)
+    print_acc(f"[comfy] snapshot rekeyed for the comfy loader ({renamed} keys)")
 
 
 def get_comfy_sampler(process):
@@ -508,6 +543,10 @@ class ComfySampler:
         finally:
             net.multiplier = prev_multiplier
         flush()
+        # rekey flash snapshots into the comfy loader's module layout when the
+        # job asks for it (sample.comfy_rekey_lora_keys); a no-op otherwise
+        if getattr(self.process.sample_config, 'comfy_rekey_lora_keys', False):
+            _rekey_flash_lora_snapshot(path)
 
     # -------------------------------------------------------------------- http
     def _upload_lora(self, round_rec: dict):

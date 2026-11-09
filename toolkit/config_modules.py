@@ -113,6 +113,10 @@ class SampleConfig:
         # ComfyUI box from a tagged API-format workflow instead of locally.
         self.comfy: bool = bool(kwargs.get('comfy', False))
         self.comfy_url: Optional[str] = kwargs.get('comfy_url', None)
+        # rekey uploaded LoRA snapshots into the ComfyUI loader's module layout
+        # (factored q/k/v under attn.qkv_proj) before upload -- for checkpoints
+        # whose training layout stores them at attn.{q,k,v}_proj.*
+        self.comfy_rekey_lora_keys: bool = bool(kwargs.get('comfy_rekey_lora_keys', False))
         # workflow is picked by model arch: <dir>/<arch>.json (the sampler
         # resolves it). comfy_workflow_path overrides for one-off cases.
         self.comfy_workflow_dir: Optional[str] = kwargs.get('comfy_workflow_dir', None)
