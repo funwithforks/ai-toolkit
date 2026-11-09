@@ -205,6 +205,25 @@ def plan_frame_indices(
     return frames_to_extract, num_frames
 
 
+def _build_select_expr(frames_to_extract: list[int]) -> str:
+    """Select-filter expression for the requested frame indices.
+
+    ffmpeg's expression parser rejects flat ``+`` chains of 101+ terms
+    ("Error while parsing expression", followed by a bogus ENOMEM). Grouping
+    terms in parentheses keeps the semantics identical while parsing fine well
+    past 500 terms.
+    """
+    if len(frames_to_extract) == 1:
+        return f"eq(n\\,{frames_to_extract[0]})"
+    head = f"eq(n\\,{frames_to_extract[0]})"
+    rest = frames_to_extract[1:]
+    groups = [
+        "(" + "+".join(f"eq(n\\,{idx})" for idx in rest[i : i + 8]) + ")"
+        for i in range(0, len(rest), 8)
+    ]
+    return head + "+" + "+".join(groups)
+
+
 def _decode_dataset_float(
     video_path: str,
     *,
@@ -220,10 +239,9 @@ def _decode_dataset_float(
         raise RuntimeError(f"No frames to decode from {video_path}")
 
     unique_idx = sorted(set(frames_to_extract))
-    if len(unique_idx) == 1:
-        select_expr = f"eq(n\\,{unique_idx[0]})"
-    else:
-        select_expr = "+".join(f"eq(n\\,{idx})" for idx in unique_idx)
+    # the deduped selection: duplicate indices are selected once and
+    # re-expanded by the repeat logic after the decode
+    select_expr = _build_select_expr(unique_idx)
 
     cmd = [
         "ffmpeg",
