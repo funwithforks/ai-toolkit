@@ -180,7 +180,7 @@ def load_vision_tower(
     holds a model-sized dict (the whole-file path peaks at ~2x the checkpoint).
     Quantized (convrot) tower linears attach through the comfy-quant importer on
     the prefix-stripped subset; the shipped dtypes are kept -- no cast, no
-    dequant (the owner-set default is the int8 tower; vision_bf16 dequants
+    dequant (the default is the int8 tower; vision_bf16 dequants
     explicitly at the call site)."""
     from accelerate import init_empty_weights
 

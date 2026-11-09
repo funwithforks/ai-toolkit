@@ -112,9 +112,9 @@ class UILogger:
         # stays machine-local at the default-layout path, and a snapshot
         # is mirrored to the real destination instead: sqlite WAL
         # memory-maps its -shm index, and a network lock loss under that
-        # mapping kills the process with SIGBUS (the owner's 2026-11-06
-        # diagnosis). The mirror is best effort by contract; the metrics
-        # file is low-value telemetry next to checkpoints/optimizer.
+        # mapping kills the process with SIGBUS. The mirror is best effort by
+        # contract; the metrics file is low-value telemetry next to
+        # checkpoints/optimizer.
         self._live_path = log_file
         self._mirror_path: Optional[str] = None
         _abs_dir = os.path.dirname(os.path.abspath(log_file))

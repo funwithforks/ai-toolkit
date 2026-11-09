@@ -504,9 +504,9 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             aitk_device=None if self.model_config.low_vram else self.device_torch,
         )
         # Same switch as krea2 (krea2.py:249). Default ON: paired 300-step
-        # runs on the owner config measured 1.120 vs 1.027 it/s (+9.1%), and
-        # the produced adapter passed the owner's ComfyUI review (in
-        # character, voice clearer than the eager-backward control). An
+        # runs measured 1.120 vs 1.027 it/s (+9.1%), and the produced adapter
+        # passed review (in character, voice clearer than the eager-backward
+        # control). An
         # earlier -8% reading came from a contaminated early-session control
         # and is void. model_kwargs int8_bwd=false restores the eager
         # backward for isolation runs.

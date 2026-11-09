@@ -1,8 +1,8 @@
 """Float video/audio ingest for phased-loading latent caching.
 
 Ported near-verbatim from the superdata pipeline (../projects/superdata),
-where this exact chain is production-proven on LTX 2.3. The contract it
-implements is the owner's: what hits the model must be pristine -- ffmpeg
+where this exact chain is production-proven on LTX 2.3. The contract:
+what hits the model must be pristine -- ffmpeg
 float decode (gbrpf32le planar fp32, correct color management, lanczos
 geometry) straight into a fp32 RGB CHW [-1, 1] tensor and from there into
 the vae. No uint8 round trip, no PIL, no per-frame python image ops; the

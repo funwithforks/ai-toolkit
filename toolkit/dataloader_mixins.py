@@ -840,10 +840,11 @@ class ImageProcessingDTOMixin:
                         and getattr(self.dataset_config, "trim_auto_frame_count_tail", False)):
                     # the imported audio path implements the plain
                     # slice-and-stretch contract only; the trim-tail audio
-                    # variant is a fork feature the owner has not ruled on
+                    # variant is not implemented in the float ingest
                     raise NotImplementedError(
                         f"{self.path}: trim_auto_frame_count_tail audio is not "
-                        "supported by the float ingest -- raise with the owner"
+                        "supported by the float ingest; set "
+                        "trim_auto_frame_count_tail: false in the dataset config"
                     )
 
                 try:

@@ -1,8 +1,8 @@
 """The float decode filter chains.
 
 Ported from superdata backend/app/encoder.py (the ingest half). The color
-chains, the reserved-tag fixup and the policy are verbatim -- the owner
-spent extensive testing on these exact filter graphs and they are frozen:
+chains, the reserved-tag fixup and the policy are verbatim from the source
+pipeline -- these exact filter graphs are tested and frozen:
 
   ENCODER POLICY — do not change without explicit user approval.
   (full text preserved below, with the export-only yuv420p tails omitted --
