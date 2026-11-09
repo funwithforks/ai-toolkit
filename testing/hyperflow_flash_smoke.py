@@ -10,6 +10,7 @@ Run: venv/bin/python testing/hyperflow_flash_smoke.py
 """
 
 import math
+import math
 import sys
 from pathlib import Path
 
@@ -18,14 +19,17 @@ sys.path.insert(0, str(REPO))
 
 import torch
 
+from toolkit.paths import MODELS_PATH
+
 from extensions_built_in.diffusion_models.minimax_h3.src.transformer import (
     MiniMaxH3Transformer,
     MiniMaxH3TransformerParams,
 )
 
-CHECKPOINT = (
-    "/run/media/computer/240gb pny/huggingface/diffusion_models/"
-    "minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors"
+CHECKPOINT = str(
+    Path(MODELS_PATH)
+    / "diffusion_models"
+    / "minimax_h3_fl2va_hyperflow_flash_int8_convrot.safetensors"
 )
 DEVICE = torch.device("cuda")
 
