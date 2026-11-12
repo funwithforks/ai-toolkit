@@ -2536,6 +2536,17 @@ class TextEmbeddingFileItemDTOMixin:
         # if we have a control image, cache the path
         if self.encode_control_in_text_embeddings and self.control_path is not None:
             item["control_path"] = self.control_path
+            # content signature of each control file: a control edited in
+            # place must not keep serving the old cached vision blocks (the
+            # reference-latent sidecars are content-keyed the same way)
+            control_paths = (
+                self.control_path
+                if isinstance(self.control_path, list)
+                else [self.control_path]
+            )
+            signatures = [get_quick_signature_string(p) for p in control_paths]
+            if all(s is not None for s in signatures):
+                item["control_signatures"] = [_signature_hash(s) for s in signatures]
             if getattr(self, 'text_embedding_uses_target_size', False) and getattr(self, 'crop_width', None):
                 item["control_target_size"] = [self.crop_width, self.crop_height]
         if self.encode_control_in_text_embeddings and getattr(self, 'control_video_paths', None):
