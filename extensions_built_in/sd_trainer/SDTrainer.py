@@ -46,7 +46,7 @@ import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
 from PIL import Image
 from torchvision.transforms import functional as TF
-from toolkit.basic import flush
+from toolkit.basic import flush, get_quick_signature_string
 
 
 adapter_transforms = transforms.Compose([
@@ -188,20 +188,41 @@ class SDTrainer(BaseSDTrainProcess):
         ) or self.train_config.prompt_dropout_prob > 0
 
     def _sample_embeds_cacheable(self):
-        # whether sample-prompt embeds are a pure function of their text. Not
-        # when the model feeds control images through the text encoder - then
-        # the embeds depend on the images too. Single source of truth shared
-        # by _fixed_embed_targets and cache_sample_prompts so writer and gate
-        # can never disagree.
-        if not getattr(self.sd, 'encode_control_in_text_embeddings', False):
-            return True
+        # whether sample-prompt embeds can be persisted for later runs: only
+        # under the caching regime (unload_text_encoder or dataset embed
+        # caching). Control images no longer disqualify a sample -- their
+        # identity (paths + content signatures + target size) rides in the
+        # cache flags via _sample_ctrl_flags, the same primitive the dataset
+        # embed keys use, so a changed control lands on a fresh cache file.
         if self.sample_config is None:
             return True
-        return not any(
-            getattr(s, a, None) is not None
-            for s in (self.sample_config.samples or [])
-            for a in ('ctrl_img', 'ctrl_img_1', 'ctrl_img_2', 'ctrl_img_3')
+        return (
+            self.train_config.unload_text_encoder or self.is_caching_text_embeddings
         )
+
+    def _sample_ctrl_flags(self, gen_img_config):
+        # control identity for one sample's embed cache flags: the resolved
+        # ctrl paths, their content signatures, and the target size the refs
+        # are sized against. Must be computed identically by the gate
+        # (_fixed_embed_targets) and the writer (cache_sample_prompts) -- both
+        # autoparse the same GenerateImageConfig shape.
+        if not getattr(self.sd, 'encode_control_in_text_embeddings', False):
+            return {}
+        paths = [
+            getattr(gen_img_config, a, None)
+            for a in ('ctrl_img', 'ctrl_img_1', 'ctrl_img_2', 'ctrl_img_3')
+        ]
+        paths = [p for p in paths if p is not None]
+        if not paths:
+            return {}
+        from toolkit.dataloader_mixins import _signature_hash
+
+        sigs = [get_quick_signature_string(str(p)) for p in paths]
+        flags = {'ctrl': '|'.join(str(p) for p in paths)}
+        if all(s is not None for s in sigs):
+            flags['ctrl_sig'] = ','.join(str(_signature_hash(s)) for s in sigs)
+        flags['target_size'] = f"{gen_img_config.width}x{gen_img_config.height}"
+        return flags
 
     def _fixed_embed_targets(self):
         # (kind, text, flags) for every fixed-prompt embed this run needs,
@@ -234,8 +255,6 @@ class SDTrainer(BaseSDTrainProcess):
                 and self.sample_config is not None
                 and len(self.sample_config.prompts) > 0
             ):
-                if not self._sample_embeds_cacheable():
-                    return None
                 for i in range(len(self.sample_config.prompts)):
                     item = self.sample_config.samples[i]
                     prompt = self.sample_config.prompts[i]
@@ -243,14 +262,22 @@ class SDTrainer(BaseSDTrainProcess):
                         prompt = self.sd.inject_trigger_into_prompt(
                             prompt, self.trigger_word, add_if_not_present=False
                         )
-                    # autoparse exactly as cache_sample_prompts does
+                    # autoparse exactly as cache_sample_prompts does, ctrl
+                    # fields seeded -- an explicit or inline control image
+                    # changes what the prompt encodes to, so it must be part
+                    # of the target identity (via the flags), never invisible
                     gen_img_config = GenerateImageConfig(
                         prompt=prompt,
                         negative_prompt=item.neg,
                         output_path='placeholder.jpg',
+                        ctrl_img=item.ctrl_img,
+                        ctrl_img_1=item.ctrl_img_1,
+                        ctrl_img_2=item.ctrl_img_2,
+                        ctrl_img_3=item.ctrl_img_3,
                     )
-                    targets.append((f'sample_pos_{i}', gen_img_config.prompt, {}))
-                    targets.append((f'sample_neg_{i}', gen_img_config.negative_prompt, {}))
+                    ctrl_flags = self._sample_ctrl_flags(gen_img_config)
+                    targets.append((f'sample_pos_{i}', gen_img_config.prompt, ctrl_flags))
+                    targets.append((f'sample_neg_{i}', gen_img_config.negative_prompt, ctrl_flags))
         return targets
 
     def _fixed_embed_cache_path(self, kind, text, flags, for_write=False):
@@ -410,86 +437,105 @@ class SDTrainer(BaseSDTrainProcess):
                     has_control_images = True
                 # see if we need to encode the control images
                 if self.sd.encode_control_in_text_embeddings and has_control_images:
-                    self.sd.prepare_sample_prompt_context(gen_img_config)
-                    
-                    video_exts = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
+                    ctrl_flags = self._sample_ctrl_flags(gen_img_config)
+                    pos_cached = embeds_cacheable and self._fixed_embed_valid(
+                        f'sample_pos_{i}', gen_img_config.prompt, ctrl_flags)
+                    neg_cached = embeds_cacheable and self._fixed_embed_valid(
+                        f'sample_neg_{i}', gen_img_config.negative_prompt, ctrl_flags)
 
-                    def _is_ctrl_video(pth):
-                        return os.path.splitext(str(pth))[1].lower() in video_exts
-
-                    ctrl_img_list = []
-                    
-                    if gen_img_config.ctrl_img is not None and _is_ctrl_video(gen_img_config.ctrl_img):
-                        # control VIDEO: pass the path through; models with
-                        # supports_video_control_images handle it in get_prompt_embeds
-                        ctrl_img_list.append(str(gen_img_config.ctrl_img))
-                    elif gen_img_config.ctrl_img is not None:
-                        ctrl_img = Image.open(gen_img_config.ctrl_img).convert("RGB")
-                        # convert to 0 to 1 tensor
-                        ctrl_img = (
-                            TF.to_tensor(ctrl_img)
-                            .unsqueeze(0)
-                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                        )
-                        ctrl_img_list.append(ctrl_img)
-                    
-                    if gen_img_config.ctrl_img_1 is not None and _is_ctrl_video(gen_img_config.ctrl_img_1):
-                        # control VIDEO: pass the path through; models with
-                        # supports_video_control_images handle it in get_prompt_embeds
-                        ctrl_img_list.append(str(gen_img_config.ctrl_img_1))
-                    elif gen_img_config.ctrl_img_1 is not None:
-                        ctrl_img_1 = Image.open(gen_img_config.ctrl_img_1).convert("RGB")
-                        # convert to 0 to 1 tensor
-                        ctrl_img_1 = (
-                            TF.to_tensor(ctrl_img_1)
-                            .unsqueeze(0)
-                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                        )
-                        ctrl_img_list.append(ctrl_img_1)
-                    if gen_img_config.ctrl_img_2 is not None and _is_ctrl_video(gen_img_config.ctrl_img_2):
-                        # control VIDEO: pass the path through; models with
-                        # supports_video_control_images handle it in get_prompt_embeds
-                        ctrl_img_list.append(str(gen_img_config.ctrl_img_2))
-                    elif gen_img_config.ctrl_img_2 is not None:
-                        ctrl_img_2 = Image.open(gen_img_config.ctrl_img_2).convert("RGB")
-                        # convert to 0 to 1 tensor
-                        ctrl_img_2 = (
-                            TF.to_tensor(ctrl_img_2)
-                            .unsqueeze(0)
-                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                        )
-                        ctrl_img_list.append(ctrl_img_2)
-                    if gen_img_config.ctrl_img_3 is not None and _is_ctrl_video(gen_img_config.ctrl_img_3):
-                        # control VIDEO: pass the path through; models with
-                        # supports_video_control_images handle it in get_prompt_embeds
-                        ctrl_img_list.append(str(gen_img_config.ctrl_img_3))
-                    elif gen_img_config.ctrl_img_3 is not None:
-                        ctrl_img_3 = Image.open(gen_img_config.ctrl_img_3).convert("RGB")
-                        # convert to 0 to 1 tensor
-                        ctrl_img_3 = (
-                            TF.to_tensor(ctrl_img_3)
-                            .unsqueeze(0)
-                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                        )
-                        ctrl_img_list.append(ctrl_img_3)
-                    
-                    if self.sd.has_multiple_control_images:
-                        ctrl_img = ctrl_img_list
+                    if pos_cached and neg_cached:
+                        # both embeds are cached under the control-keyed
+                        # flags: no ctrl decode, no encoder pass
+                        positive = PromptEmbeds.load(self._fixed_embed_cache_path(
+                            f'sample_pos_{i}', gen_img_config.prompt, ctrl_flags))
+                        negative = PromptEmbeds.load(self._fixed_embed_cache_path(
+                            f'sample_neg_{i}', gen_img_config.negative_prompt, ctrl_flags))
                     else:
-                        ctrl_img = ctrl_img_list[0] if len(ctrl_img_list) > 0 else None
-                    
-                    
-                    target_size = (gen_img_config.width, gen_img_config.height)
-                    positive = self.sd.encode_prompt(
-                        gen_img_config.prompt,
-                        control_images=ctrl_img,
-                        target_size=target_size,
-                    ).to('cpu')
-                    negative = self.sd.encode_prompt(
-                        gen_img_config.negative_prompt,
-                        control_images=ctrl_img,
-                        target_size=target_size,
-                    ).to('cpu')
+                        self.sd.prepare_sample_prompt_context(gen_img_config)
+
+                        video_exts = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
+
+                        def _is_ctrl_video(pth):
+                            return os.path.splitext(str(pth))[1].lower() in video_exts
+
+                        ctrl_img_list = []
+
+                        if gen_img_config.ctrl_img is not None and _is_ctrl_video(gen_img_config.ctrl_img):
+                            # control VIDEO: pass the path through; models with
+                            # supports_video_control_images handle it in get_prompt_embeds
+                            ctrl_img_list.append(str(gen_img_config.ctrl_img))
+                        elif gen_img_config.ctrl_img is not None:
+                            ctrl_img = Image.open(gen_img_config.ctrl_img).convert("RGB")
+                            # convert to 0 to 1 tensor
+                            ctrl_img = (
+                                TF.to_tensor(ctrl_img)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            )
+                            ctrl_img_list.append(ctrl_img)
+
+                        if gen_img_config.ctrl_img_1 is not None and _is_ctrl_video(gen_img_config.ctrl_img_1):
+                            # control VIDEO: pass the path through; models with
+                            # supports_video_control_images handle it in get_prompt_embeds
+                            ctrl_img_list.append(str(gen_img_config.ctrl_img_1))
+                        elif gen_img_config.ctrl_img_1 is not None:
+                            ctrl_img_1 = Image.open(gen_img_config.ctrl_img_1).convert("RGB")
+                            # convert to 0 to 1 tensor
+                            ctrl_img_1 = (
+                                TF.to_tensor(ctrl_img_1)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            )
+                            ctrl_img_list.append(ctrl_img_1)
+                        if gen_img_config.ctrl_img_2 is not None and _is_ctrl_video(gen_img_config.ctrl_img_2):
+                            # control VIDEO: pass the path through; models with
+                            # supports_video_control_images handle it in get_prompt_embeds
+                            ctrl_img_list.append(str(gen_img_config.ctrl_img_2))
+                        elif gen_img_config.ctrl_img_2 is not None:
+                            ctrl_img_2 = Image.open(gen_img_config.ctrl_img_2).convert("RGB")
+                            # convert to 0 to 1 tensor
+                            ctrl_img_2 = (
+                                TF.to_tensor(ctrl_img_2)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            )
+                            ctrl_img_list.append(ctrl_img_2)
+                        if gen_img_config.ctrl_img_3 is not None and _is_ctrl_video(gen_img_config.ctrl_img_3):
+                            # control VIDEO: pass the path through; models with
+                            # supports_video_control_images handle it in get_prompt_embeds
+                            ctrl_img_list.append(str(gen_img_config.ctrl_img_3))
+                        elif gen_img_config.ctrl_img_3 is not None:
+                            ctrl_img_3 = Image.open(gen_img_config.ctrl_img_3).convert("RGB")
+                            # convert to 0 to 1 tensor
+                            ctrl_img_3 = (
+                                TF.to_tensor(ctrl_img_3)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            )
+                            ctrl_img_list.append(ctrl_img_3)
+
+                        if self.sd.has_multiple_control_images:
+                            ctrl_img = ctrl_img_list
+                        else:
+                            ctrl_img = ctrl_img_list[0] if len(ctrl_img_list) > 0 else None
+
+
+                        target_size = (gen_img_config.width, gen_img_config.height)
+                        positive = self.sd.encode_prompt(
+                            gen_img_config.prompt,
+                            control_images=ctrl_img,
+                            target_size=target_size,
+                        ).to('cpu')
+                        negative = self.sd.encode_prompt(
+                            gen_img_config.negative_prompt,
+                            control_images=ctrl_img,
+                            target_size=target_size,
+                        ).to('cpu')
+                        if embeds_cacheable:
+                            self._save_fixed_embed(
+                                f'sample_pos_{i}', gen_img_config.prompt, ctrl_flags, positive)
+                            self._save_fixed_embed(
+                                f'sample_neg_{i}', gen_img_config.negative_prompt, ctrl_flags, negative)
                 else:
                     positive = self.sd.encode_prompt(gen_img_config.prompt).to('cpu')
                     negative = self.sd.encode_prompt(gen_img_config.negative_prompt).to('cpu')

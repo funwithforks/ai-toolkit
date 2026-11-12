@@ -1098,6 +1098,14 @@ class DatasetConfig:
         # background from the loss entirely; the default keeps it training at
         # half weight (the loss multiplier renormalizes by the mask mean).
         self.mask_min_value: float = kwargs.get('mask_min_value', 0.5)
+        # whether this dataset's caches (target latents, control reference
+        # sidecars, control-aware text-embed keys) judge content by
+        # size:mtime signature. Default on: an image or video edited in
+        # place lands on a fresh cache instead of serving stale tensors.
+        # Opt out for datasets whose media gets replaced by dimension-matched
+        # stub files after caching -- with keying on, the next run would
+        # re-encode the stubs.
+        self.cache_key_on_content: bool = kwargs.get('cache_key_on_content', True)
         if self.mask_source is not None and self.mask_source not in MASK_SOURCE_VALUES:
             raise ValueError(
                 f"dataset config: mask_source must be one of {MASK_SOURCE_VALUES} or None, got {self.mask_source!r}"

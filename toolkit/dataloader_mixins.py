@@ -1352,6 +1352,16 @@ class ControlFileItemDTOMixin:
         stored_sigs = meta.get('sigs', [])
         if meta.get('count') != len(paths) or len(stored_sigs) != len(paths):
             return False
+        # a sidecar is only valid for the latent space that encoded it: a
+        # second model on the same dataset must not reuse another vae's
+        # reference latents. Same identity the target latent cache keys on;
+        # carried by the item (sd is not available at fetch time).
+        if meta.get('latent_space_version') != self.latent_space_version:
+            return False
+        # with cache_key_on_content off, judge by path/count/bucket only: the
+        # dataset's media may be stub-swapped after caching
+        if self.dataset_config is not None and not self.dataset_config.cache_key_on_content:
+            return True
         for path, stored_sig in zip(paths, stored_sigs):
             sig = get_quick_signature_string(path)
             if sig is None or _signature_hash(sig) != stored_sig:
@@ -1960,6 +1970,14 @@ class LatentCachingFileItemDTOMixin:
             ("latent_space_version", self.latent_space_version),
             ("latent_version", self.latent_version),
         ])
+        if getattr(self, 'dataset_config', None) is not None and self.dataset_config.cache_key_on_content:
+            # content signature of the source media: an image or video edited
+            # in place lands on a fresh cache file instead of serving stale
+            # tensors. Opt out for stub-slimmed datasets (see the config
+            # comment) -- keying on a stub would re-encode it.
+            sig = get_quick_signature_string(self.path)
+            if sig is not None:
+                item["source_signature"] = _signature_hash(sig)
         is_video = False
         # when adding items, do it after so we dont change old latents
         if self.flip_x:
@@ -2280,6 +2298,10 @@ class LatentCachingMixin:
                 'sigs': sigs,
                 'target_h': int(target_h),
                 'target_w': int(target_w),
+                # which latent space encoded these: a second model on the same
+                # dataset must not reuse another vae's reference latents.
+                # Same identity the target latent cache keys on (vae_id).
+                'latent_space_version': getattr(self.sd, 'vae_id', None),
             }
             import json as _json
 
@@ -2545,7 +2567,10 @@ class TextEmbeddingFileItemDTOMixin:
                 else [self.control_path]
             )
             signatures = [get_quick_signature_string(p) for p in control_paths]
-            if all(s is not None for s in signatures):
+            if (
+                all(s is not None for s in signatures)
+                and (self.dataset_config is None or self.dataset_config.cache_key_on_content)
+            ):
                 item["control_signatures"] = [_signature_hash(s) for s in signatures]
             if getattr(self, 'text_embedding_uses_target_size', False) and getattr(self, 'crop_width', None):
                 item["control_target_size"] = [self.crop_width, self.crop_height]
