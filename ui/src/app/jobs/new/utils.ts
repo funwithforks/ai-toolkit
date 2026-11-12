@@ -72,10 +72,10 @@ export const handleModelArchChange = (
   const hasMultiControlPaths = newArch?.additionalSections?.includes('datasets.multi_control_paths') || false;
   const hasNumFrames = newArch?.additionalSections?.includes('datasets.num_frames') || false;
   const hasAutoFrameCount = newArch?.additionalSections?.includes('datasets.auto_frame_count') || false;
-  const controls = newArch?.controls ?? [];
+  const controlTypes = newArch?.controlTypes ?? [];
   const datasets = jobConfig.config.process[0].datasets.map(dataset => {
     const newDataset = objectCopy(dataset);
-    newDataset.controls = controls;
+    newDataset.control_types = controlTypes;
     if (hasMultiControlPaths) {
       // make sure the config has the multi control paths
       newDataset.control_path_1 = newDataset.control_path_1 || null;

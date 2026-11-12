@@ -5,8 +5,12 @@ import { JobConfig, SampleConfig, DatasetConfig, SliderConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
+  mask_source: null,
   mask_path: null,
-  mask_min_value: 0.1,
+  invert_mask: false,
+  mask_min_value: 0.5,
+  inpaint_source: null,
+  control_types: [],
   default_caption: '',
   caption_ext: 'txt',
   caption_dropout_rate: 0.05,
@@ -14,7 +18,6 @@ export const defaultDatasetConfig: DatasetConfig = {
   is_reg: false,
   network_weight: 1,
   resolution: [512, 768, 1024],
-  controls: [],
   shrink_video_to_frames: true,
   num_frames: 1,
   flip_x: false,

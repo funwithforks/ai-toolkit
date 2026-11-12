@@ -2,7 +2,7 @@ import React from 'react';
 import { GroupedSelectOption, SelectOption, JobConfig, ConfigDoc } from '@/types';
 import { defaultSliderConfig } from './jobConfig';
 
-type Control = 'depth' | 'line' | 'pose' | 'inpaint';
+type Control = 'depth' | 'line' | 'pose';
 
 type DisableableSections =
   | 'model.quantize'
@@ -18,6 +18,9 @@ type DisableableSections =
 type AdditionalSections =
   | 'datasets.control_path'
   | 'datasets.multi_control_paths'
+  | 'datasets.mask_source'
+  | 'datasets.inpaint_source'
+  | 'datasets.control_types'
   | 'datasets.do_i2v'
   | 'datasets.do_audio'
   | 'datasets.audio_normalize'
@@ -103,7 +106,7 @@ export interface ModelArch {
   generateNameOverride?: string;
   group: ModelGroup;
   generate?: GenerateOptions;
-  controls?: Control[];
+  controlTypes?: Control[];
   isVideoModel?: boolean;
   hasMultiLinePrompts?: boolean;
   defaults?: { [key: string]: any };

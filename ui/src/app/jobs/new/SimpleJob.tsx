@@ -1209,6 +1209,66 @@ export default function SimpleJob({
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].folder_path`)}
                         options={datasetOptions}
                       />
+                      <SelectInput
+                        label="Mask Source"
+                        docKey="datasets.mask_source"
+                        value={dataset.mask_source ?? ''}
+                        className="pt-2"
+                        onChange={value =>
+                          setJobConfig(value === '' ? null : value, `config.process[0].datasets[${i}].mask_source`)
+                        }
+                        options={[
+                          { value: '', label: 'None' },
+                          { value: 'alpha', label: 'Alpha Channel' },
+                          { value: 'sapiens2', label: 'Sapiens 2 (Matting)' },
+                          { value: 'birefnet', label: 'BiRefNet (Background Removal)' },
+                        ]}
+                      />
+                      {dataset.mask_source != null && (
+                        <>
+                          <Checkbox
+                            label="Invert Mask"
+                            checked={dataset.invert_mask || false}
+                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].invert_mask`)}
+                          />
+                          <NumberInput
+                            label="Mask Min Value"
+                            docKey="datasets.mask_min_value"
+                            value={dataset.mask_min_value ?? 0.5}
+                            min={0}
+                            max={1}
+                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].mask_min_value`)}
+                          />
+                        </>
+                      )}
+                      {modelArch?.additionalSections?.includes('datasets.inpaint_source') && (
+                        <Checkbox
+                          label="Inpaint Masks"
+                          docKey="datasets.inpaint_source"
+                          checked={dataset.inpaint_source != null}
+                          onChange={value =>
+                            setJobConfig(value ? 'birefnet' : null, `config.process[0].datasets[${i}].inpaint_source`)
+                          }
+                        />
+                      )}
+                      {modelArch?.additionalSections?.includes('datasets.control_types') && (
+                        <>
+                          {(['depth', 'line', 'pose'] as const).map(controlType => (
+                            <Checkbox
+                              key={controlType}
+                              label={`${controlType.charAt(0).toUpperCase()}${controlType.slice(1)} Control`}
+                              checked={(dataset.control_types ?? []).includes(controlType)}
+                              onChange={value => {
+                                const current = dataset.control_types ?? [];
+                                const next = value
+                                  ? [...current, controlType]
+                                  : current.filter(t => t !== controlType);
+                                setJobConfig(next, `config.process[0].datasets[${i}].control_types`);
+                              }}
+                            />
+                          ))}
+                        </>
+                      )}
                       {modelArch?.additionalSections?.includes('datasets.control_path') && (
                         <SelectInput
                           label="Control Dataset"
@@ -1465,8 +1525,8 @@ export default function SimpleJob({
                 onClick={() => {
                   const newDataset = objectCopy(defaultDatasetConfig);
                   // automaticallt add the controls for a new dataset
-                  const controls = modelArch?.controls ?? [];
-                  newDataset.controls = controls;
+                  const controlTypes = modelArch?.controlTypes ?? [];
+                  newDataset.control_types = controlTypes;
                   // arch dataset defaults (datasets[x].*) apply to added datasets too, not just at arch switch
                   for (const key in modelArch?.defaults ?? {}) {
                     const marker = 'datasets[x].';

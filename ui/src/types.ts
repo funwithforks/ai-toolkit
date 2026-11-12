@@ -110,8 +110,11 @@ export interface SaveConfig {
 export interface DatasetConfig {
   batch_size?: number;
   folder_path: string;
+  mask_source?: string | null;
   mask_path: string | null;
+  invert_mask?: boolean;
   mask_min_value: number;
+  inpaint_source?: string | null;
   default_caption: string;
   caption_ext: string;
   caption_dropout_rate: number;
@@ -120,7 +123,7 @@ export interface DatasetConfig {
   network_weight: number;
   cache_latents_to_disk?: boolean;
   resolution: number[];
-  controls: string[];
+  control_types?: string[];
   control_path?: string | null;
   num_frames: number;
   shrink_video_to_frames: boolean;
