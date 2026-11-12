@@ -1,0 +1,188 @@
+{
+  "9": {
+    "inputs": {
+      "filename_prefix": "minimax_h3_image_t2i",
+      "images": [
+        "23:8",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  },
+  "14": {
+    "inputs": {
+      "aspect_ratio": "16:9 (Widescreen)",
+      "megapixels": 16,
+      "multiple": 32
+    },
+    "class_type": "ResolutionSelector",
+    "_meta": {
+      "title": "Resolution Selector",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  },
+  "23:1": {
+    "inputs": {
+      "unet_name": "minimax_h3_image_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  },
+  "23:2": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  },
+  "23:3": {
+    "inputs": {
+      "vae_name": "minimax_h3_image_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  },
+  "23:5": {
+    "inputs": {
+      "prompt": "{{AITK_PROMPT}}",
+      "width": [
+        "14",
+        0
+      ],
+      "height": [
+        "14",
+        1
+      ],
+      "clip": [
+        "23:2",
+        0
+      ],
+      "vae": [
+        "23:3",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3ImageConditioning",
+    "_meta": {
+      "title": "MiniMax H3 Image Conditioning",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  },
+  "23:6": {
+    "inputs": {
+      "conditioning": [
+        "23:5",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "Conditioning Zero Out",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  },
+  "23:7": {
+    "inputs": {
+      "seed": 418194425693157,
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "23:31",
+        0
+      ],
+      "positive": [
+        "23:5",
+        0
+      ],
+      "negative": [
+        "23:6",
+        0
+      ],
+      "latent_image": [
+        "23:5",
+        1
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  },
+  "23:8": {
+    "inputs": {
+      "samples": [
+        "23:7",
+        0
+      ],
+      "vae": [
+        "23:3",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  },
+  "23:31": {
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "23:34",
+        0
+      ]
+    },
+    "class_type": "ModelAttentionBackend",
+    "_meta": {
+      "title": "Model Attention Backend",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  },
+  "23:34": {
+    "inputs": {
+      "lora_name": "{{AITK_LORA}}",
+      "strength_model": "{{AITK_LORA_STRENGTH}}",
+      "model": [
+        "23:1",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA",
+      "cnr_id": "comfy-core",
+      "ver": "0.45.2"
+    }
+  }
+}
