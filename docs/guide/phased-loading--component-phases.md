@@ -8,6 +8,8 @@ Part of the `phased-loading--` guide packet:
 Anchors are as of commit `22f1c08` (2026-10-07). Verify each file:line before
 relying on it; this document is the authoritative current-state map, the notes
 in `docs/refactor_notes/` are point-in-time research and no longer authoritative.
+Sections added 2026-11-12 (generated-image passes, masking sub-phase, reference
+latents, the residency downgrade) anchor to their own commits instead.
 
 ## The contract in one paragraph
 
@@ -62,6 +64,50 @@ latent cache filenames from the class attribute alone, so a `[2]`-only run
 still evaluates latent completeness correctly
 ([loader conventions](./phased-loading--loader-conventions.md) §5).
 
+## Generated images: conditioning pass and masking sub-phase
+
+Two phase-1 passes produce images that later phases consume; both are
+plan-then-execute (the work list is derived from the dataset configs, never
+a chained if/elif), one model load per type, all datasets requesting that
+type served in the same pass, try/finally frees, and a model no dataset
+requests is never printed or loaded
+(`BaseSDTrainProcess._run_conditioning_generation_pass` /
+`_run_masking_pass`):
+
+- **Conditioning generation** runs *before the vae load*: the generator
+  models need no vae and nothing is resident yet, so there is no
+  unload/restore dance. The latent cache below then encodes the generated
+  images like targets. Static pass order `CONTROL_PASS_ORDER` =
+  depth, line, pose.
+- **Masking sub-phase** runs *after the iron rule* (before the
+  `phases complete` early-exit, so `[1]`-only prep runs generate masks):
+  `MASK_MODEL_PASS_ORDER` = birefnet, sapiens2. Generated masks land in
+  `<media_dir>/_masks/<source>/`, generated conditioning in
+  `<media_dir>/_controls/<type>/`; existing files are reused, so the passes
+  are silent on warm runs. In `vae_training_mode == 'keep'` runs the vae is
+  still resident and the generator parks it via the device-state machinery
+  (reason printed) — in the common cached case nothing is resident and no
+  dance happens.
+- **Guards**: a skipped phase 1 refuses loudly when generated conditioning
+  images or masks are still missing (the same
+  `phases excludes 1 but its work is still needed` shape as the other
+  gates) — a silent unmasked/unconditioned run is structurally impossible.
+- **Mask models** download into `MODELS_PATH/mask|control/<name>/` via
+  `_ensure_local_model_dir`, never the ambient hf cache.
+
+## Reference latents and the post-phase-1 residency downgrade
+
+Models that declare `require_vae_during_training` (edit-mode reference
+encoding) keep the vae only while control reference sidecars are pending
+([embed caches §7](./phased-loading--embed-caches.md)). Because sidecar
+completion is only known *after* the phase-1 passes, the ladder
+re-evaluates right after them: if every sidecar is complete, `keep`
+downgrades to reload/unload with a printed line
+("Control reference latents cached in phase 1 - the vae will not stay
+resident for training") and the iron rule frees the vae. `vae_load_needed`
+also counts pending sidecars, so a warm run with complete sidecars never
+loads the vae at all.
+
 ## Sampling rounds (sample())
 
 - Non-staged models: if `vae_training_mode == 'reload'` and the vae is not
@@ -76,9 +122,10 @@ still evaluates latent completeness correctly
 
 | Gate | Anchor | Forces load when |
 |---|---|---|
-| VAE phase-1 | `BaseSDTrainProcess.py:1916` | `vae_training_mode == 'keep'`, or any dataset needs live/cached latents, or validation items exist (frozen paired clause `:1925`) |
+| VAE phase-1 | `BaseSDTrainProcess.py` (`vae_load_needed`) | `vae_training_mode == 'keep'`, or any dataset needs live/cached latents, or control reference sidecars are pending, or validation items exist (frozen paired clause — DO NOT TOUCH) |
 | TE phase-2 | `SDTrainer.needs_text_encoder_load` | arch declares no text encoder (`has_text_encoder=False`) → **skip, prints**; any dataset `text_embedding_complete()` false; `train_text_encoder`; embed_config; validation items (frozen clause); live-encoding mode; `_compute_live_text_encoder_needed()`; `fixed_embeds_cached()` false. The encoderless refusal (`cache_pre_train_text_embeddings`, mirrored in the phase-2 dataset pass) keys on `has_text_encoder`, never on the caching flags |
-| Sampling vae preload | `BaseSDTrainProcess.py:382` | `vae_training_mode == 'reload'` and vae absent and not `staged_sampling` |
+| Sampling vae preload | `BaseSDTrainProcess.py` (sample rounds) | `vae_training_mode == 'reload'` and vae absent and not `staged_sampling` |
+| Post-phase-1 downgrade | `BaseSDTrainProcess.py` (after the phase-1 passes) | never forces a load — *downgrades* a declared `require_vae_during_training` keep to reload/unload once every control reference sidecar is complete; prints the reason |
 
 Rules learned the hard way in this repo (regressions, not theory):
 

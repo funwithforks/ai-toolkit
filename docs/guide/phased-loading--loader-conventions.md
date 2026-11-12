@@ -198,7 +198,10 @@ the registry: the dataloader keys latent caches on `model.vae_id` directly
 model declaring `qwen_image` shares one cache namespace and one set of
 files. Any deliberate semantic change to a vae's output is made by the vae
 module's owner (the quality pass) and handled by deleting/stranding the id's
-cache directory — caches are cheap.
+cache directory — caches are cheap. The same identity keys the control
+reference-latent sidecars ([embed caches §7](./phased-loading--embed-caches.md)):
+a sidecar records the `vae_id` that encoded it, so two models sharing a
+dataset never reuse another vae's reference latents.
 
 **Onboarding a model** (the H3 migration, commit `c578d205`, is the
 reference):
