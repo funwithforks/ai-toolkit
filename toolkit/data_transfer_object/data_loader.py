@@ -95,7 +95,7 @@ class FileItemDTO(
         # D-OPSD: also cache teacher embeds with the item's own media as reference 1
         self.dopsd_self_ref = kwargs.get("dopsd_self_ref", False)
         self.te_padding_side = kwargs.get("te_padding_side", "right")
-        self.latent_space_version = kwargs.get("latent_space_version", "sd1")
+        self.vae_id: str = kwargs.get("vae_id", "sd1")
         self.text_embedding_space_version = kwargs.get("text_embedding_space_version", "sd1")
         # model sizes references against the item's bucket, so the cache key must carry it
         self.text_embedding_uses_target_size = kwargs.get("text_embedding_uses_target_size", False)

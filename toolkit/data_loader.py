@@ -656,10 +656,10 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         # latents; same-vae models share caches and cache filenames). A
         # model not on the registry fails loudly: it must declare a vae_id.
         if self.sd is None:
-            latent_space_version = "sd1"
+            vae_id = "sd1"
         else:
-            latent_space_version = getattr(self.sd, "vae_id", None)
-            if latent_space_version is None:
+            vae_id = getattr(self.sd, "vae_id", None)
+            if vae_id is None:
                 raise ValueError(
                     f"{type(self.sd).__name__} declares no vae_id: latent "
                     "caches are keyed to the vae through the registry. Give "
@@ -695,7 +695,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     text_embedding_space_version=text_embedding_space_version,
                     text_embedding_uses_target_size=getattr(self.sd, 'text_embedding_uses_target_size', False) if self.sd else False,
                     te_padding_side=self.sd.te_padding_side if self.sd else "right",
-                    latent_space_version=latent_space_version,
+                    vae_id=vae_id,
                     temporal_compression=temporal_compression,
                     sample_rate=self.sd.sample_rate if (self.is_audio_model or self.is_multimodal_llm) and self.sd is not None else 48000,
                 )

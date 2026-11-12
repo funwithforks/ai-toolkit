@@ -1356,7 +1356,7 @@ class ControlFileItemDTOMixin:
         # second model on the same dataset must not reuse another vae's
         # reference latents. Same identity the target latent cache keys on;
         # carried by the item (sd is not available at fetch time).
-        if meta.get('latent_space_version') != self.latent_space_version:
+        if meta.get('vae_id') != self.vae_id:
             return False
         # with cache_key_on_content off, judge by path/count/bucket only: the
         # dataset's media may be stub-swapped after caching
@@ -1967,7 +1967,7 @@ class LatentCachingFileItemDTOMixin:
             ("crop_y", self.crop_y),
             ("crop_width", self.crop_width),
             ("crop_height", self.crop_height),
-            ("latent_space_version", self.latent_space_version),
+            ("vae_id", self.vae_id),
             ("latent_version", self.latent_version),
         ])
         if getattr(self, 'dataset_config', None) is not None and self.dataset_config.cache_key_on_content:
@@ -2301,7 +2301,7 @@ class LatentCachingMixin:
                 # which latent space encoded these: a second model on the same
                 # dataset must not reuse another vae's reference latents.
                 # Same identity the target latent cache keys on (vae_id).
-                'latent_space_version': getattr(self.sd, 'vae_id', None),
+                'vae_id': getattr(self.sd, 'vae_id', None),
             }
             import json as _json
 
