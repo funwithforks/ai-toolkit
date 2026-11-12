@@ -1116,6 +1116,11 @@ def _int8_act_quant_fake(x, qmax, w_scales=None):
     ]
 
 
+# ranks whose "<32 -> elementwise epilogue" warning already printed (the op
+# runs per layer per step, the condition is static per rank)
+_EPI_DOT_SMALL_RANK_WARNED: set = set()
+
+
 @torch.library.custom_op("ostris::convrot_int8_epilogue", mutates_args=())
 def _int8_epilogue_op(
     i32: torch.Tensor,
@@ -1181,11 +1186,13 @@ def _int8_epilogue_op(
         )
         return out
     if has_lora and epi_dot and kl < 32:
-        print_acc(
-            f"ConvRot: cr8_epi_dot requested at rank {rank} (padded {kl}, "
-            "<32); tl.dot cannot run, using the elementwise epilogue for "
-            "this layer."
-        )
+        if rank not in _EPI_DOT_SMALL_RANK_WARNED:
+            _EPI_DOT_SMALL_RANK_WARNED.add(rank)
+            print_acc(
+                f"ConvRot: cr8_epi_dot requested at rank {rank} (padded {kl}, "
+                "<32); tl.dot cannot run, using the elementwise epilogue for "
+                "this layer."
+            )
     block_n = 512 if (has_lora or has_lora2) else 1024
     grid = (m, -(-n // block_n))
     kernel[grid](

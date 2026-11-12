@@ -52,6 +52,12 @@ class Qwen3VLTextEncoder(Qwen3VLForConditionalGeneration, OstrisTransformersMixi
         "Comfy-Org/MiniMax-H3": [
             "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
         ],
+        # MiniMax-H3-Image: the same 32B Qwen3-VL, int8 convrot repack (the
+        # image arch ships this variant only; the image edit labels and the
+        # 4096-token prompt cap live in the conditioning, not the encoder)
+        "Comfy-Org/MiniMax-H3-Image": [
+            "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+        ],
     }
 
     @classmethod

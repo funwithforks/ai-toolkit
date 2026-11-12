@@ -100,7 +100,7 @@ class MiniMaxH3Pipeline:
             t_lat = 1
         h_lat = height // 16
         w_lat = width // 16
-        a_lat = packing.audio_latent_num_frames(num_frames)
+        a_lat = model._num_audio_latents(num_frames)
 
         text_embeds, token_tags = trim_caption_tokens(
             conditional_embeds.text_embeds[0],
@@ -218,6 +218,14 @@ class MiniMaxH3Pipeline:
             num_inference_steps + 1
         ):
             sigmas_v = stored_sigmas.detach().float().to(device)
+        # models distilled on a fixed grid sample their own schedule
+        # (MiniMax-H3-Image's PDD head grid); the shifted-uniform default above
+        # is unchanged for everything that doesn't declare one
+        build_sample_sigmas = getattr(model, "build_sample_sigmas", None)
+        if not two_time and callable(build_sample_sigmas):
+            sample_sigmas = build_sample_sigmas(num_inference_steps)
+            if sample_sigmas is not None:
+                sigmas_v = sample_sigmas.to(device)
         # the audio schedule follows the video grid through the closed-form
         # shift remap so both streams sit at the same underlying position
         sigmas_a = remap_sigma(sigmas_v, video_shift, AUDIO_SIGMA_SHIFT)
@@ -270,6 +278,7 @@ class MiniMaxH3Pipeline:
                 text_indices=text_indices,
                 # target-video token grid (patch 1x2x2); consumed only by VSA models
                 vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
+                pdd_weights=model._pdd_weights(sv, sv_next),
             )
             v_video = video_pred[:, num_cond:].float()
             v_audio = audio_pred[:, layout.num_condition_audio_rows :].float()

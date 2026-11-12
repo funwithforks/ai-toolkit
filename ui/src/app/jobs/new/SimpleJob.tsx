@@ -782,7 +782,11 @@ export default function SimpleJob({
                         { value: 'linear', label: 'Linear' },
                         { value: 'shift', label: 'Shift' },
                         { value: 'weighted', label: 'Weighted' },
-                        { value: 'deployment_grid', label: 'Deployment Grid' },
+                        {
+                          value: 'minimax_h3_image_grid',
+                          label: 'MiniMax H3 Image Grid',
+                        },
+                        { value: 'hyperflow_grid', label: 'HyperFlow Flash Grid' },
                       ]}
                     />
                   )}

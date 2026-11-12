@@ -590,7 +590,7 @@ class TrainConfig:
         # adds an additional loss to the network to encourage it output a normalized standard deviation
         self.target_norm_std = kwargs.get('target_norm_std', None)
         self.target_norm_std_value = kwargs.get('target_norm_std_value', 1.0)
-        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step, deployment_grid
+        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step, hyperflow_grid, minimax_h3_image_grid (deployment_grid: deprecated alias for hyperflow_grid)
         
         self.first_timestep_chance = kwargs.get('first_timestep_chance', 0.0)
         

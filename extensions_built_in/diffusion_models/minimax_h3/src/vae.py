@@ -340,6 +340,9 @@ class ViTDecoder3d(nn.Module):
         rope_theta=100.0,
         rope_dim_ratio=0.75,
         eps=1e-5,
+        fixed_time_coord=None,
+        mask_token=True,
+        rope_axes=3,
     ):
         super().__init__()
         dim = heads * head_dim
@@ -347,12 +350,19 @@ class ViTDecoder3d(nn.Module):
         self.patch_size_t = patch_size_t
         self.out_channels = out_channels
         self.num_register_tokens = num_register_tokens
+        # P-H3-Image: every token sits at one fixed rope time coordinate
+        self.fixed_time_coord = fixed_time_coord
+        # MiniMax-H3-Image: 2 = rope over (h, w) only, single-frame latents
+        self.rope_axes = rope_axes
 
-        self.rope = RotaryEmbedding3d(int(head_dim * rope_dim_ratio), theta=rope_theta)
+        self.rope = RotaryEmbedding3d(
+            int(head_dim * rope_dim_ratio), theta=rope_theta, num_axes=rope_axes
+        )
         self.x_embedder = nn.Linear(in_channels, dim)
         self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, dim))
-        # unused at inference; kept so the checkpoint loads strict
-        self.register_buffer("mask_token", torch.zeros(1, 1, dim))
+        if mask_token:
+            # unused at inference; kept so the checkpoint loads strict
+            self.register_buffer("mask_token", torch.zeros(1, 1, dim))
         self.transformer_blocks = nn.ModuleList(
             TransformerBlock(heads, head_dim, ffn_mult=ffn_mult, eps=eps)
             for _ in range(num_layers)
@@ -382,25 +392,25 @@ class ViTDecoder3d(nn.Module):
         x = x.to(self.x_embedder.weight.dtype)
         num_patches = x.shape[1]
 
-        x = torch.cat(
-            [
-                x,
-                self.register_tokens.expand(b, -1, -1).to(x.dtype),
-                torch.zeros_like(x[:, :1]),
-            ],
-            dim=1,
-        )
+        suffix = [self.register_tokens.expand(b, -1, -1).to(x.dtype)]
+        if getattr(self, "mask_token", None) is not None:
+            suffix.append(torch.zeros_like(x[:, :1]))
+        x = torch.cat([x, *suffix], dim=1)
 
         grids = [
             2.0 * (torch.arange(0.5, size, dtype=torch.float32, device=z.device) / size)
             - 1.0
-            for size in (t, h, w)
+            for size in (t, h, w)[-self.rope_axes :]
         ]
+        if self.fixed_time_coord is not None:
+            grids[0] = torch.full_like(grids[0], self.fixed_time_coord)
         position_ids = torch.stack(
             torch.meshgrid(*grids, indexing="ij"), dim=-1
-        ).flatten(0, 2)
+        ).flatten(0, self.rope_axes - 1)
         position_ids = position_ids.unsqueeze(0).expand(b, -1, -1)
-        suffix_ids = position_ids.new_zeros((b, self.num_register_tokens + 1, 3))
+        suffix_ids = position_ids.new_zeros(
+            (b, self.num_register_tokens + (1 if getattr(self, "mask_token", None) is not None else 0), self.rope_axes)
+        )
         with torch.autocast(device_type=z.device.type, enabled=False):
             rotary_emb = self.rope(torch.cat([position_ids, suffix_ids], dim=1))
 
@@ -519,6 +529,10 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
         decoder_ffn_mult=4,
         rope_theta=100.0,
         rope_dim_ratio=0.75,
+        decoder_fixed_time_coord=None,
+        decoder_mask_token=True,
+        decoder_rope_axes=3,
+        decoder_patch_size_t=None,
         clip_length=17,
         token_drop=3,
         latents_mean=None,
@@ -563,7 +577,9 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
             in_channels=latent_channels,
             out_channels=out_channels,
             patch_size=self.spatial_compression,
-            patch_size_t=self.temporal_compression,
+            patch_size_t=decoder_patch_size_t
+            if decoder_patch_size_t is not None
+            else self.temporal_compression,
             num_layers=decoder_num_layers,
             heads=decoder_heads,
             head_dim=decoder_head_dim,
@@ -571,6 +587,9 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
             ffn_mult=decoder_ffn_mult,
             rope_theta=rope_theta,
             rope_dim_ratio=rope_dim_ratio,
+            fixed_time_coord=decoder_fixed_time_coord,
+            mask_token=decoder_mask_token,
+            rope_axes=decoder_rope_axes,
         )
 
         if latents_mean is None:
@@ -873,5 +892,103 @@ class MiniMaxH3VideoVAE(nn.Module, OstrisModelMixin):
                 dec = self._decode_video(z)
 
         # out-of-place so gradients can flow through decode (pixel-space losses)
+        dec = dec.float() * self.pixel_std + self.pixel_mean
+        return dec.clamp(0.0, 1.0) * 2.0 - 1.0
+
+
+class MiniMaxH3ImageVideoVAE(MiniMaxH3VideoVAE):
+    """MiniMax-H3-Image VAE: the H3 encoder with a single-frame 2D ViT decoder
+    (24 layers, 16 heads, rope over (h, w) on half of each head, patch_size_t
+    1). One latent frame decodes straight to one image, spatially tiled like
+    the release (256 px tiles, 64 px minimum overlap, blended in pixel space).
+    The comfy file is fp16 throughout and runs at that precision, and ships
+    no latents_mean/latents_std -- the inherited H3 latent stats constants
+    are the value (verified identical to the original release's fp32 config
+    up to fp16 rounding)."""
+
+    aitk_comfy_repo = "Comfy-Org/MiniMax-H3-Image"
+    aitk_comfy_weight_names = {
+        "Comfy-Org/MiniMax-H3-Image": ["vae/minimax_h3_image_vae_fp16.safetensors"],
+    }
+
+    def __init__(self, decoder_num_layers=24, **kwargs):
+        super().__init__(
+            decoder_num_layers=decoder_num_layers,
+            decoder_heads=16,
+            rope_dim_ratio=0.5,
+            decoder_patch_size_t=1,
+            decoder_rope_axes=2,
+            **kwargs,
+        )
+
+    @classmethod
+    def _sniff_decoder_layers(cls, keys) -> int:
+        return sum(
+            k.startswith("decoder.transformer_blocks.") and k.endswith(".scale1")
+            for k in keys
+        )
+
+    @classmethod
+    def load_to_device(cls, file_path: str, device) -> "MiniMaxH3ImageVideoVAE":
+        """Stream the checkpoint straight onto ``device`` (same contract as
+        MiniMaxH3VideoVAE.load_to_device), with two file-layout differences:
+        the decoder layer count is sniffed from the block keys, and the
+        release stores the 1x1 post-quant conv as a Conv2d."""
+        import time as _time
+
+        from accelerate import init_empty_weights
+
+        from toolkit.util.weight_source import WeightSource
+
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        t0 = _time.perf_counter()
+        state = WeightSource.open(file_path).materialize(dev)
+        num_layers = cls._sniff_decoder_layers(state.keys())
+        with init_empty_weights(include_buffers=False):
+            model = cls(decoder_num_layers=num_layers)
+        # the release stores the 1x1 post-quant conv as a Conv2d
+        post_quant = state["post_quant_conv.weight"]
+        if post_quant.ndim == 4:
+            state["post_quant_conv.weight"] = post_quant.unsqueeze(2)
+        model.load_state_dict(state, strict=True, assign=True)
+        del state
+        model.to(dev)
+        model.eval().requires_grad_(False)
+        print(
+            f"[load-timing] MiniMaxH3ImageVideoVAE: streamed to {dev} "
+            f"{(_time.perf_counter() - t0):.1f}s"
+        )
+        return model
+
+    @classmethod
+    def load_from_state_dict(cls, state_dict, dtype=None, **kwargs):
+        """Comfy single-file load. The image file ships no latents_mean/
+        latents_std; the class's H3 latent stats constants are the value
+        (no per-file branching)."""
+        state_dict = dict(state_dict)
+        # the release stores the 1x1 post-quant conv as a Conv2d
+        post_quant = state_dict["post_quant_conv.weight"]
+        if post_quant.ndim == 4:
+            state_dict["post_quant_conv.weight"] = post_quant.unsqueeze(2)
+        num_layers = cls._sniff_decoder_layers(state_dict.keys())
+        model = cls(decoder_num_layers=num_layers)
+        model.load_state_dict(state_dict, strict=True, assign=True)
+        model.eval().requires_grad_(False)
+        return model
+
+    def decode(self, latents, autocast_fp16=False):
+        """Normalized (B, 24, 1, h, w) -> (B, 3, 1, H, W) in [-1, 1]."""
+        if latents.shape[2] != 1:
+            raise ValueError(
+                "MiniMax-H3-Image decodes single-frame latents only, got "
+                f"{latents.shape[2]}"
+            )
+        shape = (1, -1, 1, 1, 1)
+        z = latents.float() * self.latents_std.view(shape) + self.latents_mean.view(
+            shape
+        )
+        dec = self._decode_clip(z.to(self.post_quant_conv.weight.dtype))
         dec = dec.float() * self.pixel_std + self.pixel_mean
         return dec.clamp(0.0, 1.0) * 2.0 - 1.0

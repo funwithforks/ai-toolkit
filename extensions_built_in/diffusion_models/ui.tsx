@@ -1535,6 +1535,106 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     ),
   },
   {
+    name: "minimax_h3_image",
+    label: "MiniMax-H3-Image",
+    group: "image",
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      "config.process[0].model.name_or_path": [
+        "Comfy-Org/MiniMax-H3-Image",
+        defaultNameOrPath,
+      ],
+      // pre-quantized weights: matching qtypes keep the load unchanged
+      "config.process[0].model.quantize": [true, false],
+      "config.process[0].model.qtype": ["convrot8", "qfloat8"],
+      "config.process[0].model.quantize_te": [true, false],
+      "config.process[0].model.qtype_te": ["convrot8", "qfloat8"],
+      "config.process[0].model.low_vram": [false, false],
+      "config.process[0].sample.sampler": ["flowmatch", "flowmatch"],
+      "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
+      "config.process[0].train.cache_text_embeddings": [true, false],
+      "config.process[0].model.assistant_lora_path": [
+        "ostris/minimax_h3_training_adapter/minimax_h3_image_training_adapter_v1.safetensors",
+        undefined,
+      ],
+      "config.process[0].network.linear": [16, defaultLinearRank],
+      "config.process[0].network.linear_alpha": [16, defaultLinearRank],
+      "config.process[0].network.network_kwargs.ignore_if_contains": [
+        ["adaln_proj"],
+        [],
+      ],
+      "config.process[0].sample.width": [2048, 1024],
+      "config.process[0].sample.height": [2048, 1024],
+      "config.process[0].sample.guidance_scale": [1, 4],
+      "config.process[0].sample.sample_steps": [6, 25],
+      "config.process[0].train.timestep_type": ["sigmoid", "sigmoid"],
+      "config.process[0].datasets[x].cache_latents_to_disk": [true, false],
+    },
+    disableSections: ["network.conv"],
+    additionalSections: [
+      "datasets.multi_control_paths",
+      "sample.multi_ctrl_imgs",
+      "model.low_vram",
+      "model.layer_offloading",
+      "model.assistant_lora_path",
+    ],
+    modelNotes: (
+      <div className="space-y-2">
+        <p>
+          MiniMax-H3-Image is the MiniMax-H3 DiT without its audio stream,
+          distilled to 6 steps with no CFG, for text-to-image and image
+          editing. Without control images it trains and samples as
+          text-to-image. With control images each one is a reference the
+          prompt names as <code>&lt;Picture 1&gt;</code>,{" "}
+          <code>&lt;Picture 2&gt;</code>, ...: it rides into the packed
+          sequence as a reference block and is shown to the Qwen3-VL
+          conditioner at a 1024 short edge. References keep their own size
+          instead of following the target: the encoded copy has its short
+          edge inside 1024 to 2048 (
+          <code>model_kwargs.reference_min_short_edge</code> /{" "}
+          <code>reference_max_short_edge</code>). Sample ctrl images work the
+          same way. The prompt is used as written, so describe the whole
+          image in detail.
+        </p>
+        <p>
+          Weights load from the{" "}
+          <Link href="/settings" className="text-blue-400 hover:underline">
+            Models Folder Path
+          </Link>{" "}
+          in the ComfyUI layout; anything missing is downloaded there from{" "}
+          <code>Comfy-Org/MiniMax-H3-Image</code>. The text encoder is the
+          MiniMax-H3 one (int8 convrot repack), so an existing copy of that
+          variant is reused. Files used with the default quantization:
+        </p>
+        <pre className="bg-gray-900 border border-gray-700 rounded-lg p-3 text-xs overflow-x-auto">
+          <code>{`<MODELS_PATH>/
+├── diffusion_models/
+│   └── minimax_h3_image_pruned_int8_convrot.safetensors
+├── text_encoders/
+│   └── qwen3vl_32b_minimax_h3_int8_convrot.safetensors
+└── vae/
+    └── minimax_h3_image_vae_fp16.safetensors`}</code>
+        </pre>
+        <p>
+          The default qtypes load those files as shipped. Transformer qtype{" "}
+          <code>convrotw4a8</code> loads the 4-bit{" "}
+          <code>minimax_h3_image_pruned_w4a8</code> file, and any other
+          transformer qtype quantizes the bf16 file. The transformer has one
+          output head per sampling step on its own 6-step sigma grid, so keep
+          sample steps at 6 and guidance scale at 1. Training draws only
+          those six sampling timesteps, each through its own head, so the
+          Timestep Type setting has no effect. It is trained for 4 MP
+          to 20 MP output (2048×2048 up to 4096×4096, 5472×3072, ...); lower
+          resolutions show more artifacts. The model is step and guidance
+          distilled, so training runs with the MiniMax-H3-Image training
+          adapter (<code>minimax_h3_image_training_adapter_v1</code>) as a
+          live assistant LoRA by default; the sampler turns it off for
+          previews. Audio and video are not supported.
+        </p>
+      </div>
+    ),
+  },
+  {
     name: "minimax_h3_flash",
     label: "MiniMax-H3 Flash (HyperFlow)",
     group: "video",
@@ -1616,12 +1716,13 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
         <p>
           The repack is pre-quantized and loads as-shipped: the default qtypes
           (<code>convrot8</code> / <code>nvfp4</code>) match the files exactly,
-          so nothing is re-quantized on load. Training samples whole 6-step
-          deployment steps — the trainer noises at a grid sigma and conditions
-          every row on its (t, r) pair toward the next grid point, so{" "}
-          <code>timestep_type</code> is ignored for this arch. Sample with 6
-          steps and guidance scale 1 (the trained schedule; 4 and 8 steps also
-          exist). Video is fixed 24 fps and frame counts snap down to the 17n+5
+          so nothing is re-quantized on load. Training timesteps are a
+          normal config choice (sigmoid is the usual best); every drawn sigma
+          maps through the PDD head blend of the grid interval it falls in.
+          To train exactly on the deployment schedule instead, set{" "}
+          <code>timestep_type</code> to <code>minimax_h3_image_grid</code>{" "}
+          (MiniMax H3 Image Grid). Sample with 6 steps and guidance scale 1
+          (the trained schedule; other step counts interpolate the grid). Video is fixed 24 fps and frame counts snap down to the 17n+5
           grid (5, 22, 39, 56, ..., 107, 124 ≈ 5s). Image datasets
           (num_frames 1) train as single frames, and a sample with num_frames 1
           renders a single image.

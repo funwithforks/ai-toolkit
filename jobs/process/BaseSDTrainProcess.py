@@ -1437,6 +1437,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     elif hasattr(self.sd.unet, 'config') and hasattr(self.sd.unet.config, 'patch_size'):
                         patch_size = self.sd.unet.config.patch_size
                     
+                    # deployment grids ("HyperFlow Flash Grid" /
+                    # "MiniMax H3 Image Grid" in the UI): the model exposes
+                    # the sigma grid it was distilled on and the scheduler
+                    # trains whole steps of it. 'deployment_grid' is the old
+                    # flash-only name, kept as a loud alias.
+                    if timestep_type in (
+                        "hyperflow_grid", "minimax_h3_image_grid", "deployment_grid",
+                    ):
+                        if timestep_type == "deployment_grid":
+                            print(
+                                "timestep_type 'deployment_grid' is deprecated: use "
+                                "'hyperflow_grid' (HyperFlow Flash) or "
+                                "'minimax_h3_image_grid' (MiniMax H3 Image)"
+                            )
+                        grid = getattr(self.sd, "train_sigma_grid", None)
+                        if grid is None:
+                            raise ValueError(
+                                f"timestep_type {self.train_config.timestep_type!r} "
+                                "needs a model that exposes a sigma grid (this "
+                                "arch has none)"
+                            )
+                        # the optional-scheduler channel: set_train_timesteps
+                        # emits exactly these sigmas (terminal 0 appended),
+                        # and the timestep draw picks whole steps of the grid
+                        self.sd.noise_scheduler.fixed_train_sigmas = (
+                            grid[:-1].tolist()
+                        )
+
                     self.sd.noise_scheduler.set_train_timesteps(
                         num_train_timesteps,
                         device=self.device_torch,
@@ -1472,34 +1500,31 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if is_reg:
                     content_or_style = self.train_config.content_or_style_reg
 
-                # "deployment_grid": sample whole steps of the sigma grid the
-                # loaded model exposes (few-step distilled models, e.g.
-                # HyperFlow flash), so the noising sigma and the (t, r)
-                # endpoint pair land exactly on the schedule the model was
-                # distilled for. Selected explicitly via timestep_type -- the
-                # arch never overrides the config's own timestep type. Every
-                # other value (sigmoid, shift, ...) samples continuously and
-                # the endpoint column pairs each sigma with the next
-                # deployment point below it.
+                # "deployment grids" (UI: HyperFlow Flash Grid / MiniMax H3
+                # Image Grid): prepare_scheduler hands the model's exposed
+                # sigma grid to the scheduler as fixed_train_sigmas, and the
+                # draw below picks whole steps of it, so the noising sigma
+                # lands exactly on the schedule the model was distilled for.
+                # Selected explicitly via timestep_type -- the arch never
+                # overrides the config's own timestep type. Every other value
+                # (sigmoid, shift, ...) samples continuously and the endpoint
+                # column pairs each sigma with the next deployment point
+                # below it.
                 sigma_grid = None
-                if self.train_config.timestep_type == "deployment_grid":
-                    sigma_grid = getattr(self.sd, "train_sigma_grid", None)
-                    if sigma_grid is None:
-                        raise ValueError(
-                            "timestep_type deployment_grid needs a model that "
-                            "exposes a sigma grid (this arch has none)"
-                        )
-                    step_idx = torch.randint(
+                fixed_sigmas = getattr(
+                    self.sd.noise_scheduler, "fixed_train_sigmas", None
+                )
+                if fixed_sigmas is not None:
+                    # the scheduler's timesteps are the model's own deployment
+                    # grid: each step-distilled head only ever sees its own
+                    # sigma
+                    timestep_indices = torch.randint(
                         0,
-                        len(sigma_grid) - 1,
+                        len(self.sd.noise_scheduler.timesteps),
                         (batch_size,),
-                        device=self.device_torch,
+                        device=self.device_torch
                     )
-                    timestep_indices = step_idx
-                    timesteps = (
-                        sigma_grid.to(device=self.device_torch, dtype=torch.float32)
-                        * 1000.0
-                    )[step_idx]
+                    timestep_indices = timestep_indices.long()
                 elif self.train_config.timestep_type in ['two_step', 'four_step', 'eight_step']:
                     if self.train_config.timestep_type == 'two_step':
                         indice_choices = [0, 499]
@@ -1568,7 +1593,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     raise ValueError(f"Unknown content_or_style {content_or_style}")
 
-                if sigma_grid is None and self.train_config.first_timestep_chance > 0.0:
+                if sigma_grid is None and fixed_sigmas is None and self.train_config.first_timestep_chance > 0.0:
                     # index 0 is full noise; per-sample chance to force it
                     force_first = torch.rand((batch_size,), device=timestep_indices.device) < self.train_config.first_timestep_chance
                     timestep_indices = torch.where(force_first, torch.zeros_like(timestep_indices), timestep_indices)

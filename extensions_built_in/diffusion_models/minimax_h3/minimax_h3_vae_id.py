@@ -22,7 +22,7 @@ from toolkit.basic import flush
 from toolkit.models.vae_registry import VaeEntry, register_vae_entry
 
 from .src.audio_vae import MiniMaxH3AudioVAE
-from .src.vae import MiniMaxH3VideoVAE
+from .src.vae import MiniMaxH3ImageVideoVAE, MiniMaxH3VideoVAE
 
 
 def _load_minimax_h3_vae(model):
@@ -53,6 +53,32 @@ register_vae_entry(
         load=_load_minimax_h3_vae,
         # members keep their shipped precisions (fp16 video / fp32 audio):
         # the loaders take no dtype, and placement only moves
+        bundle=True,
+    )
+)
+
+
+def _load_minimax_h3_image_vae(model):
+    """-> MiniMaxH3VaeBundle(MiniMaxH3ImageVideoVAE, None): the image-only
+    bundle. The audio member is None for the whole life of the job -- the
+    image arch has no audio stream (model._num_audio_latents == 0), so the
+    bundle's audio path is never taken."""
+    from .minimax_h3 import MiniMaxH3VaeBundle
+
+    model.print_and_status_update("Loading MiniMax-H3-Image VAE")
+    video_vae = MiniMaxH3ImageVideoVAE.load_to_device(
+        model._resolve_comfy_file("video_vae", MiniMaxH3ImageVideoVAE),
+        model.vae_device_torch,
+    )
+    flush()
+    return MiniMaxH3VaeBundle(video_vae, None)
+
+
+register_vae_entry(
+    VaeEntry(
+        vae_id="minimax_h3_image",
+        components={"video_vae": MiniMaxH3ImageVideoVAE},
+        load=_load_minimax_h3_image_vae,
         bundle=True,
     )
 )

@@ -30,6 +30,7 @@ from .minimax_h3 import (
     MinimaxH3Ref2VAModel,
     MinimaxH3FastModel,
     MinimaxH3FlashModel,
+    MinimaxH3ImageModel,
 )
 
 AI_TOOLKIT_MODELS = [
@@ -75,6 +76,7 @@ AI_TOOLKIT_MODELS = [
     MinimaxH3Ref2VAModel,
     MinimaxH3FastModel,
     MinimaxH3FlashModel,
+    MinimaxH3ImageModel,
     Fibo2Model,
     MossImageModel,
 ]

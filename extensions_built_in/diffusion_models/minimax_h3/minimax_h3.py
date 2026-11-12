@@ -185,8 +185,10 @@ class MiniMaxH3VaeBundle(torch.nn.Module):
         return vae.dtype
 
     def enable_gradient_checkpointing(self, enable: bool = True):
-        self.video_vae.enable_gradient_checkpointing(enable)
-        self.audio_vae.enable_gradient_checkpointing(enable)
+        if self.video_vae is not None:
+            self.video_vae.enable_gradient_checkpointing(enable)
+        if self.audio_vae is not None:
+            self.audio_vae.enable_gradient_checkpointing(enable)
 
     def disable_gradient_checkpointing(self):
         self.enable_gradient_checkpointing(False)
@@ -325,6 +327,25 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
     def get_bucket_divisibility(self):
         # 16x VAE spatial compression * 2x2 transformer patch
         return 32
+
+    def _num_audio_latents(self, num_frames: int) -> int:
+        """Target audio latents riding with ``num_frames`` video frames
+        (MiniMax-H3-Image has no audio stream: 0)."""
+        return packing.audio_latent_num_frames(num_frames)
+
+    def _pdd_weights(self, sigma_v, sigma_v_next=None):
+        """Head weights for PDD checkpoints (None otherwise). Training passes a
+        single sigma per sample: the one grid interval containing it."""
+        return None
+
+    def _prompt_encoder_kwargs(self) -> dict:
+        """Extra kwargs for encode_minimax_h3_prompt (picture_label variants)."""
+        return {}
+
+    def build_sample_sigmas(self, num_inference_steps: int):
+        """Sampling sigma schedule override for models distilled on a fixed
+        grid (None-returning models keep the shifted-uniform default)."""
+        return None
 
     def get_frame_count_snapper(self):
         # auto_frame_count: snap dataset clips down to the VAE's 17n+5 grid
@@ -932,6 +953,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                 keyframes_per_prompt = [pil_images] * len(prompt)
 
         embeds_list, tags_list = [], []
+        prompt_kwargs = self._prompt_encoder_kwargs()
         for p, keyframes in zip(prompt, keyframes_per_prompt):
             embeds, tags = encode_minimax_h3_prompt(
                 self.text_encoder,
@@ -942,6 +964,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                 device=self.device_torch,
                 dtype=self.torch_dtype,
                 max_length=self.max_text_length,
+                **prompt_kwargs,
             )
             embeds_list.append(embeds)
             tags_list.append(tags)
@@ -1135,7 +1158,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             else:
                 # invert 17n+5 -> 5n+2 from the latent frame count
                 num_frames = (t_lat - 2) // 5 * 17 + 5 if t_lat > 1 else 1
-            a_lat = packing.audio_latent_num_frames(num_frames)
+            a_lat = self._num_audio_latents(num_frames)
             # audio only trains for video batches from datasets that asked for
             # it. Cached latents can carry audio after do_audio was turned off,
             # and image (single frame) batches must never pick up a soundtrack
@@ -1288,6 +1311,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             text_indices=text_indices.to(device),
             # target-video token grid (patch 1x2x2); consumed only by VSA models
             vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
+            pdd_weights=self._pdd_weights(sigma_v),
         )
 
         if num_cond_audio > 0:
@@ -1390,6 +1414,13 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             return result
         return result[0]
 
+    def _staged_video_vae(self):
+        """The video vae the staged-sampling decode phase streams in. Hook:
+        the MiniMax-H3-Image arch swaps in its own single-frame decoder."""
+        return MiniMaxH3VideoVAE.load_to_device(
+            self._resolve_comfy_file("video_vae", MiniMaxH3VideoVAE), self.vae_device_torch
+        )
+
     def decode_staged_samples(self, staged_samples):
         """staged_sampling decode phase, one vae at a time: the video vae
         streams onto the gpu, decodes every payload, and is gone before the
@@ -1407,9 +1438,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         own_video = prior is None or prior.video_vae is None
         if own_video:
             self.print_and_status_update("Loading video VAE")
-            video_vae = MiniMaxH3VideoVAE.load_to_device(
-                self._resolve_comfy_file("video_vae", MiniMaxH3VideoVAE), self.vae_device_torch
-            )
+            video_vae = self._staged_video_vae()
             self.vae = MiniMaxH3VaeBundle(video_vae=video_vae)
         frames = []
         for _gen_config, _idx, payload in staged_samples:
@@ -1544,6 +1573,14 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             return 0
         return packing.align_num_frames_down(int(kw.get("image_ref_video_frames", 5)))
 
+    def _reference_pixel_size(
+        self, ref_width: int, ref_height: int, target_height: int, target_width: int
+    ):
+        """(height, width) a still reference is encoded at."""
+        return packing.reference_pixel_size(
+            ref_width, ref_height, target_height, target_width
+        )
+
     @property
     def text_embedding_space_version(self):
         # the presentation of image references changes the embeds -> new cache key
@@ -1624,7 +1661,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         size_fn = (
             packing.reference_video_pixel_size
             if as_video_frames
-            else packing.reference_pixel_size
+            else self._reference_pixel_size
         )
 
         all_rows = []
@@ -1711,7 +1748,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             and batch.audio_latents is not None
             and getattr(batch, "num_frames", 1) > 1
         ):
-            a_lat = packing.audio_latent_num_frames(batch.num_frames)
+            a_lat = self._num_audio_latents(batch.num_frames)
             audio_rows = torch.stack(
                 [
                     self._fit_audio_rows(
@@ -1785,7 +1822,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             rows = self.encode_audio(
                 [{"waveform": waveform, "sample_rate": sample_rate}]
             )[0]
-            a_lat = packing.audio_latent_num_frames(n)
+            a_lat = self._num_audio_latents(n)
             audio_rows = self._fit_audio_rows(rows.float(), a_lat)
         except Exception:
             pass
@@ -1855,7 +1892,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             # soundtrack rows ride clean when every item in the batch has them
             a_lat = 0
             if all(a is not None for a in auds):
-                a_lat = packing.audio_latent_num_frames(entry["num_frames"])
+                a_lat = self._num_audio_latents(entry["num_frames"])
                 trimmed = [
                     self._fit_audio_rows(a.to(device, torch.float32), a_lat)
                     for a in auds
@@ -1933,11 +1970,12 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
                         self._encode_static_image_ref_for_sampling(img, gen_config)
                     )
                 else:
-                    ref_images.append(
-                        packing.prepare_reference_image(
-                            img, gen_config.height, gen_config.width
-                        )
+                    ph, pw = self._reference_pixel_size(
+                        img.size[0], img.size[1], gen_config.height, gen_config.width
                     )
+                    if img.size != (pw, ph):
+                        img = img.resize((pw, ph), Image.Resampling.LANCZOS)
+                    ref_images.append(img)
 
         with_audio = bool(self.model_config.model_kwargs.get("sample_audio", True))
 
@@ -1953,7 +1991,12 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             generator=generator,
             ref_images=ref_images or None,
             with_audio=with_audio and is_video,
+            # staged sampling: return the latents payload and let
+            # decode_staged_samples own the decode phase
+            decode=not self.staged_sampling,
         )
+        if self.staged_sampling:
+            return result
         if is_video:
             return result  # dict consumed by new_save_image_function
         return result[0]

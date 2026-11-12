@@ -74,6 +74,13 @@ class MiniMaxH3TransformerParams:
     # and add a bias to the block AdaLN linears, which the original weights
     # lack (the final layer's AdaLN carries a bias in both variants).
     adaln_t_table_size: Optional[int] = None
+    # PDD checkpoints stack pdd_steps output heads per stream on the unshifted
+    # [1, 0] grid: block 0 is a full head, later blocks are offsets from it; a
+    # step uses the dt-weighted blend of the heads it spans
+    pdd_steps: int = 1
+    # image checkpoints (MiniMax-H3-Image) drop the audio stream: no
+    # audio_patch_proj, no final_layer.audio_out, no audio rows in the pack
+    audio_enabled: bool = True
     # HyperFlow flash two-time checkpoints: a second (endpoint) time embedder
     # blended as ``emb_t + gate * (emb_r - emb_t)``, checkpoint-native low-rank
     # factorized linears (module path -> rank), and the deployment sigma grid
@@ -438,14 +445,23 @@ class MiniMaxH3FinalLayer(nn.Module):
             apply_silu=p.adaln_apply_silu,
             bias=True,
         )
-        self.video_out = nn.Linear(p.hidden_size, video_patch_dim, bias=True)
-        self.audio_out = nn.Linear(p.hidden_size, p.audio_latents_dim, bias=True)
+        self.pdd_steps = p.pdd_steps
+        self.video_out = nn.Linear(
+            p.hidden_size, video_patch_dim * p.pdd_steps, bias=True
+        )
+        self.audio_latents_dim = p.audio_latents_dim
+        self.audio_out = (
+            nn.Linear(p.hidden_size, p.audio_latents_dim * p.pdd_steps, bias=True)
+            if p.audio_enabled
+            else None
+        )
 
     def forward(
         self,
         x: torch.Tensor,  # (B, S, hidden)
         temb: torch.Tensor,  # (M, time_embed_dim)
         timestep_indices: torch.Tensor,  # (B, S) long into the M rows
+        pdd_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         shift, scale = self.adaln_proj(temb)
         dt = x.dtype
@@ -453,7 +469,29 @@ class MiniMaxH3FinalLayer(nn.Module):
             timestep_indices
         ].to(dt)
         h = h.to(self.video_out.weight.dtype)
-        return self.video_out(h), self.audio_out(h)
+        video_all = self.video_out(h)
+        if self.pdd_steps > 1:
+            if pdd_weights is None:
+                raise ValueError("PDD heads need pdd_weights for the current step")
+            # heads run through the Linear's own forward so LoRA hooks apply
+            video_all = _blend_pdd_heads(video_all, pdd_weights[0], self.pdd_steps)
+        if self.audio_out is None:
+            # no audio stream: zero audio rows
+            return video_all, video_all.new_zeros(
+                (video_all.shape[0], 0, self.audio_latents_dim)
+            )
+        audio_all = self.audio_out(h)
+        if self.pdd_steps > 1:
+            audio_all = _blend_pdd_heads(audio_all, pdd_weights[1], self.pdd_steps)
+        return video_all, audio_all
+
+
+def _blend_pdd_heads(out: torch.Tensor, weights: torch.Tensor, n: int):
+    """(B, N, n * d) stacked head outputs, (B, n) weights -> (B, N, d)."""
+    b, rows, _ = out.shape
+    return torch.einsum(
+        "brkd,bk->brd", out.view(b, rows, n, -1), weights.to(out.device, out.dtype)
+    )
 
 
 class MiniMaxH3LowRankLinear(nn.Module):
@@ -496,6 +534,14 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
             "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
             "diffusion_models/fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors",
         ],
+        # MiniMax-H3-Image: the audio-less 6-PDD-head pruned DiT, three
+        # precision variants; the image arch's candidate filter ranks them by
+        # the requested qtype
+        "Comfy-Org/MiniMax-H3-Image": [
+            "diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors",
+            "diffusion_models/minimax_h3_image_pruned_bf16.safetensors",
+            "diffusion_models/minimax_h3_image_pruned_w4a8.safetensors",
+        ],
         # the HyperFlow flash ComfyUI-layout repack: its own repo/subfolder,
         # resolved only when a job asks for this source explicitly
         (FLASH_REPO, "fl2va_int8_convrot_comfyui"): {
@@ -516,6 +562,15 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
             params.adaln_t_table_size = table.shape[0]
             params.time_embed_dim = table.shape[1]
         params.gate_compress = "blocks.0.attn.to_gate_compress.weight" in state_dict
+        # image checkpoints (MiniMax-H3-Image) drop the audio stream
+        params.audio_enabled = "audio_patch_proj.weight" in state_dict
+        # PDD checkpoints stack pdd_steps heads on video_out / audio_out
+        video_out = state_dict.get("final_layer.video_out.weight", None)
+        if video_out is not None:
+            p = params.patch_size
+            params.pdd_steps = video_out.shape[0] // (
+                params.latents_dim * p[0] * p[1] * p[2]
+            )
         # block count varies by repack (the flash repack renumbers past its
         # dropped blocks down to 47); derive it from the block keys
         block_indices = set()
@@ -600,7 +655,11 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
             p.latents_dim * p.patch_size[0] * p.patch_size[1] * p.patch_size[2]
         )
         self.video_patch_proj = nn.Linear(video_patch_dim, p.hidden_size, bias=True)
-        self.audio_patch_proj = nn.Linear(p.audio_latents_dim, p.hidden_size, bias=True)
+        self.audio_patch_proj = (
+            nn.Linear(p.audio_latents_dim, p.hidden_size, bias=True)
+            if p.audio_enabled
+            else None
+        )
         self.condition_proj = nn.Linear(p.text_dim, p.hidden_size, bias=True)
 
         if p.adaln_t_table_size is not None:
@@ -703,6 +762,9 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         vsa_video_grid: Optional[
             Tuple[int, int, int]
         ] = None,  # target-video token grid (t, h, w)
+        # PDD checkpoints only: per-sample (video, audio) head weights, each
+        # (B, pdd_steps), from packing.build_pdd_grid_weights
+        pdd_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         """Returns (video_out (B, Nv, 96), audio_out (B, Na, 32)) — the
         data-ward velocity ``clean - noise`` for every row, in input order.
@@ -715,9 +777,11 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         video_embeds = self.video_patch_proj(
             hidden_states.to(self.video_patch_proj.weight.dtype)
         )
-        audio_embeds = self.audio_patch_proj(
-            audio_hidden_states.to(self.audio_patch_proj.weight.dtype)
-        )
+        audio_embeds = None
+        if self.audio_patch_proj is not None:
+            audio_embeds = self.audio_patch_proj(
+                audio_hidden_states.to(self.audio_patch_proj.weight.dtype)
+            )
         text_embeds = self.condition_proj(encoder_hidden_states.to(self.dtype))
 
         # pad rows never act as attention keys; as queries they see everything
@@ -751,7 +815,8 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         x = text_embeds.new_zeros((batch_size, seq_len, text_embeds.shape[-1]))
         x = x.index_copy(1, text_indices, text_embeds)
         x = x.index_copy(1, video_indices, video_embeds.to(x.dtype))
-        x = x.index_copy(1, audio_indices, audio_embeds.to(x.dtype))
+        if audio_embeds is not None:
+            x = x.index_copy(1, audio_indices, audio_embeds.to(x.dtype))
 
         # one timestep embedding per distinct noise level across the batch
         if self.params.hyperflow_gate is not None:
@@ -835,7 +900,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                     vsa_ctx,
                 )
 
-        video_all, audio_all = self.final_layer(x, temb, inverse)
+        video_all, audio_all = self.final_layer(x, temb, inverse, pdd_weights)
         video_out = video_all.index_select(1, video_indices)
         audio_out = audio_all.index_select(1, audio_indices)
         return video_out, audio_out
