@@ -1,29 +1,120 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Modal } from '@/components/Modal';
 import Link from 'next/link';
 import { TextInput } from '@/components/formInputs';
-import useDatasetList from '@/hooks/useDatasetList';
+import useDatasetList, { DatasetCounts } from '@/hooks/useDatasetList';
 import { Button } from '@headlessui/react';
-import { FaRegTrashAlt } from 'react-icons/fa';
+import { FaFilm, FaRegImage, FaRegTrashAlt, FaVolumeUp } from 'react-icons/fa';
 import { openConfirm } from '@/components/ConfirmModal';
 import { TopBar, MainContent } from '@/components/layout';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
 import { apiClient } from '@/utils/api';
 import { useRouter } from 'next/navigation';
+import classNames from 'classnames';
+
+type SortOrder = 'name-asc' | 'name-desc' | 'items-asc' | 'items-desc';
+
+const SORT_OPTIONS: { value: SortOrder; label: string }[] = [
+  { value: 'name-asc', label: 'Name ↑' },
+  { value: 'name-desc', label: 'Name ↓' },
+  { value: 'items-desc', label: 'Items ↓' },
+  { value: 'items-asc', label: 'Items ↑' },
+];
+
+function TypeToggle({
+  icon: Icon,
+  label,
+  checked,
+  onChange,
+}: {
+  icon: React.ComponentType;
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      title={`${checked ? 'Hide' : 'Show'} ${label}`}
+      onClick={() => onChange(!checked)}
+      className={classNames(
+        'p-1.5 rounded-sm border transition-colors',
+        checked ? 'border-gray-600 bg-gray-800 text-gray-200' : 'border-gray-800 bg-transparent text-gray-600',
+      )}
+    >
+      <Icon />
+    </button>
+  );
+}
+
+function ItemCountBadge({ counts }: { counts: DatasetCounts | null }) {
+  if (!counts) {
+    return <span className="text-xs text-gray-500">—</span>;
+  }
+  return (
+    <span className="inline-flex items-center gap-2">
+      <span className="bg-green-900/60 text-green-400 border border-green-700/60 rounded-full px-2 py-0.5 text-xs font-medium">
+        {counts.total}
+      </span>
+      {counts.image > 0 && (
+        <span className="inline-flex items-center gap-1 text-xs text-gray-400">
+          <FaRegImage /> {counts.image}
+        </span>
+      )}
+      {counts.video > 0 && (
+        <span className="inline-flex items-center gap-1 text-xs text-gray-400">
+          <FaFilm /> {counts.video}
+        </span>
+      )}
+      {counts.audio > 0 && (
+        <span className="inline-flex items-center gap-1 text-xs text-gray-400">
+          <FaVolumeUp /> {counts.audio}
+        </span>
+      )}
+    </span>
+  );
+}
 
 export default function Datasets() {
   const router = useRouter();
   const { datasets, status, refreshDatasets } = useDatasetList();
   const [newDatasetName, setNewDatasetName] = useState('');
   const [isNewDatasetModalOpen, setIsNewDatasetModalOpen] = useState(false);
+  const [filterText, setFilterText] = useState('');
+  const [visibleTypes, setVisibleTypes] = useState({ image: true, video: true, audio: true });
+  const [sortOrder, setSortOrder] = useState<SortOrder>('name-asc');
 
-  // Transform datasets array into rows with objects
-  const tableRows = datasets.map(dataset => ({
-    name: dataset,
-    actions: dataset, // Pass full dataset name for actions
-  }));
+  // Transform datasets array into rows with objects, applying the name
+  // filter, the type visibility toggles, and the sort order.
+  const tableRows = useMemo(() => {
+    const filter = filterText.trim().toLowerCase();
+    const anyTypeChecked = visibleTypes.image || visibleTypes.video || visibleTypes.audio;
+    const rows = datasets
+      .filter(dataset => !filter || dataset.name.toLowerCase().includes(filter))
+      .filter(
+        dataset =>
+          !anyTypeChecked ||
+          (dataset.counts !== null &&
+            ((visibleTypes.image && dataset.counts.image > 0) ||
+              (visibleTypes.video && dataset.counts.video > 0) ||
+              (visibleTypes.audio && dataset.counts.audio > 0))),
+      );
+    rows.sort((a, b) => {
+      switch (sortOrder) {
+        case 'name-asc':
+          return a.name.localeCompare(b.name);
+        case 'name-desc':
+          return b.name.localeCompare(a.name);
+        case 'items-asc':
+          return (a.counts?.total ?? -1) - (b.counts?.total ?? -1) || a.name.localeCompare(b.name);
+        case 'items-desc':
+          return (b.counts?.total ?? -1) - (a.counts?.total ?? -1) || a.name.localeCompare(b.name);
+      }
+    });
+    return rows.map(dataset => ({ name: dataset.name, counts: dataset.counts }));
+  }, [datasets, filterText, visibleTypes, sortOrder]);
 
   const columns: TableColumn[] = [
     {
@@ -34,6 +125,11 @@ export default function Datasets() {
           {row.name}
         </Link>
       ),
+    },
+    {
+      title: 'Items',
+      key: 'counts',
+      render: row => <ItemCountBadge counts={row.counts} />,
     },
     {
       title: 'Actions',
@@ -115,6 +211,46 @@ export default function Datasets() {
       <TopBar>
         <div>
           <h1 className="text-base sm:text-lg">Datasets</h1>
+        </div>
+        <div className="flex items-center gap-2 ml-2 min-w-0">
+          <input
+            type="text"
+            value={filterText}
+            onChange={e => setFilterText(e.target.value)}
+            placeholder="Filter..."
+            className="w-32 sm:w-48 text-sm px-2 py-1 bg-gray-950 dark:bg-gray-800 border border-gray-700 rounded-sm text-gray-100 placeholder:text-gray-500 focus:ring-2 focus:ring-gray-600 focus:border-transparent focus:outline-none"
+          />
+          <div className="flex items-center gap-1">
+            <TypeToggle
+              icon={FaRegImage}
+              label="image datasets"
+              checked={visibleTypes.image}
+              onChange={checked => setVisibleTypes(prev => ({ ...prev, image: checked }))}
+            />
+            <TypeToggle
+              icon={FaFilm}
+              label="video datasets"
+              checked={visibleTypes.video}
+              onChange={checked => setVisibleTypes(prev => ({ ...prev, video: checked }))}
+            />
+            <TypeToggle
+              icon={FaVolumeUp}
+              label="audio datasets"
+              checked={visibleTypes.audio}
+              onChange={checked => setVisibleTypes(prev => ({ ...prev, audio: checked }))}
+            />
+          </div>
+          <select
+            value={sortOrder}
+            onChange={e => setSortOrder(e.target.value as SortOrder)}
+            className="text-sm px-2 py-1 bg-gray-950 dark:bg-gray-800 border border-gray-700 rounded-sm text-gray-100 focus:outline-none"
+          >
+            {SORT_OPTIONS.map(option => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="flex-1"></div>
         <div>

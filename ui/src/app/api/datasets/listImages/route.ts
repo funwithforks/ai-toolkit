@@ -4,6 +4,7 @@ import path from 'path';
 import zlib from 'zlib';
 import { promisify } from 'util';
 import { getDatasetsRoot } from '@/server/settings';
+import { mediaExtensions } from '@/server/datasetCounts';
 
 const brotliCompress = promisify(zlib.brotliCompress);
 const gzipCompress = promisify(zlib.gzip);
@@ -74,7 +75,6 @@ export async function POST(request: Request) {
  * @returns Array of absolute paths to image files
  */
 async function findImagesRecursively(dir: string): Promise<string[]> {
-  const imageExtensions = ['.png', '.jpg', '.jpeg', '.webp', '.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv', '.mp3', '.wav', '.flac', '.ogg'];
   let results: string[] = [];
 
   // withFileTypes avoids a separate stat per entry — a big win on large datasets.
@@ -92,7 +92,7 @@ async function findImagesRecursively(dir: string): Promise<string[]> {
       subdirs.push(itemPath);
     } else if (entry.isFile()) {
       const ext = path.extname(name).toLowerCase();
-      if (imageExtensions.includes(ext)) {
+      if (mediaExtensions.includes(ext)) {
         results.push(itemPath);
       }
     }

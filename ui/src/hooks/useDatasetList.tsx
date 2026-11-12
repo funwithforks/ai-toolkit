@@ -3,8 +3,21 @@
 import { useEffect, useState } from 'react';
 import { apiClient } from '@/utils/api';
 
+export interface DatasetCounts {
+  image: number;
+  video: number;
+  audio: number;
+  total: number;
+}
+
+export interface DatasetInfo {
+  name: string;
+  // null when the server could not count this dataset (e.g. unreadable folder)
+  counts: DatasetCounts | null;
+}
+
 export default function useDatasetList() {
-  const [datasets, setDatasets] = useState<string[]>([]);
+  const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
 
   const refreshDatasets = () => {
@@ -15,7 +28,7 @@ export default function useDatasetList() {
       .then(data => {
         console.log('Datasets:', data);
         // sort
-        data.sort((a: string, b: string) => a.localeCompare(b));
+        data.sort((a: DatasetInfo, b: DatasetInfo) => a.name.localeCompare(b.name));
         setDatasets(data);
         setStatus('success');
       })
