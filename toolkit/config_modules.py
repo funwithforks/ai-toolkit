@@ -968,7 +968,24 @@ class SliderConfig:
                 self.targets.append(target)
         print(f"Built {len(self.targets)} slider targets (with permutations)")
 
-ControlTypes = Literal['depth', 'line', 'pose', 'inpaint', 'mask', 'sapiens2_mask']
+# conditioning image types a dataset can generate (<image_dir>/_controls/<type>/)
+# and latent-cache in phase 1
+ControlTypes = Literal['depth', 'line', 'pose']
+
+# mask models that can be run to produce masks under the dataset
+MaskModelType = Literal['birefnet', 'sapiens2']
+
+# every source a loss mask can come from: the training image's own alpha
+# channel, a mask model run, or pre-made files pointed at by mask_path
+MaskSource = Literal['alpha', 'birefnet', 'sapiens2']
+
+MASK_SOURCE_VALUES = ('alpha', 'birefnet', 'sapiens2')
+MASK_MODEL_VALUES = ('birefnet', 'sapiens2')
+# static execution order for mask model passes: every run derives the same
+# order from this tuple, so a given config always generates identically
+MASK_MODEL_PASS_ORDER = ('birefnet', 'sapiens2')
+# static execution order for conditioning generation passes
+CONTROL_PASS_ORDER = ('depth', 'line', 'pose')
 
 class DatasetConfig:
     """
@@ -1060,15 +1077,35 @@ class DatasetConfig:
         # inpaint images should be webp/png images with alpha channel. The alpha 0 (invisible) section will
         # be the part conditioned to be inpainted. The alpha 1 (visible) section will be the part that is ignored
         self.inpaint_path: Union[str,List[str]] = kwargs.get('inpaint_path', None)
+        # mask model run to generate the inpaint mask under the dataset
+        # (<image_dir>/_masks/inpaint/). No consumer ever uses the inpaint
+        # image's RGB -- only its mask channel -- so inpaint generation is a
+        # mask pass with the inverted "erased region" packaging.
+        self.inpaint_source: Union[MaskModelType, None] = kwargs.get('inpaint_source', None)
         # instead of cropping ot match image, it will serve the full size control image (clip images ie for ip adapters)
         self.full_size_control_images: bool = kwargs.get('full_size_control_images', True)
-        self.alpha_mask: bool = kwargs.get('alpha_mask', False)  # if true, will use alpha channel as mask
+        # what produces the loss mask. None = no masking. 'alpha' uses the
+        # training image's own alpha channel; a mask model name generates the
+        # mask under the dataset (<image_dir>/_masks/<source>/) during the
+        # phase-1 masking pass; mask_path below serves pre-made files instead.
+        self.mask_source: Union[MaskSource, None] = kwargs.get('mask_source', None)
         self.mask_path: str = kwargs.get('mask_path',
                                          None)  # focus mask (black and white. White has higher loss than black)
         self.unconditional_path: str = kwargs.get('unconditional_path',
                                                   None)  # path where matching unconditional images are located
         self.invert_mask: bool = kwargs.get('invert_mask', False)  # invert mask
-        self.mask_min_value: float = kwargs.get('mask_min_value', 0.0)  # min value for . 0 - 1
+        # loss weight floor for masked-OUT regions. 0.0 would drop the
+        # background from the loss entirely; the default keeps it training at
+        # half weight (the loss multiplier renormalizes by the mask mean).
+        self.mask_min_value: float = kwargs.get('mask_min_value', 0.5)
+        if self.mask_source is not None and self.mask_source not in MASK_SOURCE_VALUES:
+            raise ValueError(
+                f"dataset config: mask_source must be one of {MASK_SOURCE_VALUES} or None, got {self.mask_source!r}"
+            )
+        if self.inpaint_source is not None and self.inpaint_source not in MASK_MODEL_VALUES:
+            raise ValueError(
+                f"dataset config: inpaint_source must be one of {MASK_MODEL_VALUES} or None, got {self.inpaint_source!r}"
+            )
         self.poi: Union[str, None] = kwargs.get('poi', None)
         if self.poi is not None:
             raise ValueError("poi is deprecated and is no longer supported")
@@ -1161,12 +1198,49 @@ class DatasetConfig:
         # debug the frame count and frame selection. You dont need this. It is for debugging.
         self.debug: bool = kwargs.get('debug', False)
         
-        # automatic controls
-        self.controls: List[ControlTypes] = kwargs.get('controls', [])
-        if isinstance(self.controls, str):
-            self.controls = [self.controls]
-        # remove empty strings
-        self.controls = [control for control in self.controls if control.strip() != '']
+        # conditioning image types to generate under the dataset and
+        # latent-cache in phase 1. Custom folders (control_path etc.) are
+        # independent of this list and stay as-is.
+        self.control_types: List[ControlTypes] = kwargs.get('control_types', [])
+        if isinstance(self.control_types, str):
+            self.control_types = [self.control_types]
+        self.control_types = [c for c in self.control_types if isinstance(c, str) and c.strip() != '']
+        for control_type in self.control_types:
+            if control_type not in ('depth', 'line', 'pose'):
+                raise ValueError(
+                    f"dataset config: control_types entries must be 'depth', 'line' or 'pose', got {control_type!r}"
+                )
+
+        # legacy translation for configs saved before the masking/conditioning
+        # split (field names changed; previously generated files are orphaned,
+        # not migrated). Translated on load so old job configs keep working.
+        legacy_controls = kwargs.get('controls', None)
+        legacy_alpha_mask = kwargs.get('alpha_mask', False)
+        if legacy_controls or legacy_alpha_mask:
+            if isinstance(legacy_controls, str):
+                legacy_controls = [legacy_controls]
+            for legacy_control in (legacy_controls or []):
+                if legacy_control == 'mask':
+                    self.mask_source = self.mask_source or 'birefnet'
+                elif legacy_control == 'sapiens2_mask':
+                    self.mask_source = self.mask_source or 'sapiens2'
+                elif legacy_control == 'inpaint':
+                    self.inpaint_source = self.inpaint_source or 'birefnet'
+                elif legacy_control in ('depth', 'line', 'pose'):
+                    if legacy_control not in self.control_types:
+                        self.control_types.append(legacy_control)
+                else:
+                    raise ValueError(
+                        f"dataset config: unknown legacy controls entry {legacy_control!r}"
+                    )
+            if legacy_alpha_mask and self.mask_source is None:
+                self.mask_source = 'alpha'
+            print(
+                "dataset config: translated legacy fields "
+                f"(controls={legacy_controls}, alpha_mask={legacy_alpha_mask}) to "
+                f"mask_source={self.mask_source!r}, inpaint_source={self.inpaint_source!r}, "
+                f"control_types={self.control_types}"
+            )
         
         # if true, will use a fask method to get image sizes. This can result in errors. Do not use unless you know what you are doing
         self.fast_image_size: bool = kwargs.get('fast_image_size', False)

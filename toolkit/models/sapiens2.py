@@ -1070,15 +1070,16 @@ class Sapiens2Matting(nn.Module):
         import huggingface_hub
         from safetensors.torch import load_file
 
-        safetensors_path = os.path.join(MODELS_PATH, "sapiens2", filename)
+        safetensors_path = os.path.join(MODELS_PATH, "mask", "sapiens2", filename)
         if not os.path.exists(safetensors_path):
             print(f"Downloading pretrained weights from HuggingFace Hub: {repo_id}/{filename}...")
             os.makedirs(os.path.dirname(safetensors_path), exist_ok=True)
             safetensors_path = huggingface_hub.hf_hub_download(
                 repo_id=repo_id,
                 filename=filename,
-                local_dir=os.path.join(MODELS_PATH, "sapiens2"),
+                local_dir=os.path.join(MODELS_PATH, "mask", "sapiens2"),
             )
+        print(f"Loading mask model sapiens2 from {safetensors_path}")
         model = cls(arch=arch, img_size=img_size, patch_size=patch_size)
         state_dict = load_file(safetensors_path)
         model.load_state_dict(state_dict)

@@ -21,8 +21,8 @@ from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, Sigl
 from toolkit.audio.preserve_pitch import time_stretch_preserve_pitch
 from toolkit.basic import UnusableFileError, flush, get_quick_signature_string, value_map
 from toolkit.buckets import get_bucket_for_image_size, get_resolution
-from toolkit.config_modules import ControlTypes
-from toolkit.control_generator import ControlGenerator
+from toolkit.config_modules import ControlTypes, MASK_MODEL_PASS_ORDER, MASK_MODEL_VALUES
+from toolkit.control_generator import ControlGenerator, generated_image_save_path
 from toolkit.dto import DTO, DISK_PREFIX
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatible
@@ -933,8 +933,9 @@ class ImageProcessingDTOMixin:
             np_img = np_img[:, :, :3]
             img = Image.fromarray(np_img)
 
-        # load_rgba keeps a 4th channel for models with an RGBA VAE. alpha_mask
-        # consumes the alpha itself, so the two are mutually exclusive.
+        # load_rgba keeps a 4th channel for models with an RGBA VAE. A mask
+        # source of 'alpha' consumes the alpha itself, so the two are mutually
+        # exclusive.
         if self.load_rgba and not self.use_alpha_as_mask:
             # sources without alpha get a fully opaque one
             img = img.convert('RGBA')
@@ -1630,19 +1631,30 @@ class MaskFileItemDTOMixin:
         self.use_alpha_as_mask: bool = False
         dataset_config: 'DatasetConfig' = kwargs.get('dataset_config', None)
         self.mask_min_value = dataset_config.mask_min_value
-        if dataset_config.alpha_mask:
+        if dataset_config.mask_source == 'alpha':
             self.use_alpha_as_mask = True
             self.mask_path = kwargs.get('path', None)
             self.has_mask_image = True
+        elif dataset_config.mask_source is not None:
+            # generated masks live under <image_dir>/_masks/<source>/ and are
+            # produced by the phase-1 masking pass before training begins
+            img_path = kwargs.get('path', None)
+            mask_dir = os.path.join(
+                os.path.dirname(img_path), '_masks', dataset_config.mask_source)
+            file_name_no_ext = os.path.splitext(os.path.basename(img_path))[0]
+            for ext in img_ext_list:
+                candidate = os.path.join(mask_dir, file_name_no_ext + ext)
+                if os.path.exists(candidate):
+                    self.mask_path = candidate
+                    self.has_mask_image = True
+                    break
         elif dataset_config.mask_path is not None:
-            # find the control image path
-            mask_path = dataset_config.mask_path if dataset_config.mask_path is not None else dataset_config.alpha_mask
-            # we are using control images
+            # custom mask folder; files matched to images by filename stem
             img_path = kwargs.get('path', None)
             file_name_no_ext = os.path.splitext(os.path.basename(img_path))[0]
             for ext in img_ext_list:
-                if os.path.exists(os.path.join(mask_path, file_name_no_ext + ext)):
-                    self.mask_path = os.path.join(mask_path, file_name_no_ext + ext)
+                if os.path.exists(os.path.join(dataset_config.mask_path, file_name_no_ext + ext)):
+                    self.mask_path = os.path.join(dataset_config.mask_path, file_name_no_ext + ext)
                     self.has_mask_image = True
                     break
 
@@ -3027,11 +3039,11 @@ class ControlCachingMixin:
             super().__init__(**kwargs)
             self.control_generator: ControlGenerator = None
     
-    def add_control_path_to_file_item(self: 'AiToolkitDataset', file_item: 'FileItemDTO', control_path: str, control_type: ControlTypes):
-        if control_type == 'inpaint':
+    def add_control_path_to_file_item(self: 'AiToolkitDataset', file_item: 'FileItemDTO', control_path: str, gen_type: str):
+        if gen_type == 'inpaint':
             file_item.inpaint_path = control_path
             file_item.has_inpaint_image = True
-        elif control_type == 'mask' or control_type == 'sapiens2_mask':
+        elif gen_type in ('birefnet', 'sapiens2'):
             file_item.mask_path = control_path
             file_item.has_mask_image = True
         else:
@@ -3045,28 +3057,65 @@ class ControlCachingMixin:
                 raise Exception(f"Error: control_path is not a string or list: {file_item.control_path}")
             file_item.has_control_image = True
 
+    def _generate_images_for_file_items(
+            self: 'AiToolkitDataset', generator: 'ControlGenerator', gen_types: List[str], label: str):
+        """Generate every requested image type for this dataset's file items,
+        wiring the resulting paths on as they are produced. Existing files are
+        reused, so this is idempotent across runs."""
+        for file_item in tqdm(self.file_list, desc=f'Generating {label}'):
+            for gen_type in gen_types:
+                gen_path = generator.get_control_path(file_item.path, gen_type)
+                if gen_path is not None:
+                    self.add_control_path_to_file_item(file_item, gen_path, gen_type)
+
+    def generate_mask_model_files(self: 'AiToolkitDataset', generator: 'ControlGenerator', mask_model: str):
+        """One mask model pass for this dataset: generate every mask variant
+        the dataset requested from that model and wire the paths. The model
+        is already loaded by the caller's pass loop."""
+        gen_types = self.mask_model_requests.get(mask_model, [])
+        if not gen_types:
+            return
+        print_acc(f"Generating {'/'.join(gen_types)} masks for {self.dataset_path}")
+        self._generate_images_for_file_items(generator, gen_types, f'{mask_model} masks')
+
+    def generate_conditioning_files(self: 'AiToolkitDataset', generator: 'ControlGenerator', control_type: str):
+        """One conditioning model pass for this dataset."""
+        print_acc(f"Generating '{control_type}' conditioning for {self.dataset_path}")
+        self._generate_images_for_file_items(generator, [control_type], f'{control_type} controls')
+
+    def mask_generation_complete(self: 'AiToolkitDataset') -> bool:
+        """True when every mask variant this dataset wants already exists on
+        disk. This is the phases-guard question for the masking sub-phase."""
+        for file_item in self.file_list:
+            for gen_types in self.mask_model_requests.values():
+                for gen_type in gen_types:
+                    if not os.path.exists(generated_image_save_path(file_item.path, gen_type)):
+                        return False
+        return True
+
+    def conditioning_generation_complete(self: 'AiToolkitDataset') -> bool:
+        """Same question for generated conditioning images."""
+        for file_item in self.file_list:
+            for control_type in self.dataset_config.control_types:
+                if not os.path.exists(generated_image_save_path(file_item.path, control_type)):
+                    return False
+        return True
+
     def setup_controls(self: 'AiToolkitDataset'):
-        if not self.is_generating_controls:
+        """Legacy (non-deferred) path used by generator jobs: run every
+        generation pass this dataset wants, one model load per type."""
+        wants_masks = any(self.mask_model_requests.values())
+        wants_conditioning = len(self.dataset_config.control_types) > 0
+        if not wants_masks and not wants_conditioning:
             return
         with torch.no_grad():
-            print_acc(f"Generating controls for {self.dataset_path}")
             device = self.sd.device
-            
-            self.control_generator = ControlGenerator(
-                device=device,
-                sd=self.sd,
-            )
-
-            # use tqdm to show progress
-            for file_item in tqdm(self.file_list, desc=f'Generating Controls'):
-                for control_type in self.dataset_config.controls:
-                    # generates the control if it is not already there
-                    control_path = self.control_generator.get_control_path(file_item.path, control_type)
-                    if control_path is not None:
-                        self.add_control_path_to_file_item(file_item, control_path, control_type)
-                
-            # remove models
-            self.control_generator.cleanup()
-            self.control_generator = None
-            
+            generator = ControlGenerator(device=device, sd=self.sd)
+            try:
+                for mask_model in MASK_MODEL_PASS_ORDER:
+                    self.generate_mask_model_files(generator, mask_model)
+                for control_type in self.dataset_config.control_types:
+                    self.generate_conditioning_files(generator, control_type)
+            finally:
+                generator.cleanup()
             flush()

@@ -12,19 +12,13 @@ from tqdm import tqdm
 # allow importing from project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from toolkit.control_generator import ControlGenerator, img_ext_list
+from toolkit.control_generator import ControlGenerator, generated_image_save_path, img_ext_list
 
 
-def control_exists(img_path, control_type):
+def control_exists(img_path, gen_type):
     # mirrors the lookup in ControlGenerator.get_control_path so we can skip
     # images another instance has already finished
-    controls_folder = os.path.join(os.path.dirname(img_path), "_controls")
-    file_name_no_ext = os.path.splitext(os.path.basename(img_path))[0]
-    file_name_no_ext_control = f"{file_name_no_ext}.{control_type}"
-    for ext in img_ext_list:
-        if os.path.exists(os.path.join(controls_folder, file_name_no_ext_control + ext)):
-            return True
-    return False
+    return os.path.exists(generated_image_save_path(img_path, gen_type))
 
 
 # sentinel pushed through the queues to tell workers to stop
@@ -158,9 +152,9 @@ def main():
     parser.add_argument(
         "--control",
         type=str,
-        default="mask",
-        choices=["mask", "inpaint", "depth", "pose", "line", "sapiens2_mask"],
-        help="Control type to generate (default: mask)",
+        default="sapiens2",
+        choices=["birefnet", "inpaint", "sapiens2", "depth", "pose", "line"],
+        help="Image type to generate (default: sapiens2)",
     )
     parser.add_argument(
         "--device", type=str, default="cuda", help="Device to run on (default: cuda)"
@@ -196,10 +190,10 @@ def main():
         print(f"Error: {img_dir} is not a directory")
         sys.exit(1)
 
-    # find images, skipping existing _controls folders and hidden files
+    # find images, skipping existing generation folders and hidden files
     img_list = []
     for root, dirs, files in os.walk(img_dir):
-        if "_controls" in root:
+        if "_controls" in root or "_masks" in root or "_latent_cache" in root:
             continue
         for file in files:
             if file.startswith("."):

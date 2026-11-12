@@ -64,7 +64,8 @@ from tqdm import tqdm
 
 from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, NetworkConfig, TrainConfig, ModelConfig, \
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
-    DecoratorConfig
+    DecoratorConfig, MASK_MODEL_PASS_ORDER, CONTROL_PASS_ORDER
+from toolkit.control_generator import ControlGenerator
 from toolkit.logging_aitk import create_logger
 from toolkit.ragged import RaggedBatch, is_ragged
 from diffusers import FluxTransformer2DModel
@@ -2058,6 +2059,54 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if was_unet_training:
             self.sd.unet.train()
 
+    def _run_masking_pass(self, all_dataset_objs):
+        """One model load per mask model; every dataset requesting that model
+        is served in the same pass, then the model is freed before the next
+        one loads. Models no dataset requests are never printed or loaded."""
+        requests = {}  # mask model -> [datasets]
+        for ds in all_dataset_objs:
+            for mask_model in ds.mask_model_requests:
+                requests.setdefault(mask_model, []).append(ds)
+        generator = ControlGenerator(device=self.sd.device, sd=self.sd)
+        try:
+            for mask_model in MASK_MODEL_PASS_ORDER:
+                datasets = requests.get(mask_model, [])
+                if not datasets:
+                    continue
+                print_acc(
+                    f"Mask pass: loading '{mask_model}' for "
+                    f"{len(datasets)} dataset(s)"
+                )
+                for ds in datasets:
+                    ds.generate_mask_model_files(generator, mask_model)
+        finally:
+            # frees the mask model and restores anything the pass parked
+            generator.cleanup()
+        flush()
+
+    def _run_conditioning_generation_pass(self, all_dataset_objs):
+        """One model load per conditioning type; every dataset wanting that
+        type is served in the same pass."""
+        requests = {}  # control type -> [datasets]
+        for ds in all_dataset_objs:
+            for control_type in ds.dataset_config.control_types:
+                requests.setdefault(control_type, []).append(ds)
+        generator = ControlGenerator(device=self.sd.device, sd=self.sd)
+        try:
+            for control_type in CONTROL_PASS_ORDER:
+                datasets = requests.get(control_type, [])
+                if not datasets:
+                    continue
+                print_acc(
+                    f"Conditioning pass: generating '{control_type}' for "
+                    f"{len(datasets)} dataset(s)"
+                )
+                for ds in datasets:
+                    ds.generate_conditioning_files(generator, control_type)
+        finally:
+            generator.cleanup()
+        flush()
+
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
@@ -2217,6 +2266,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # changing it while validation is untested breaks component loading.
         # Paired clause on the TE gate: SDTrainer.needs_text_encoder_load.
         _phase1 = 1 in self.train_config.phases
+
+        # ### generated conditioning images (early phase 1) ###
+        # conditioning models need no vae and nothing is resident yet, so
+        # their passes run before the vae load: one model per type, every
+        # dataset wanting it served in that pass, the model freed before the
+        # vae arrives. The latent cache below then encodes them like targets.
+        _conditioning_incomplete = any(
+            ds.is_generating_conditioning and not ds.conditioning_generation_complete()
+            for ds in all_dataset_objs
+        )
+        if _conditioning_incomplete and not _phase1:
+            if 3 in self.train_config.phases:
+                raise ValueError(
+                    "phases excludes 1 but generated conditioning images are "
+                    "still missing: include phase 1 or generate them first"
+                )
+        elif _phase1 and any(
+            ds.is_generating_conditioning for ds in all_dataset_objs
+        ):
+            self._run_conditioning_generation_pass(all_dataset_objs)
+
         if not _phase1:
             # a skipped phase may not be one phase 3 still consumes. same
             # simple question as the gate itself: are latents needed and not
@@ -2262,6 +2332,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc("VAE unloaded for the rest of training")
             self.sd.vae = None
         flush()
+
+        # ### masking sub-phase (phase 1) ###
+        # mask models run one at a time, after the iron rule: in the common
+        # cached case nothing is resident, so the mask model loads alone and
+        # every dataset requesting it is served in the same pass. In 'keep'
+        # mode the vae is still resident; the generator parks it on cpu via
+        # the device-state machinery for the duration (reason printed) and
+        # restores it after.
+        _masking_incomplete = any(
+            any(ds.mask_model_requests.values()) and not ds.mask_generation_complete()
+            for ds in all_dataset_objs
+        )
+        if _masking_incomplete and not _phase1:
+            if 3 in self.train_config.phases:
+                raise ValueError(
+                    "phases excludes 1 but generated masks are still "
+                    "missing: include phase 1 or generate the masks first"
+                )
+        elif _phase1 and any(
+            any(ds.mask_model_requests.values()) for ds in all_dataset_objs
+        ):
+            self._run_masking_pass(all_dataset_objs)
 
         if (
             2 not in self.train_config.phases
@@ -2313,9 +2405,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             "the dataset config."
                         )
                     dataset.cache_text_embeddings()
-                if dataset.is_generating_controls:
-                    # always do this last
-                    dataset.setup_controls()
 
             # validation prompt embeds (the latents half ran in phase 1)
             self.setup_validation_embeds()

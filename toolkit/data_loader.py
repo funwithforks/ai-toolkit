@@ -18,7 +18,13 @@ import albumentations as A
 
 from toolkit import image_utils
 from toolkit.buckets import get_bucket_for_image_size, BucketResolution
-from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
+from toolkit.config_modules import (
+    DatasetConfig,
+    preprocess_dataset_raw_config,
+    MASK_MODEL_PASS_ORDER,
+    MASK_MODEL_VALUES,
+)
+from toolkit.control_generator import ControlGenerator
 from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
@@ -502,7 +508,20 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.is_caching_latents_to_memory = dataset_config.cache_latents
         self.is_caching_latents_to_disk = dataset_config.cache_latents_to_disk
         self.is_caching_clip_vision_to_disk = dataset_config.cache_clip_vision_to_disk
-        self.is_generating_controls = len(dataset_config.controls) > 0
+        # what this dataset wants generated, keyed by mask model so one model
+        # load serves every variant it produces ('birefnet' serves both the
+        # birefnet loss masks and the inpaint packaging). The pass order is
+        # static so every run generates identically.
+        self.mask_model_requests: dict = {}
+        if dataset_config.mask_source in MASK_MODEL_VALUES:
+            self.mask_model_requests.setdefault(dataset_config.mask_source, []).append(
+                dataset_config.mask_source)
+        if dataset_config.inpaint_source is not None:
+            self.mask_model_requests.setdefault(dataset_config.inpaint_source, []).append('inpaint')
+        self.mask_model_requests = {
+            model: gen_types for model, gen_types in self.mask_model_requests.items()
+        }
+        self.is_generating_conditioning = len(dataset_config.control_types) > 0
         self.epoch_num = 0
         # (file_list index, flip_x, flip_y) per training slot; used by the
         # non-bucket fetch path, buckets use batch_indices (same tuples)
@@ -765,9 +784,19 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     self.cache_clip_vision_to_disk()
                 if self.is_caching_text_embeddings:
                     self.cache_text_embeddings()
-                if self.is_generating_controls:
-                    # always do this last
-                    self.setup_controls()
+                # generation passes: one model load per type, reused across
+                # every file item; existing generated files are reused as-is
+                wants_masks = any(self.mask_model_requests.values())
+                if wants_masks or self.is_generating_conditioning:
+                    generator = ControlGenerator(device=self.sd.device, sd=self.sd)
+                    try:
+                        for mask_model in MASK_MODEL_PASS_ORDER:
+                            self.generate_mask_model_files(generator, mask_model)
+                        for control_type in self.dataset_config.control_types:
+                            self.generate_conditioning_files(generator, control_type)
+                    finally:
+                        generator.cleanup()
+                        flush()
         self.epoch_num += 1
 
     def __getstate__(self):

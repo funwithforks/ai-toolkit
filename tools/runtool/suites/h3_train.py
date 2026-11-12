@@ -65,6 +65,12 @@ _kit = TrainerKit(
         "cutlass_bwd": _MK + ".int8_cutlass_bwd",
         "cutlass_fwd": _MK + ".int8_cutlass_gemm",
     },
+    extra_markers={
+        "mask_pass": r"Mask pass: loading '(?P<model>\S+)' for (?P<ndatasets>\d+) dataset",
+        "mask_gen": r"Generating (?P<types>\S+) masks for",
+        "conditioning_pass": r"Conditioning pass: generating '(?P<ctype>\S+)' for",
+        "mask_guard_refused": r"phases excludes 1 but generated masks are still",
+    },
     extra_flags=lambda params: [
         *([] if params.get("varlen", True) else ["novarlen"]),
         *([] if params.get("rope", True) else ["norope"]),

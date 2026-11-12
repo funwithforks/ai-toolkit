@@ -272,6 +272,11 @@ def patchable(prefix):
         f"{prefix}.save.max_step_saves_to_keep",
         f"{prefix}.datasets[0].caption_dropout_rate",
         f"{prefix}.datasets[0].num_repeats",
+        # dataset-level masking/conditioning (loss masks are model-agnostic;
+        # generation happens in the phase-1 passes)
+        f"{prefix}.datasets[0].mask_source",
+        f"{prefix}.datasets[0].inpaint_source",
+        f"{prefix}.datasets[0].control_types",
     )
 
 
