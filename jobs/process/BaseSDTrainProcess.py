@@ -2239,15 +2239,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # decide how the vae lives during training. Ranked by necessity, take
         # the highest that applies: unload < reload < keep.
+        # require_vae_during_training forces 'keep' only when train-time
+        # encoding is guaranteed (controls that cannot be cached). Cacheable
+        # controls get their sidecars in phase 1 (vae_load_needed covers that
+        # load); a sidecar missing at train time falls to the printed
+        # borrow-and-return in the model's encode path.
         _model_wants_train_vae = getattr(self.sd, 'require_vae_during_training', False) and any(
-            dataset.control_latents_pending() for dataset in all_dataset_objs
+            ds.control_encode_live() for ds in all_dataset_objs
         )
         if not self.is_latents_cached:
             # training encodes every batch; the vae must stay loaded
             self.vae_training_mode = 'keep'
         elif _model_wants_train_vae:
-            # the model encodes at train time (e.g. edit-mode reference images)
-            # and at least one control reference latent is not cached
+            # the model encodes at train time and at least one control is
+            # not cacheable (same-folder pairing, aug replay, non-raw)
             self.vae_training_mode = 'keep'
         elif not self.train_config.disable_sampling:
             # only sampling needs it: load on demand per sample round
@@ -2334,23 +2339,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if dataset.is_caching_clip_vision_to_disk:
                     dataset.cache_clip_vision_to_disk()
             self.setup_validation_latents()
-
-        # the control reference pass above may have completed the sidecars: a
-        # model that declared train-time vae encoding no longer needs it, so
-        # downgrade 'keep' here and let the iron rule below free the vae
-        if (
-            self.vae_training_mode == 'keep'
-            and self.is_latents_cached
-            and getattr(self.sd, 'require_vae_during_training', False)
-            and not any(ds.control_latents_pending() for ds in all_dataset_objs)
-        ):
-            self.vae_training_mode = (
-                'reload' if not self.train_config.disable_sampling else 'unload'
-            )
-            print_acc(
-                "Control reference latents cached in phase 1 - the vae will "
-                "not stay resident for training"
-            )
         flush()
         # IRON RULE: at the phase 1 -> 2 boundary the vae must never be left
         # resident unless vae_training_mode is 'keep' (live per-batch latent

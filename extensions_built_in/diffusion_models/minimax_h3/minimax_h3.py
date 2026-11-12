@@ -990,6 +990,12 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
         # conditioning encodes borrow it for this call and hand it back
         loaded_here = self.vae is None
         if loaded_here:
+            # a forced load declares itself: reaching this branch means a
+            # reference latent sidecar was missing or invalid for this batch
+            print_acc(
+                "Control reference latent not cached - borrowing the vae "
+                "for this encode (run phase 1 to cache reference latents)"
+            )
             self.load_vae()
         if self.vae.device == torch.device("cpu"):
             self.vae.to(self.vae_device_torch)

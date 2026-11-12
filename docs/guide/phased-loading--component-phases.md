@@ -95,18 +95,18 @@ requests is never printed or loaded
 - **Mask models** download into `MODELS_PATH/mask|control/<name>/` via
   `_ensure_local_model_dir`, never the ambient hf cache.
 
-## Reference latents and the post-phase-1 residency downgrade
+## Reference latents and train-time vae residency
 
 Models that declare `require_vae_during_training` (edit-mode reference
-encoding) keep the vae only while control reference sidecars are pending
-([embed caches §7](./phased-loading--embed-caches.md)). Because sidecar
-completion is only known *after* the phase-1 passes, the ladder
-re-evaluates right after them: if every sidecar is complete, `keep`
-downgrades to reload/unload with a printed line
-("Control reference latents cached in phase 1 - the vae will not stay
-resident for training") and the iron rule frees the vae. `vae_load_needed`
-also counts pending sidecars, so a warm run with complete sidecars never
-loads the vae at all.
+encoding) keep the vae resident **only when train-time encoding is
+guaranteed** — controls that cannot be cached (same-folder pairing, aug
+replay, non-raw). Cacheable controls get their sidecars in phase 1
+([embed caches §7](./phased-loading--embed-caches.md)); `vae_load_needed`
+counts pending sidecars so the vae loads for that pass, and a sidecar
+missing at train time falls to the printed borrow-and-return in the model's
+encode path. The ladder decides once, upfront — there is no
+decide-then-reverse: a warm run never sets `keep`, and a cold run's phase-1
+pass is what makes `keep` unnecessary.
 
 ## Sampling rounds (sample())
 
@@ -124,8 +124,8 @@ loads the vae at all.
 |---|---|---|
 | VAE phase-1 | `BaseSDTrainProcess.py` (`vae_load_needed`) | `vae_training_mode == 'keep'`, or any dataset needs live/cached latents, or control reference sidecars are pending, or validation items exist (frozen paired clause — DO NOT TOUCH) |
 | TE phase-2 | `SDTrainer.needs_text_encoder_load` | arch declares no text encoder (`has_text_encoder=False`) → **skip, prints**; any dataset `text_embedding_complete()` false; `train_text_encoder`; embed_config; validation items (frozen clause); live-encoding mode; `_compute_live_text_encoder_needed()`; `fixed_embeds_cached()` false. The encoderless refusal (`cache_pre_train_text_embeddings`, mirrored in the phase-2 dataset pass) keys on `has_text_encoder`, never on the caching flags |
-| Sampling vae preload | `BaseSDTrainProcess.py` (sample rounds) | `vae_training_mode == 'reload'` and vae absent and not `staged_sampling` |
-| Post-phase-1 downgrade | `BaseSDTrainProcess.py` (after the phase-1 passes) | never forces a load — *downgrades* a declared `require_vae_during_training` keep to reload/unload once every control reference sidecar is complete; prints the reason |
+| Sampling vae preload (non-staged models) | `BaseSDTrainProcess.py` (sample rounds) | `vae_training_mode == 'reload'` and vae absent and not `staged_sampling`. **Non-staged models only** — `staged_sampling` models skip this and load the vae in their own decode phase (see [staged sampling](./phased-loading--staged-sampling.md)) |
+| Control-encode borrow | `minimax_h3.py` (`encode_keyframe_latents`) | a reference latent sidecar is missing/invalid at train time — borrows the vae for one encode, prints the reason, hands it back. The fallback for a failed phase-1 pass, not the normal path |
 
 Rules learned the hard way in this repo (regressions, not theory):
 

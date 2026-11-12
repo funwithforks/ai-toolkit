@@ -1319,6 +1319,20 @@ class ControlFileItemDTOMixin:
         self.control_latent_list = None
         self.control_cache_keys = None
 
+    def control_encode_live(self: 'FileItemDTO') -> bool:
+        """True when this item's controls are encoded at train time no matter
+        what is cached: stochastic selection or augmentation replay makes the
+        control latent a per-step function."""
+        if self.control_path is None:
+            return False
+        if not self.use_raw_control_images:
+            return True
+        if self.aug_replay_spatial_transforms is not None:
+            return True
+        if self.dataset_config is not None and self.dataset_config.control_from_same_folder:
+            return True
+        return False
+
     def _control_latent_sidecar_path(self: 'FileItemDTO') -> str:
         return control_latent_sidecar_path(self.path)
 
@@ -2255,6 +2269,14 @@ class LatentCachingMixin:
         if self.dataset_config.control_from_same_folder:
             return False
         return any(item.control_latents_pending() for item in self.file_list)
+
+    def control_encode_live(self: 'AiToolkitDataset') -> bool:
+        """True when any control of this dataset is a per-step function
+        (stochastic selection or aug replay) and will be encoded at train
+        time no matter what is cached."""
+        if not getattr(self.sd, 'supports_control_latent_cache', False):
+            return False
+        return any(item.control_encode_live() for item in self.file_list)
 
     def cache_control_reference_latents(self: 'AiToolkitDataset'):
         """Phase-1 pass: encode every deterministic control image to a clean
