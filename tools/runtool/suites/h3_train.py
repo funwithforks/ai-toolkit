@@ -70,6 +70,8 @@ _kit = TrainerKit(
         "mask_gen": r"Generating (?P<types>\S+) masks for",
         "conditioning_pass": r"Conditioning pass: generating '(?P<ctype>\S+)' for",
         "mask_guard_refused": r"phases excludes 1 but generated masks are still",
+        "ctrl_latent_pass": r"Caching control reference latents for",
+        "vae_not_kept": r"vae will not stay resident for training",
     },
     extra_flags=lambda params: [
         *([] if params.get("varlen", True) else ["novarlen"]),

@@ -277,6 +277,7 @@ def patchable(prefix):
         f"{prefix}.datasets[0].mask_source",
         f"{prefix}.datasets[0].inpaint_source",
         f"{prefix}.datasets[0].control_types",
+        f"{prefix}.datasets[0].control_path",
     )
 
 

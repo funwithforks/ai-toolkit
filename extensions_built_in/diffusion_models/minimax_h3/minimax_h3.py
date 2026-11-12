@@ -1581,6 +1581,34 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             ref_width, ref_height, target_height, target_width
         )
 
+    # reference latents are a deterministic function of (control file, target
+    # bucket), so they cache in phase 1 and the vae does not need to stay
+    # resident for training; the ladder in BaseSDTrainProcess decides from
+    # the sidecar state
+    supports_control_latent_cache = True
+
+    def get_control_reference_size(
+        self, ref_width: int, ref_height: int, target_height: int, target_width: int
+    ):
+        as_video_frames = self._image_ref_video_frames()
+        size_fn = (
+            packing.reference_video_pixel_size
+            if as_video_frames
+            else self._reference_pixel_size
+        )
+        return size_fn(ref_width, ref_height, target_height, target_width)
+
+    def encode_control_reference(self, pixel_frames: torch.Tensor) -> torch.Tensor:
+        # pixel_frames: (1, 3, 1, ph, pw) in [-1, 1]; still refs held for
+        # image_ref_video_frames expand to a static clip here, matching
+        # _build_condition's pixel path. borrow-and-return keeps this correct
+        # whether or not the vae is resident.
+        as_video_frames = self._image_ref_video_frames()
+        if as_video_frames:
+            pixel_frames = pixel_frames.expand(
+                -1, -1, as_video_frames, -1, -1).contiguous()
+        return self.encode_keyframe_latents(pixel_frames)
+
     @property
     def text_embedding_space_version(self):
         # the presentation of image references changes the embeds -> new cache key
@@ -1635,24 +1663,36 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
                 batch, latent_shape, device, dtype
             )
         controls_per_item = None
-        if batch.control_tensor_list is not None:
+        cached_ref_latents = getattr(batch, "control_latent_list", None)
+        if cached_ref_latents is not None:
+            # phase-1 cached clean reference latents (per item, per ref:
+            # (C, T, h, w)); the per-step noise augmentation below is the only
+            # thing still applied fresh
+            ref_count = len(cached_ref_latents[0])
+            if any(len(c) != ref_count for c in cached_ref_latents):
+                raise ValueError(
+                    "ref2va: every item in a batch must have the same number of "
+                    "reference images"
+                )
+        elif batch.control_tensor_list is not None:
             controls_per_item = batch.control_tensor_list
         elif batch.control_tensor is not None:
             controls_per_item = [
                 [batch.control_tensor[b]] for b in range(batch.control_tensor.shape[0])
             ]
-        if not controls_per_item:
-            controls_per_item = (
-                [[] for _ in batch.file_items] if batch.file_items else []
-            )
+        if cached_ref_latents is None:
             if not controls_per_item:
-                return None, None, (), ()
-        ref_count = len(controls_per_item[0])
-        if any(len(c) != ref_count for c in controls_per_item):
-            raise ValueError(
-                "ref2va: every item in a batch must have the same number of "
-                "reference images"
-            )
+                controls_per_item = (
+                    [[] for _ in batch.file_items] if batch.file_items else []
+                )
+                if not controls_per_item:
+                    return None, None, (), ()
+            ref_count = len(controls_per_item[0])
+            if any(len(c) != ref_count for c in controls_per_item):
+                raise ValueError(
+                    "ref2va: every item in a batch must have the same number of "
+                    "reference images"
+                )
 
         _, h_lat, w_lat = latent_shape
         target_h, target_w = h_lat * 16, w_lat * 16
@@ -1666,45 +1706,66 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
 
         all_rows = []
         blocks = []
-        for ref_idx in range(ref_count):
-            resized = []
-            for c in controls_per_item:
-                img = c[ref_idx]
-                if img.ndim == 4:
-                    img = img[0]
-                ph, pw = size_fn(img.shape[2], img.shape[1], target_h, target_w)
-                # LANCZOS like ComfyUI / the sampling path
-                resized.append(
-                    torch.nn.functional.interpolate(
-                        img[None].to(device, torch.float32),
-                        size=(ph, pw),
-                        mode="bicubic",
-                        antialias=True,
-                    )[0].clamp(0.0, 1.0)
+        if cached_ref_latents is not None:
+            for ref_idx in range(ref_count):
+                per_item = [c[ref_idx] for c in cached_ref_latents]
+                shapes = {tuple(r.shape) for r in per_item}
+                if len(shapes) > 1:
+                    raise ValueError(
+                        "ref2va: reference aspect ratios must match across a batch "
+                        f"(got latent shapes {sorted(shapes)}); use batch_size 1 for "
+                        "mixed-aspect references"
+                    )
+                stacked = torch.stack(per_item).to(device, torch.float32)
+                ref_noise = torch.randn_like(stacked)
+                ref_latents = (
+                    KEYFRAME_NOISE_AUG_T * stacked
+                    + (1.0 - KEYFRAME_NOISE_AUG_T) * ref_noise
                 )
-            shapes = {tuple(r.shape[1:]) for r in resized}
-            if len(shapes) > 1:
-                raise ValueError(
-                    "ref2va: reference aspect ratios must match across a batch "
-                    f"(got pixel shapes {sorted(shapes)}); use batch_size 1 for "
-                    "mixed-aspect references"
+                blocks.append(
+                    (ref_latents.shape[2], ref_latents.shape[3], ref_latents.shape[4], 0)
                 )
-            # [0, 1] control -> [-1, 1] pixels; (B, 3, T, H, W) with T = 1
-            # for a keyframe-style image ref, or the still held for
-            # ``image_ref_video_frames`` frames as a static clip
-            frames = (torch.stack(resized) * 2.0 - 1.0).unsqueeze(2)
-            if as_video_frames:
-                frames = frames.expand(-1, -1, as_video_frames, -1, -1).contiguous()
-            ref_latents = self.encode_keyframe_latents(frames)
-            ref_noise = torch.randn_like(ref_latents)
-            ref_latents = (
-                KEYFRAME_NOISE_AUG_T * ref_latents
-                + (1.0 - KEYFRAME_NOISE_AUG_T) * ref_noise
-            )
-            blocks.append(
-                (ref_latents.shape[2], ref_latents.shape[3], ref_latents.shape[4], 0)
-            )
-            all_rows.append(patchify_video_latents(ref_latents).to(dtype))
+                all_rows.append(patchify_video_latents(ref_latents).to(dtype))
+        else:
+            for ref_idx in range(ref_count):
+                resized = []
+                for c in controls_per_item:
+                    img = c[ref_idx]
+                    if img.ndim == 4:
+                        img = img[0]
+                    ph, pw = size_fn(img.shape[2], img.shape[1], target_h, target_w)
+                    # LANCZOS like ComfyUI / the sampling path
+                    resized.append(
+                        torch.nn.functional.interpolate(
+                            img[None].to(device, torch.float32),
+                            size=(ph, pw),
+                            mode="bicubic",
+                            antialias=True,
+                        )[0].clamp(0.0, 1.0)
+                    )
+                shapes = {tuple(r.shape[1:]) for r in resized}
+                if len(shapes) > 1:
+                    raise ValueError(
+                        "ref2va: reference aspect ratios must match across a batch "
+                        f"(got pixel shapes {sorted(shapes)}); use batch_size 1 for "
+                        "mixed-aspect references"
+                    )
+                # [0, 1] control -> [-1, 1] pixels; (B, 3, T, H, W) with T = 1
+                # for a keyframe-style image ref, or the still held for
+                # ``image_ref_video_frames`` frames as a static clip
+                frames = (torch.stack(resized) * 2.0 - 1.0).unsqueeze(2)
+                if as_video_frames:
+                    frames = frames.expand(-1, -1, as_video_frames, -1, -1).contiguous()
+                ref_latents = self.encode_keyframe_latents(frames)
+                ref_noise = torch.randn_like(ref_latents)
+                ref_latents = (
+                    KEYFRAME_NOISE_AUG_T * ref_latents
+                    + (1.0 - KEYFRAME_NOISE_AUG_T) * ref_noise
+                )
+                blocks.append(
+                    (ref_latents.shape[2], ref_latents.shape[3], ref_latents.shape[4], 0)
+                )
+                all_rows.append(patchify_video_latents(ref_latents).to(dtype))
 
         audio_rows = []
         self._append_video_ref_blocks(

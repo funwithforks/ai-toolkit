@@ -44,6 +44,36 @@ from torchvision.transforms import functional as TF
 
 from toolkit.train_tools import get_torch_dtype
 
+
+# -- phase-1 control reference latent sidecars --------------------------------
+# Models with supports_control_latent_cache encode their control/reference
+# images once in phase 1 (sized for the training item's bucket) instead of
+# per training step. One sidecar per training item next to the latent cache;
+# validity is keyed on the control files' content signatures + bucket dims,
+# so edited controls or a changed bucket regenerate on the next run.
+
+def control_latent_sidecar_path(img_path: str) -> str:
+    img_dir = os.path.dirname(img_path)
+    stem = os.path.splitext(os.path.basename(img_path))[0]
+    return os.path.join(img_dir, '_latent_cache', f'{stem}.ctrl.safetensors')
+
+
+def _signature_hash(signature: str) -> int:
+    import hashlib
+
+    return int(hashlib.md5(signature.encode('utf-8')).hexdigest(), 16) % (2 ** 63)
+
+
+def _read_control_sidecar_meta(sidecar_path: str) -> dict:
+    from safetensors.torch import safe_open
+
+    with safe_open(sidecar_path, framework='pt', device='cpu') as f:
+        if 'meta_json' not in f.keys():
+            raise KeyError('meta_json')
+        import json
+
+        return json.loads(bytes(f.get_tensor('meta_json').tolist()).decode('utf-8'))
+
 if TYPE_CHECKING:
     from toolkit.data_loader import AiToolkitDataset
     from toolkit.data_transfer_object.data_loader import FileItemDTO
@@ -897,7 +927,10 @@ class ImageProcessingDTOMixin:
             # tensor in addition to the cached latent, so fall through to load it below
             if not self.dataset_config.load_image_when_caching_latents:
                 if self.has_control_image:
-                    self.load_control_image()
+                    # phase-1 cached reference latents win when present; the
+                    # per-fetch pixel decode is skipped entirely
+                    if not self.load_control_latents():
+                        self.load_control_image()
                 if self.has_inpaint_image:
                     self.load_inpaint_image()
                 if self.has_clip_image:
@@ -1014,7 +1047,8 @@ class ImageProcessingDTOMixin:
         self.tensor = img
         if not only_load_latents:
             if self.has_control_image:
-                self.load_control_image()
+                if not self.load_control_latents():
+                    self.load_control_image()
             if self.has_inpaint_image:
                 self.load_inpaint_image()
             if self.has_clip_image:
@@ -1116,6 +1150,9 @@ class ControlFileItemDTOMixin:
         self.control_path: Union[str, List[str], None] = None
         self.control_tensor: Union[torch.Tensor, None] = None
         self.control_tensor_list: Union[List[torch.Tensor], None] = None
+        # phase-1 cached clean reference latents (per ref: (C, T, h, w));
+        # set by load_control_latents when the sidecar is present and valid
+        self.control_latent_list: Union[List[torch.Tensor], None] = None
         # file identity per control image (see load_control_image). Models
         # that VAE-encode controls may use it to cache the latents.
         self.control_cache_keys: Union[List, None] = None
@@ -1279,7 +1316,64 @@ class ControlFileItemDTOMixin:
     def cleanup_control(self: 'FileItemDTO'):
         self.control_tensor = None
         self.control_tensor_list = None
+        self.control_latent_list = None
         self.control_cache_keys = None
+
+    def _control_latent_sidecar_path(self: 'FileItemDTO') -> str:
+        return control_latent_sidecar_path(self.path)
+
+    def control_latents_pending(self: 'FileItemDTO') -> bool:
+        """True when this item's controls are cacheable (raw disk controls,
+        no aug replay, no same-folder pairing) and no valid sidecar exists."""
+        if self.control_path is None or not self.use_raw_control_images:
+            return False
+        if self.aug_replay_spatial_transforms is not None:
+            return False
+        if self.dataset_config is not None and self.dataset_config.control_from_same_folder:
+            return False
+        return not self._control_latent_sidecar_valid()
+
+    def _control_latent_sidecar_valid(self: 'FileItemDTO') -> bool:
+        """True when the sidecar exists and matches the item's current control
+        files (content signatures), count and bucket sizing."""
+        paths = self.control_path if isinstance(self.control_path, list) else [self.control_path]
+        paths = [p for p in paths if p is not None]
+        if not paths:
+            return False
+        sidecar = self._control_latent_sidecar_path()
+        if not os.path.exists(sidecar):
+            return False
+        try:
+            meta = _read_control_sidecar_meta(sidecar)
+        except Exception:
+            return False
+        if meta.get('target_h') != self.crop_height or meta.get('target_w') != self.crop_width:
+            return False
+        stored_sigs = meta.get('sigs', [])
+        if meta.get('count') != len(paths) or len(stored_sigs) != len(paths):
+            return False
+        for path, stored_sig in zip(paths, stored_sigs):
+            sig = get_quick_signature_string(path)
+            if sig is None or _signature_hash(sig) != stored_sig:
+                return False
+        return True
+
+    def load_control_latents(self: 'FileItemDTO') -> bool:
+        """Load phase-1 cached control reference latents when the sidecar is
+        valid. Returns True when latents were loaded (pixel controls are then
+        skipped entirely); False leaves control loading to the pixel path."""
+        if not self._control_latent_sidecar_valid():
+            return False
+        from safetensors.torch import load_file
+
+        sidecar = self._control_latent_sidecar_path()
+        state_dict = load_file(sidecar, device='cpu')
+        count = _read_control_sidecar_meta(sidecar)['count']
+        latents = []
+        for i in range(count):
+            latents.append(state_dict[f'ctrl_latent_{i}'])
+        self.control_latent_list = latents
+        return True
 
 
 class ClipImageFileItemDTOMixin:
@@ -2133,6 +2227,98 @@ class LatentCachingMixin:
             if failed_items:
                 print_acc(f"Removed {len(failed_items)} files from the dataset that failed to load or were unusable")
                 self._remove_file_items(failed_items)
+
+    def control_latents_pending(self: 'AiToolkitDataset') -> bool:
+        """True when any cacheable control image of this dataset still lacks
+        a valid reference-latent sidecar. The vae gate and the training-time
+        vae residency decision both ask this."""
+        if not getattr(self.sd, 'supports_control_latent_cache', False):
+            return False
+        if self.dataset_config.control_from_same_folder:
+            return False
+        return any(item.control_latents_pending() for item in self.file_list)
+
+    def cache_control_reference_latents(self: 'AiToolkitDataset'):
+        """Phase-1 pass: encode every deterministic control image to a clean
+        reference latent sidecar, sized for the owning item's bucket. Items
+        with stochastic controls (same-folder pairing, aug replay) keep the
+        per-step encode path and are skipped here."""
+        if not getattr(self.sd, 'supports_control_latent_cache', False):
+            return
+        if self.dataset_config.control_from_same_folder:
+            return
+        device = self.sd.device_torch
+        to_tensor = transforms.ToTensor()
+        pending = [item for item in self.file_list if item.control_latents_pending()]
+        if not pending:
+            return
+        print_acc(f"Caching control reference latents for {self.dataset_path}")
+        for file_item in pending:
+            paths = (
+                file_item.control_path
+                if isinstance(file_item.control_path, list)
+                else [file_item.control_path]
+            )
+            paths = [p for p in paths if p is not None]
+            if not paths:
+                continue
+            sigs = []
+            skipped = False
+            for p in paths:
+                sig = get_quick_signature_string(p)
+                if sig is None:
+                    # unreadable control file: leave it to the per-step path
+                    skipped = True
+                    break
+                sigs.append(_signature_hash(sig))
+            if skipped:
+                continue
+            target_h, target_w = file_item.crop_height, file_item.crop_width
+            state_dict = {}
+            meta = {
+                'count': len(paths),
+                'sigs': sigs,
+                'target_h': int(target_h),
+                'target_w': int(target_w),
+            }
+            import json as _json
+
+            state_dict['meta_json'] = torch.frombuffer(
+                bytearray(_json.dumps(meta).encode('utf-8')), dtype=torch.uint8
+            )
+            for i, control_path in enumerate(paths):
+                try:
+                    img = Image.open(control_path)
+                    img = exif_transpose(img).convert('RGB')
+                except Exception as e:
+                    print_acc(f"Error loading control image {control_path}: {e}")
+                    skipped = True
+                    break
+                ref_w, ref_h = img.size
+                ph, pw = self.sd.get_control_reference_size(
+                    ref_w, ref_h, target_h, target_w)
+                pixels = to_tensor(img).to(device, torch.float32)
+                # bicubic to the sized target, [0, 1] -> [-1, 1], single frame
+                pixels = torch.nn.functional.interpolate(
+                    pixels[None],
+                    size=(ph, pw),
+                    mode="bicubic",
+                    antialias=True,
+                )[0].clamp(0.0, 1.0)
+                frames = (pixels * 2.0 - 1.0).unsqueeze(1).unsqueeze(0)
+                with torch.no_grad():
+                    latent = self.sd.encode_control_reference(frames)
+                # (1, C, T, h, w) -> (C, T, h, w), exactly what
+                # _build_condition stacks back up per reference index
+                state_dict[f'ctrl_latent_{i}'] = latent.squeeze(0).cpu()
+            if skipped:
+                continue
+            sidecar = control_latent_sidecar_path(file_item.path)
+            os.makedirs(os.path.dirname(sidecar), exist_ok=True)
+            from safetensors.torch import save_file
+
+            save_file(state_dict, sidecar, metadata={"format": "pt"})
+        flush()
 
     def _remove_file_items(self: 'AiToolkitDataset', items_to_remove: List['FileItemDTO']):
         # buckets hold raw indices into file_list, so removal requires remapping them

@@ -1365,6 +1365,30 @@ class BaseModel:
 
         return self.get_prompt_embeds(prompt)
 
+    # -- control reference latent caching --------------------------------
+    # Models that encode control/reference images through the vae at train
+    # time can cache those latents in phase 1 instead (sidecar per training
+    # item, keyed on the control file contents + the item's bucket). Models
+    # that opt in declare supports_control_latent_cache and override the two
+    # hooks below; every other model keeps its existing behavior.
+
+    supports_control_latent_cache = False
+
+    def get_control_reference_size(
+            self, ref_width: int, ref_height: int, target_height: int, target_width: int
+    ):
+        """(height, width) a control reference is encoded at for a batch whose
+        target is target_height x target_width pixels. Default: native size."""
+        return ref_height, ref_width
+
+    def encode_control_reference(self, pixel_frames: torch.Tensor) -> torch.Tensor:
+        """Encode control reference pixels to a clean latent.
+        pixel_frames: (1, 3, T, ph, pw) in [-1, 1] -> (1, C, T, h, w)."""
+        raise NotImplementedError(
+            "supports_control_latent_cache models must implement "
+            "encode_control_reference"
+        )
+
     @torch.no_grad()
     def encode_images(
             self,

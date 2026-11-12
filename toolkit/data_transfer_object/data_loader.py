@@ -238,6 +238,7 @@ class DataLoaderBatchDTO:
             self.latents: Union[torch.Tensor, None] = None
             self.control_tensor: Union[torch.Tensor, None] = None
             self.control_tensor_list: Union[List[List[torch.Tensor]], None] = None
+            self.control_latent_list: Union[List[List[torch.Tensor]], None] = None
             self.clip_image_tensor: Union[torch.Tensor, None] = None
             self.mask_tensor: Union[torch.Tensor, None] = None
             self.unaugmented_tensor: Union[torch.Tensor, None] = None
@@ -361,6 +362,19 @@ class DataLoaderBatchDTO:
                     else:
                         raise Exception(
                             f"Could not find control tensors for all file items, missing for {x.path}"
+                        )
+
+            # handle phase-1 cached control reference latents (per item, per
+            # ref: (C, T, h, w) clean latents; the model applies its own
+            # per-step noise augmentation)
+            if any([x.control_latent_list is not None for x in self.file_items]):
+                self.control_latent_list = []
+                for x in self.file_items:
+                    if x.control_latent_list is not None:
+                        self.control_latent_list.append(x.control_latent_list)
+                    else:
+                        raise Exception(
+                            f"Could not find control reference latents for all file items, missing for {x.path}"
                         )
 
             self.inpaint_tensor: Union[torch.Tensor, None] = None
