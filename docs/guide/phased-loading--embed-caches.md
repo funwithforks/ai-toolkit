@@ -201,11 +201,12 @@ time (minimax_h3 ref2va family) instead encode them once in phase 1:
   reference latents). Any mismatch → regenerate; the batch DTO carries
   `control_latent_list` and the model skips its per-step encode entirely.
 - **Residency**: a model declaring `require_vae_during_training` keeps the
-  vae only while sidecars are pending; the ladder re-evaluates after the
-  phase-1 passes and downgrades to reload/unload with a printed reason (see
-  [component phases](./phased-loading--component-phases.md)). Stochastic
-  controls (same-folder pairing, aug replay) are not cacheable and keep the
-  old path.
+  vae only while it has no reference-latent cache (per-step encode is its
+  design). Cache-capable models never hold the vae for training: pending
+  sidecars make the vae gate load for the phase-1 pass, and an item whose
+  sidecar fails is removed from the dataset. Stochastic controls
+  (same-folder pairing, aug replay) are not cacheable and are skipped by
+  the pass.
 - **Acceptance line**: first run prints `Caching control reference latents`
   once and the vae loads; the second prints the skip lines and loads nothing
   on the GPU except the transformer. Verified on

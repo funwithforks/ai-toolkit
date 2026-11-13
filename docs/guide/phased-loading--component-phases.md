@@ -97,16 +97,14 @@ requests is never printed or loaded
 
 ## Reference latents and train-time vae residency
 
-Models that declare `require_vae_during_training` (edit-mode reference
-encoding) keep the vae resident **only when train-time encoding is
-guaranteed** — controls that cannot be cached (same-folder pairing, aug
-replay, non-raw). Cacheable controls get their sidecars in phase 1
-([embed caches §7](./phased-loading--embed-caches.md)); `vae_load_needed`
-counts pending sidecars so the vae loads for that pass, and a sidecar
-missing at train time falls to the printed borrow-and-return in the model's
-encode path. The ladder decides once, upfront — there is no
-decide-then-reverse: a warm run never sets `keep`, and a cold run's phase-1
-pass is what makes `keep` unnecessary.
+Models that declare `require_vae_during_training` keep the vae resident for
+training **only when they have no reference-latent cache** (their per-step
+encode is the design). Cache-capable models
+([embed caches §7](./phased-loading--embed-caches.md)) never hold the vae
+for training: sidecars are written in phase 1 (`vae_load_needed` counts
+pending ones), and an item whose sidecar fails to generate is removed from
+the dataset with a printed count — the same pattern as failed latent
+caches, never a residency held "just in case".
 
 ## Sampling rounds (sample())
 
