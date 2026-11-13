@@ -1496,6 +1496,7 @@ export default function SimpleJob({
                             {[
                               [256, 512, 768, 1024],
                               [1280, 1328, 1536, 2048],
+                              [3072, 4096, 8192, 16384],
                             ].map(resGroup => (
                               <div key={resGroup[0]} className="space-y-2">
                                 {resGroup.map(res => (
