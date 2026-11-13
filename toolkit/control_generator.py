@@ -16,6 +16,10 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
+from toolkit.print import print_acc
+from toolkit.accelerator import get_accelerator
+
+
 def flush(garbage_collect=True):
     torch.cuda.empty_cache()
     if garbage_collect:
@@ -98,12 +102,20 @@ class ControlGenerator:
 
     def ensure_unloaded(self):
         # park any resident training components (device-state machinery) so
-        # the mask/control model loads alone; restored by cleanup()
-        if not self.has_unloaded:
-            if self.sd is not None:
-                print("Unloading training model to generate masks/controls")
-                self.sd.set_device_state_preset('unload')
-            self.has_unloaded = True
+        # the mask/control model loads alone; restored by cleanup(). When
+        # nothing is resident -- the common case, after the phase-1 iron
+        # rule -- there is nothing to park and nothing to print.
+        if self.has_unloaded or self.sd is None:
+            return
+        resident = [
+            name for name in ('vae', 'unet', 'text_encoder', 'adapter', 'refiner_unet')
+            if getattr(self.sd, name, None) is not None
+        ]
+        if not resident:
+            return
+        print_acc(f"Unloading {', '.join(resident)} to generate masks/controls")
+        self.sd.set_device_state_preset('unload')
+        self.has_unloaded = True
 
     def load_image(self, img_path):
         # CPU/disk stage: read, orient, and downscale to a max of 1mp
@@ -193,6 +205,79 @@ class ControlGenerator:
         # the fallback path already produced a finished PIL image
         return result
 
+    def _ensure_depth(self):
+        if self.control_depth_model is not None:
+            return
+        from transformers import pipeline
+
+        model_dir = _ensure_local_model_dir(
+            'depth-anything/Depth-Anything-V2-Large-hf',
+            os.path.join('control', 'depth-anything-v2'),
+        )
+        print_acc(f"Loading control model depth (Depth-Anything-V2) from {model_dir}")
+        self.control_depth_model = pipeline(
+            task="depth-estimation",
+            model=model_dir,
+            device=self.device,
+            torch_dtype=torch.float16
+        )
+
+    def _ensure_pose(self):
+        if self.control_pose_model is not None:
+            return
+        try:
+            import onnxruntime
+            onnxruntime.set_default_logger_severity(3)
+        except ImportError:
+            raise ImportError(
+                "onnxruntime is not installed. Please install it with pip install onnxruntime or onnxruntime-gpu")
+        try:
+            from easy_dwpose import DWposeDetector
+            print_acc("Loading control model pose (DWPose)")
+            self.control_pose_model = DWposeDetector(
+                device=str(self.device))
+        except ImportError:
+            raise ImportError(
+                "easy-dwpose is not installed. Please install it with pip install git+https://github.com/jaretburkett/easy_dwpose.git")
+
+    def _ensure_line(self):
+        if self.control_line_model is not None:
+            return
+        from controlnet_aux import TEEDdetector
+
+        teed_dir = _ensure_local_model_dir(
+            'fal-ai/teed',
+            os.path.join('control', 'teed'),
+        )
+        print_acc(f"Loading control model line (TEED) from {teed_dir}")
+        self.control_line_model = TEEDdetector.from_pretrained(
+            teed_dir, filename="5_model.pth").to(self.device)
+
+    def _ensure_sapiens2(self):
+        if self.mask_sapiens2_model is not None:
+            return
+        from toolkit.models.sapiens2 import Sapiens2Matting
+
+        self.mask_sapiens2_model = Sapiens2Matting.from_pretrained(
+            device=self.device,
+            dtype=torch.float16
+        )
+
+    def prepare(self, gen_types):
+        """Load every model these generation types need, before any progress
+        bar starts, so load lines never interleave with the bar."""
+        for gen_type in gen_types:
+            if gen_type == 'depth':
+                self._ensure_depth()
+            elif gen_type == 'pose':
+                self._ensure_pose()
+            elif gen_type == 'line':
+                self._ensure_line()
+            elif gen_type in ('birefnet', 'inpaint'):
+                self._ensure_birefnet()
+            elif gen_type == 'sapiens2':
+                self._ensure_sapiens2()
+
     def run_control(self, image, gen_type):
         # GPU stage: run inference on an already-loaded image and return the
         # resulting PIL image (no disk IO). Models are lazily loaded here, so
@@ -201,21 +286,8 @@ class ControlGenerator:
         self.ensure_unloaded()
 
         if gen_type == 'depth':
+            self._ensure_depth()
             self.debug_print("Generating depth control")
-            if self.control_depth_model is None:
-                from transformers import pipeline
-
-                model_dir = _ensure_local_model_dir(
-                    'depth-anything/Depth-Anything-V2-Large-hf',
-                    os.path.join('control', 'depth-anything-v2'),
-                )
-                print(f"Loading control model depth (Depth-Anything-V2) from {model_dir}")
-                self.control_depth_model = pipeline(
-                    task="depth-estimation",
-                    model=model_dir,
-                    device=device,
-                    torch_dtype=torch.float16
-                )
             img = image.copy()
             in_size = img.size
             output = self.control_depth_model(img)
@@ -226,21 +298,8 @@ class ControlGenerator:
             img = img.resize(in_size, Image.LANCZOS)
             return img
         elif gen_type == 'pose':
+            self._ensure_pose()
             self.debug_print("Generating pose control")
-            if self.control_pose_model is None:
-                try:
-                    import onnxruntime
-                    onnxruntime.set_default_logger_severity(3)
-                except ImportError:
-                    raise ImportError(
-                        "onnxruntime is not installed. Please install it with pip install onnxruntime or onnxruntime-gpu")
-                try:
-                    from easy_dwpose import DWposeDetector
-                    self.control_pose_model = DWposeDetector(
-                        device=str(device))
-                except ImportError:
-                    raise ImportError(
-                        "easy-dwpose is not installed. Please install it with pip install git+https://github.com/jaretburkett/easy_dwpose.git")
             img = image.copy()
 
             detect_res = int(math.sqrt(img.size[0] * img.size[1]))
@@ -250,17 +309,8 @@ class ControlGenerator:
             return img
 
         elif gen_type == 'line':
+            self._ensure_line()
             self.debug_print("Generating line control")
-            if self.control_line_model is None:
-                from controlnet_aux import TEEDdetector
-
-                teed_dir = _ensure_local_model_dir(
-                    'fal-ai/teed',
-                    os.path.join('control', 'teed'),
-                )
-                print(f"Loading control model line (TEED) from {teed_dir}")
-                self.control_line_model = TEEDdetector.from_pretrained(
-                    teed_dir, filename="5_model.pth").to(device)
             img = image.copy()
             img = self.control_line_model(img, detect_resolution=1024)
             # apply threshold
@@ -271,12 +321,7 @@ class ControlGenerator:
         elif gen_type in ('birefnet', 'inpaint', 'sapiens2'):
             self.debug_print(f"Generating {gen_type} mask")
             if gen_type == 'sapiens2':
-                if self.mask_sapiens2_model is None:
-                    from toolkit.models.sapiens2 import Sapiens2Matting
-                    self.mask_sapiens2_model = Sapiens2Matting.from_pretrained(
-                        device=device,
-                        dtype=torch.float16
-                    )
+                self._ensure_sapiens2()
                 img = image.copy()
                 img = self.mask_sapiens2_model(img)
                 return img

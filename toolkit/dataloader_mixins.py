@@ -3295,7 +3295,9 @@ class ControlCachingMixin:
             self: 'AiToolkitDataset', generator: 'ControlGenerator', gen_types: List[str], label: str):
         """Generate every requested image type for this dataset's file items,
         wiring the resulting paths on as they are produced. Existing files are
-        reused, so this is idempotent across runs."""
+        reused, so this is idempotent across runs. Models are loaded before
+        the progress bar starts so load lines never interleave with it."""
+        generator.prepare(gen_types)
         for file_item in tqdm(self.file_list, desc=f'Generating {label}'):
             for gen_type in gen_types:
                 gen_path = generator.get_control_path(file_item.path, gen_type)
