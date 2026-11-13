@@ -858,6 +858,11 @@ class BaseModel:
                         # the model returned latents, not an image: decode
                         # every one at the end with the vae loaded
                         staged_samples.append((gen_config, i, img))
+                        # mirror the non-staged branch: return the allocator
+                        # segments this sample's transients held (embeds,
+                        # denoise buffers) so they don't accumulate across
+                        # samples of the round
+                        flush()
                     else:
                         gen_config.save_image_atomic(img, i)
                         gen_config.log_image(img, i)
@@ -877,6 +882,16 @@ class BaseModel:
             # staged_sampling (see decode_sample_payload): the vae sat out
             # the entire denoise loop so the transformer had the memory to
             # itself, and now the whole round decodes through it at once.
+            if getattr(self, 'drop_transformer_for_decode', False) and self.unet is not None:
+                # one-shot vae decode testing (drop_transformer_for_decode):
+                # the latents exist and the job's work ends at its samples --
+                # free the transformer so the decode has the whole card
+                from toolkit.memory_management import MemoryManager
+
+                MemoryManager.free(self.unet)
+                self.unet = None
+                self.transformer_dropped = True
+                MemoryManager.release_cached_memory()
             if hasattr(self, "decode_staged_samples"):
                 # model owns the entire decode phase (e.g. H3 loads and
                 # frees each vae separately so never more than one is
@@ -903,9 +918,12 @@ class BaseModel:
             network.train()
             network.multiplier = start_multiplier
 
-        self.unet.to(self.device_torch, dtype=self.torch_dtype)
-        if network.is_merged_in:
-            network.merge_out(merge_multiplier)
+        if self.unet is not None:
+            # drop_transformer_for_decode one-shot runs freed it; the job's
+            # work ended at its samples
+            self.unet.to(self.device_torch, dtype=self.torch_dtype)
+            if network.is_merged_in:
+                network.merge_out(merge_multiplier)
         # self.tokenizer.to(original_device_dict['tokenizer'])
 
         # refuse loras

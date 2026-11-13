@@ -52,6 +52,19 @@ Dispatch order (`base_model.py:851`): if the model defines
 `decode_sample_payload`. Both paths then do the identical tail the non-staged
 path does — `save_image_atomic`, `log_image`, `_after_sample_image`, `flush`.
 
+## One-shot vae decode testing: `drop_transformer_for_decode`
+
+`TrainToolsConfig.drop_transformer_for_decode` (default `False`) is a
+one-shot testing switch: after the denoise pass of a staged model, the
+transformer is freed through the memory machinery and never restored, so
+the decode phase has the whole card (large single-frame decodes on a
+32 GB card that OOM with the transformer resident). The job's work ends
+at its samples — pair it with `steps: 0` (a 0-step run that only
+samples); the process raises loudly if training steps would follow a
+freed transformer. Without the flag, 0-step runs are general vae tests
+with normal residency. Implemented as one `if` in the staged branch of
+`BaseModel.generate_images`; the non-staged path never sees it.
+
 ## Invariants a staged model must keep
 
 - **Never load the vae during the denoise pass.** Denoise consumes cached

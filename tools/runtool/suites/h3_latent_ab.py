@@ -98,7 +98,9 @@ def _fp(path):
 def _check(params):
     """The provenance + drift laws as a list of named problems ([] = ok).
     Cheap: fingerprints ~40 small files, no GPU, no model."""
-    from ..runner import RUNS_ROOT
+    from ..runner import get_runs_root
+
+    RUNS_ROOT = get_runs_root()
     problems = []
     variant = params["latent_variant"]
     if variant in _NO_DOOR:

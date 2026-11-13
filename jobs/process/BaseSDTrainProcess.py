@@ -295,6 +295,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return generate_image_config_list
 
     def sample(self, step=None, is_first=False):
+        if getattr(self.sd, 'transformer_dropped', False):
+            # drop_transformer_for_decode one-shot run: the transformer was
+            # freed after an earlier decode and this job's samples exist
+            print_acc("Transformer was dropped for decode; skipping this sample round")
+            return
         if not self.accelerator.is_main_process:
             return
         flush()
@@ -409,6 +414,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # without the vae and load it themselves for the decode pass.
                 print_acc("Loading vae for sampling")
                 self.sd.load_vae()
+
+            # one-shot vae decode testing: the transformer is freed after the
+            # denoise pass and never restored, so the job must end at its
+            # samples (steps: 0)
+            if self.train_config.drop_transformer_for_decode:
+                remaining = self.train_config.steps - self.step_num
+                if remaining > 0:
+                    raise ValueError(
+                        "drop_transformer_for_decode frees the transformer "
+                        f"after the denoise pass, but this job still has "
+                        f"{remaining} training steps after this sample round. "
+                        "Use steps: 0."
+                    )
+                self.sd.drop_transformer_for_decode = True
 
             # send to be generated
             self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)

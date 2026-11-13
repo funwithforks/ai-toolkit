@@ -100,7 +100,9 @@ def base_params(**extra):
             desc="dataset key (names the job; maps to folders in the "
                  "machine-local registry)",
         ),
-        "steps": Param("int", default=60, min=10, max=5000),
+        # min 0: a 0-step run is a legal sampling-only job (see
+        # drop_transformer_for_decode) -- it trains nothing and only samples
+        "steps": Param("int", default=60, min=0, max=5000),
         "batch_size": Param(
             "int", default=1, min=1, max=32,
             desc="train batch; fit is machine-dependent, high values are "
@@ -257,6 +259,7 @@ def patchable(prefix):
         train + ".gradient_accumulation",
         train + ".cache_text_embeddings",
         train + ".unload_text_encoder",
+        train + ".drop_transformer_for_decode",
         train + ".dtype",
         train + ".phases",  # lifecycle option (config_modules.py:424,
         # default [1,2,3]): declarative WHICH-phases-run list; a trainer

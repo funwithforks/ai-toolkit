@@ -598,6 +598,11 @@ class TrainConfig:
         self.linear_timesteps = kwargs.get('linear_timesteps', False)
         self.linear_timesteps2 = kwargs.get('linear_timesteps2', False)
         self.disable_sampling = kwargs.get('disable_sampling', False)
+        # one-shot vae decode testing: on a staged-sampling model the transformer
+        # is freed after the denoise pass and never restored, so a large decode
+        # has the whole card. Use with steps: 0 -- the job's work ends at its
+        # samples.
+        self.drop_transformer_for_decode = kwargs.get('drop_transformer_for_decode', False)
 
         # will cache a blank prompt or the trigger word, and unload the text encoder to cpu
         # will make training faster and use less vram

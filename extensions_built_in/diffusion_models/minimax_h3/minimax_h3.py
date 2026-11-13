@@ -1422,7 +1422,15 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
 
     def _staged_video_vae(self):
         """The video vae the staged-sampling decode phase streams in. Hook:
-        the MiniMax-H3-Image arch swaps in its own single-frame decoder."""
+        the MiniMax-H3-Image arch swaps in its own single-frame decoder.
+        model_kwargs.decode_with_image_vae forces the image vae's
+        single-frame 2D decoder on any arch (decoder A/B on one latent
+        space; the encoders are bit-identical)."""
+        if self.model_config.model_kwargs.get("decode_with_image_vae", False):
+            return MiniMaxH3ImageVideoVAE.load_to_device(
+                self._resolve_comfy_file("video_vae", MiniMaxH3ImageVideoVAE),
+                self.vae_device_torch,
+            )
         return MiniMaxH3VideoVAE.load_to_device(
             self._resolve_comfy_file("video_vae", MiniMaxH3VideoVAE), self.vae_device_torch
         )

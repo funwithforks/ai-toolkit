@@ -49,6 +49,8 @@ def scaled_grid_size(w, h, area, div):
 
 
 def to_pil(t):
+    while t.dim() > 3 and t.shape[-3] == 1:  # single-frame archs keep a frame dim
+        t = t.squeeze(-3)
     t = (t.detach().float().cpu().clamp(-1, 1) + 1) * 127.5
     return Image.fromarray(t.permute(1, 2, 0).round().to(torch.uint8).numpy())
 
