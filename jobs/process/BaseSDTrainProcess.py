@@ -25,7 +25,7 @@ import torch.backends.cuda
 from huggingface_hub import HfApi, interpreter_login
 from toolkit.memory_management import MemoryManager
 
-from toolkit.basic import value_map
+from toolkit.basic import value_map, get_quick_signature_string
 from toolkit.buckets import get_bucket_for_image_size
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
@@ -44,7 +44,7 @@ from toolkit.network_mixins import Network
 from toolkit.optimizer import get_optimizer
 from toolkit.paths import CONFIG_ROOT
 from toolkit.progress_bar import ToolkitProgressBar
-from toolkit.prompt_utils import concat_prompt_embeds
+from toolkit.prompt_utils import concat_prompt_embeds, PromptEmbeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sampler import get_sampler
 from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adapter_from_diffusers, \
@@ -1873,33 +1873,133 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set trainable params
         self.sd.adapter = self.adapter
     
-    def _has_validation_items(self):
-        val_config = self.train_config.validation_config
-        return val_config is not None and len(val_config.validation_items) > 0
-
-    def setup_validation_latents(self):
-        # phase 1 half of validation prep: images -> latents + fixed noise.
-        # Runs while phase 1 still holds the vae (vae_load_needed counts
-        # validation items; the iron-rule free fires right after this call).
-        self._validation_items = None
+    def _valid_validation_items(self):
+        """Config validation items whose images exist. Items with missing
+        images are skipped loudly in the setup passes; here it is a silent
+        filter (the gates call this on every run)."""
         val_config = self.train_config.validation_config
         if val_config is None:
-            return
+            return []
+        return [
+            item for item in val_config.validation_items
+            if item.image_path and os.path.exists(item.image_path)
+        ]
+
+    def _validation_latent_cache_info(self):
+        """(path, meta, items) for the validation latent cache file, or None
+        when validation is not configured with valid images. Pure config,
+        stat and image headers -- no vae, safe to call from the gates. The
+        meta keys the cache on image contents, bucket dims, vae identity and
+        the seed constants; a model without a vae_id skips validation loudly
+        (non-registry models are out of scope)."""
+        items = self._valid_validation_items()
+        if not items or self.sd is None:
+            return None
+        vae_id = getattr(self.sd, 'vae_id', None)
+        if vae_id is None:
+            print_acc(
+                f"{type(self.sd).__name__} declares no vae_id: validation "
+                "latent caching is keyed to the vae through the registry -- "
+                "skipping validation"
+            )
+            return None
+        val_config = self.train_config.validation_config
+        resolution = val_config.resolution
+        divisibility = self.sd.get_bucket_divisibility()
+        meta_items = []
+        for item in items:
+            img = Image.open(item.image_path)
+            img = ImageOps.exif_transpose(img).convert('RGB')
+            bucket = get_bucket_for_image_size(
+                img.width, img.height,
+                resolution=resolution,
+                divisibility=divisibility,
+            )
+            meta_items.append({
+                'sig': get_quick_signature_string(item.image_path),
+                'w': bucket['width'],
+                'h': bucket['height'],
+            })
+        meta = {
+            'items': meta_items,
+            'vae_id': vae_id,
+            'encode_seed': 42,
+            'noise_seed_base': 42,
+        }
+        vae_hash = hashlib.md5(str(vae_id).encode()).hexdigest()[:12]
+        digest = hashlib.md5(json.dumps(meta, sort_keys=True).encode()).hexdigest()[:16]
+        cache_dir = os.path.join(self.training_folder, '.validation_cache', vae_hash)
+        return os.path.join(cache_dir, f'latents_{digest}.safetensors'), meta, items
+
+    def _validation_latents_pending(self):
+        """True when validation is configured and its latent cache file is
+        missing or stale (the vae gate's validation question)."""
+        info = self._validation_latent_cache_info()
+        if info is None:
+            return False
+        path, _, _ = info
+        return not os.path.exists(path)
+
+    def _validation_embed_cache_path(self, idx, prompt):
+        """Shared prompt-embed-cache namespace, kind validation_pos_{idx} --
+        same scheme as the fixed embeds (model identity + space version in
+        the directory, prompt in the digest)."""
+        model_id = f"{self.sd.arch}|{self.sd.model_config.name_or_path}"
+        space_version = getattr(self.sd, 'text_embedding_space_version', 0)
+        digest = hashlib.md5(
+            f"validation_pos_{idx}|{model_id}|{space_version}|{prompt}|".encode()
+        ).hexdigest()[:16]
+        shared_dir = os.path.join(
+            self.training_folder,
+            '.prompt_embed_cache',
+            hashlib.md5(f"{model_id}|{space_version}".encode()).hexdigest()[:12],
+        )
+        return os.path.join(shared_dir, f"validation_pos_{idx}_{digest}.safetensors")
+
+    def _validation_embeds_pending(self):
+        """True when validation is configured and any prompt embed cache file
+        is missing (the TE gate's validation question)."""
+        items = self._valid_validation_items()
+        if not items or self.sd is None:
+            return False
+        for idx, item in enumerate(items):
+            prompt = item.prompt
+            if self.trigger_word is not None:
+                prompt = self.sd.inject_trigger_into_prompt(
+                    prompt,
+                    trigger=self.trigger_word,
+                    add_if_not_present=False,
+                )
+            if not os.path.exists(self._validation_embed_cache_path(idx, prompt)):
+                return True
+        return False
+
+    def setup_validation_latents(self):
+        # phase 1 half of validation prep: images -> latents + fixed noise,
+        # cached to disk like every other latent (keyed on image contents,
+        # bucket dims, vae identity and the seed constants). Runs while phase
+        # 1 holds the vae; a warm run loads the file and never touches it.
+        self._validation_items = None
         if not self.accelerator.is_main_process:
             return
-        validation_items = []
-        for item in val_config.validation_items:
-            if not item.image_path:
-                print_acc("Skipping validation item with no image")
-                continue
-            if not os.path.exists(item.image_path):
-                print_acc(f"Skipping validation item, image not found: {item.image_path}")
-                continue
-            validation_items.append(item)
-        if len(validation_items) == 0:
-            print_acc("Validation config has no valid validation_items, skipping validation")
+        info = self._validation_latent_cache_info()
+        if info is None:
             return
+        path, meta, validation_items = info
         self._validation_items = validation_items
+        val_config = self.train_config.validation_config
+        skipped_count = len(val_config.validation_items) - len(validation_items)
+        if skipped_count:
+            print_acc(f"Skipping {skipped_count} validation items with missing images")
+
+        if os.path.exists(path):
+            state_dict = load_file(path, device='cpu')
+            latent_list = [state_dict[f'latent_{i}'] for i in range(len(validation_items))]
+            noise_list = [state_dict[f'noise_{i}'] for i in range(len(validation_items))]
+            self._validation_cache = {'latents': latent_list, 'noise': noise_list, 'embeds': None}
+            print_acc(f"Loading validation latents from cache ({len(validation_items)} images)")
+            return
+
         print_acc(f"Caching validation latents for {len(validation_items)} images")
         device = self.device_torch
         dtype = get_torch_dtype(self.train_config.dtype)
@@ -1942,6 +2042,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     torch.randn(latent.shape, generator=generator, dtype=torch.float32)
                 )
 
+        state_dict = {}
+        for i, (latent, noise) in enumerate(zip(latent_list, noise_list)):
+            state_dict[f'latent_{i}'] = latent
+            state_dict[f'noise_{i}'] = noise
+        state_dict['meta_json'] = torch.frombuffer(
+            bytearray(json.dumps(meta, sort_keys=True).encode('utf-8')), dtype=torch.uint8
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        save_file(state_dict, path, metadata={"format": "pt"})
         self._validation_cache = {
             'latents': latent_list,
             'noise': noise_list,
@@ -1950,12 +2059,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         flush()
 
     def setup_validation_embeds(self):
-        # phase 2 half of validation prep: prompts -> cached embeds. Runs
-        # while phase 2 holds the text encoder (needs_text_encoder_load
-        # counts validation items).
+        # phase 2 half of validation prep: prompts -> embeds, cached in the
+        # shared prompt-embed-cache namespace like every other embedding.
+        # Runs while phase 2 holds the text encoder; a warm run loads the
+        # files and never touches it.
         if getattr(self, '_validation_items', None) is None:
             return
-        print_acc(f"Caching validation prompt embeddings for {len(self._validation_items)} images")
+        if not self.accelerator.is_main_process:
+            return
         device = self.device_torch
         prompt_list = []
         for item in self._validation_items:
@@ -1968,6 +2079,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
             prompt_list.append(prompt)
 
+        embeds_list = [None] * len(prompt_list)
+        to_encode = []
+        for idx, prompt in enumerate(prompt_list):
+            cache_path = self._validation_embed_cache_path(idx, prompt)
+            if os.path.exists(cache_path):
+                embeds_list[idx] = PromptEmbeds.load(cache_path)
+            else:
+                to_encode.append((idx, prompt, cache_path))
+
+        if not to_encode:
+            print_acc(f"Loading validation prompt embeddings from cache ({len(prompt_list)} images)")
+            self._validation_cache['embeds'] = embeds_list
+            return
+
+        print_acc(f"Caching validation prompt embeddings for {len(to_encode)} images")
         fork_devices = [device] if device.type == 'cuda' else []
         with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
             # encode the prompts one at a time so they can be reassembled per sigma later
@@ -1975,10 +2101,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             te_list = te if isinstance(te, list) else ([te] if te is not None else [])
             orig_te_devices = [next(t.parameters()).device for t in te_list]
             self.sd.text_encoder_to(device)
-            embeds_list = [
-                self.sd.encode_prompt([prompt]).to('cpu', dtype=torch.float32).detach()
-                for prompt in prompt_list
-            ]
+            for idx, prompt, cache_path in to_encode:
+                embeds = self.sd.encode_prompt([prompt]).to('cpu', dtype=torch.float32).detach()
+                embeds.save(cache_path)
+                embeds_list[idx] = embeds
             for t, te_device in zip(te_list, orig_te_devices):
                 t.to(te_device)
 
@@ -2272,20 +2398,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # load the vae only if something in phase 1 can use it: live latent
         # encoding (keep), a latent cache that is not fully populated, control
         # reference latents still to encode, clip vision caching, or
-        # validation latents (re-encoded every run in
-        # setup_validation_latents). Otherwise the iron rule below frees it.
+        # validation latents whose cache file is missing/stale. Otherwise the
+        # iron rule below frees it.
         vae_load_needed = self.vae_training_mode == 'keep' or any(
             dataset.is_caching_clip_vision_to_disk
             or not dataset.latent_cache_complete()
             or dataset.control_latents_pending()
             for dataset in all_dataset_objs
-        ) or self._has_validation_items()
-        # *** The trailing _has_validation_items() clause: DO NOT TOUCH for
-        # validation code until we actually work on validation. ***
-        # Validation latents have no disk cache by design-debt, so any
-        # validation item forces a vae load. Known and accepted for now;
-        # changing it while validation is untested breaks component loading.
-        # Paired clause on the TE gate: SDTrainer.needs_text_encoder_load.
+        ) or self._validation_latents_pending()
+        # Paired clause on the TE gate: SDTrainer.needs_text_encoder_load
+        # (_validation_embeds_pending). Validation latents are a disk cache
+        # like every other: a warm run loads neither component for them.
         _phase1 = 1 in self.train_config.phases
 
         # ### generated conditioning images (early phase 1) ###

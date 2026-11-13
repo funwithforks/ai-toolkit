@@ -72,6 +72,10 @@ _kit = TrainerKit(
         "mask_guard_refused": r"phases excludes 1 but generated masks are still",
         "ctrl_latent_pass": r"Caching control reference latents for",
         "vae_not_kept": r"vae will not stay resident for training",
+        "val_latent_cold": r"Caching validation latents for",
+        "val_latent_warm": r"Loading validation latents from cache",
+        "val_embed_cold": r"Caching validation prompt embeddings for",
+        "val_embed_warm": r"Loading validation prompt embeddings from cache",
     },
     extra_flags=lambda params: [
         *([] if params.get("varlen", True) else ["novarlen"]),

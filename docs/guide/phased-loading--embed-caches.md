@@ -142,7 +142,8 @@ loads fine and poisons training silently.
 arch declaring no text encoder (`has_text_encoder=False` — an llm whose loss
 consumes token ids from the cached artifact) → skip, prints; any dataset
 incomplete → load; `train_text_encoder` / `embed_config` → load; validation
-items → load (**frozen clause**); live-encoding mode → load; live-embed needs
+embeds pending → load (they cache in phase 2 like every other embedding);
+live-encoding mode → load; live-embed needs
 (`_compute_live_text_encoder_needed`) → load; fixed targets missing/invalid →
 load; otherwise skip and every embed is loaded from disk instead (the serve
 branch in `cache_pre_train_text_embeddings`).

@@ -356,16 +356,11 @@ class SDTrainer(BaseSDTrainProcess):
             return True
         if self.embed_config is not None:
             return True
-        if self._has_validation_items():
-            # *** DO NOT TOUCH this clause for validation code until we
-            # actually work on validation. *** Validation prompt embeds have
-            # no disk cache by design-debt, so any validation item forces a
-            # full text encoder load. That is known and accepted for now;
-            # "fixing" it (or touching it in passing) while validation is
-            # untested breaks component loading. Paired clause on the VAE
-            # gate: BaseSDTrainProcess vae_load_needed.
-            # validation prompt embeds are re-encoded into memory every run
-            # (setup_validation_embeds, phase 2)
+        if self._validation_embeds_pending():
+            # validation prompt embeds cache in phase 2 like every other
+            # embedding; a missing or stale cache file loads the encoder for
+            # the re-encode. Paired clause on the VAE gate:
+            # BaseSDTrainProcess vae_load_needed / _validation_latents_pending
             return True
         if not (self.train_config.unload_text_encoder or self.is_caching_text_embeddings):
             # captions are encoded live every epoch

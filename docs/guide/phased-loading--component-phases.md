@@ -41,11 +41,14 @@ every release point.
 | train loop | every step consumes: transformer + cached latents + cached embeds | transformer only |
 
 Validation prep is split across the same boundaries on purpose: images→latents
-runs while phase 1 holds the vae (`:1622`–`:1623`), prompts→embeds while phase
-2 holds the TE (`:1694`–`:1695`). The validation clauses in both gates are
-frozen — see the DO-NOT-TOUCH comment at `SDTrainer.needs_text_encoder_load`
-(`extensions_built_in/sd_trainer/SDTrainer.py:321`–`:328`) and its paired
-VAE-gate clause (`BaseSDTrainProcess.py:1925`).
+runs while phase 1 holds the vae, prompts→embeds while phase 2 holds the TE.
+Both are disk caches now (validation latents under
+`<training_folder>/.validation_cache/<vae_id>/`, embeds in the shared
+prompt-embed-cache namespace under `validation_pos_N` kinds) — the gates ask
+pending-checks (`_validation_latents_pending` /
+`_validation_embeds_pending`), so a warm run loads neither component for
+validation. The old DO-NOT-TOUCH clauses were removed when the caches
+landed; the paired-clause cross-references between the two gates remain.
 
 **Phase selection (`phases`)** — added commit `cd9d5d4d`: `train.phases` is a
 subset of the fixed lifecycle [1, 2, 3] (default [1, 2, 3] = the normal full
@@ -120,8 +123,8 @@ caches, never a residency held "just in case".
 
 | Gate | Anchor | Forces load when |
 |---|---|---|
-| VAE phase-1 | `BaseSDTrainProcess.py` (`vae_load_needed`) | `vae_training_mode == 'keep'`, or any dataset needs live/cached latents, or control reference sidecars are pending, or validation items exist (frozen paired clause — DO NOT TOUCH) |
-| TE phase-2 | `SDTrainer.needs_text_encoder_load` | arch declares no text encoder (`has_text_encoder=False`) → **skip, prints**; any dataset `text_embedding_complete()` false; `train_text_encoder`; embed_config; validation items (frozen clause); live-encoding mode; `_compute_live_text_encoder_needed()`; `fixed_embeds_cached()` false. The encoderless refusal (`cache_pre_train_text_embeddings`, mirrored in the phase-2 dataset pass) keys on `has_text_encoder`, never on the caching flags |
+| VAE phase-1 | `BaseSDTrainProcess.py` (`vae_load_needed`) | `vae_training_mode == 'keep'`, or any dataset needs live/cached latents, or control reference sidecars are pending, or validation latents are pending |
+| TE phase-2 | `SDTrainer.needs_text_encoder_load` | arch declares no text encoder (`has_text_encoder=False`) → **skip, prints**; any dataset `text_embedding_complete()` false; `train_text_encoder`; embed_config; validation embeds pending; live-encoding mode; `_compute_live_text_encoder_needed()`; `fixed_embeds_cached()` false. The encoderless refusal (`cache_pre_train_text_embeddings`, mirrored in the phase-2 dataset pass) keys on `has_text_encoder`, never on the caching flags |
 | Sampling vae preload (non-staged models) | `BaseSDTrainProcess.py` (sample rounds) | `vae_training_mode == 'reload'` and vae absent and not `staged_sampling`. **Non-staged models only** — `staged_sampling` models skip this and load the vae in their own decode phase (see [staged sampling](./phased-loading--staged-sampling.md)) |
 | Control-encode borrow | `minimax_h3.py` (`encode_keyframe_latents`) | a reference latent sidecar is missing/invalid at train time — borrows the vae for one encode, prints the reason, hands it back. The fallback for a failed phase-1 pass, not the normal path |
 
