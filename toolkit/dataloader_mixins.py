@@ -1319,20 +1319,6 @@ class ControlFileItemDTOMixin:
         self.control_latent_list = None
         self.control_cache_keys = None
 
-    def control_encode_live(self: 'FileItemDTO') -> bool:
-        """True when this item's controls are encoded at train time no matter
-        what is cached: stochastic selection or augmentation replay makes the
-        control latent a per-step function."""
-        if self.control_path is None:
-            return False
-        if not self.use_raw_control_images:
-            return True
-        if self.aug_replay_spatial_transforms is not None:
-            return True
-        if self.dataset_config is not None and self.dataset_config.control_from_same_folder:
-            return True
-        return False
-
     def _control_latent_sidecar_path(self: 'FileItemDTO') -> str:
         return control_latent_sidecar_path(self.path)
 
@@ -2270,14 +2256,6 @@ class LatentCachingMixin:
             return False
         return any(item.control_latents_pending() for item in self.file_list)
 
-    def control_encode_live(self: 'AiToolkitDataset') -> bool:
-        """True when any control of this dataset is a per-step function
-        (stochastic selection or aug replay) and will be encoded at train
-        time no matter what is cached."""
-        if not getattr(self.sd, 'supports_control_latent_cache', False):
-            return False
-        return any(item.control_encode_live() for item in self.file_list)
-
     def cache_control_reference_latents(self: 'AiToolkitDataset'):
         """Phase-1 pass: encode every deterministic control image to a clean
         reference latent sidecar, sized for the owning item's bucket. Items
@@ -2293,6 +2271,7 @@ class LatentCachingMixin:
         if not pending:
             return
         print_acc(f"Caching control reference latents for {self.dataset_path}")
+        failed_items = []
         for file_item in pending:
             paths = (
                 file_item.control_path
@@ -2307,11 +2286,12 @@ class LatentCachingMixin:
             for p in paths:
                 sig = get_quick_signature_string(p)
                 if sig is None:
-                    # unreadable control file: leave it to the per-step path
+                    # unreadable control file: the item cannot be cached
                     skipped = True
                     break
                 sigs.append(_signature_hash(sig))
             if skipped:
+                failed_items.append(file_item)
                 continue
             target_h, target_w = file_item.crop_height, file_item.crop_width
             state_dict = {}
@@ -2334,34 +2314,44 @@ class LatentCachingMixin:
                 try:
                     img = Image.open(control_path)
                     img = exif_transpose(img).convert('RGB')
+                    ref_w, ref_h = img.size
+                    ph, pw = self.sd.get_control_reference_size(
+                        ref_w, ref_h, target_h, target_w)
+                    pixels = to_tensor(img).to(device, torch.float32)
+                    # bicubic to the sized target, [0, 1] -> [-1, 1], single frame
+                    pixels = torch.nn.functional.interpolate(
+                        pixels[None],
+                        size=(ph, pw),
+                        mode="bicubic",
+                        antialias=True,
+                    )[0].clamp(0.0, 1.0)
+                    frames = (pixels * 2.0 - 1.0).unsqueeze(1).unsqueeze(0)
+                    with torch.no_grad():
+                        latent = self.sd.encode_control_reference(frames)
+                    # (1, C, T, h, w) -> (C, T, h, w), exactly what
+                    # _build_condition stacks back up per reference index
+                    state_dict[f'ctrl_latent_{i}'] = latent.squeeze(0).cpu()
                 except Exception as e:
-                    print_acc(f"Error loading control image {control_path}: {e}")
+                    print_acc(f"Error caching control reference {control_path}: {e}")
                     skipped = True
                     break
-                ref_w, ref_h = img.size
-                ph, pw = self.sd.get_control_reference_size(
-                    ref_w, ref_h, target_h, target_w)
-                pixels = to_tensor(img).to(device, torch.float32)
-                # bicubic to the sized target, [0, 1] -> [-1, 1], single frame
-                pixels = torch.nn.functional.interpolate(
-                    pixels[None],
-                    size=(ph, pw),
-                    mode="bicubic",
-                    antialias=True,
-                )[0].clamp(0.0, 1.0)
-                frames = (pixels * 2.0 - 1.0).unsqueeze(1).unsqueeze(0)
-                with torch.no_grad():
-                    latent = self.sd.encode_control_reference(frames)
-                # (1, C, T, h, w) -> (C, T, h, w), exactly what
-                # _build_condition stacks back up per reference index
-                state_dict[f'ctrl_latent_{i}'] = latent.squeeze(0).cpu()
             if skipped:
+                # an item whose reference latents cannot be cached is removed
+                # from the dataset, like a failed latent cache -- never a vae
+                # residency held "just in case"
+                failed_items.append(file_item)
                 continue
             sidecar = control_latent_sidecar_path(file_item.path)
             os.makedirs(os.path.dirname(sidecar), exist_ok=True)
             from safetensors.torch import save_file
 
             save_file(state_dict, sidecar, metadata={"format": "pt"})
+        if failed_items:
+            print_acc(
+                f"Removed {len(failed_items)} files from the dataset whose "
+                "control reference latents failed to cache"
+            )
+            self._remove_file_items(failed_items)
         flush()
 
     def _remove_file_items(self: 'AiToolkitDataset', items_to_remove: List['FileItemDTO']):

@@ -2239,13 +2239,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # decide how the vae lives during training. Ranked by necessity, take
         # the highest that applies: unload < reload < keep.
-        # require_vae_during_training forces 'keep' only when train-time
-        # encoding is guaranteed (controls that cannot be cached). Cacheable
-        # controls get their sidecars in phase 1 (vae_load_needed covers that
-        # load); a sidecar missing at train time falls to the printed
-        # borrow-and-return in the model's encode path.
-        _model_wants_train_vae = getattr(self.sd, 'require_vae_during_training', False) and any(
-            ds.control_encode_live() for ds in all_dataset_objs
+        # require_vae_during_training forces 'keep' only for models WITHOUT
+        # the reference-latent cache (their per-step encode is the design).
+        # Cache-capable models never keep the vae for training: sidecars are
+        # written in phase 1, and an item whose sidecar fails is removed from
+        # the dataset -- never a vae residency "just in case".
+        _model_wants_train_vae = getattr(self.sd, 'require_vae_during_training', False) and not (
+            getattr(self.sd, 'supports_control_latent_cache', False)
         )
         if not self.is_latents_cached:
             # training encodes every batch; the vae must stay loaded
