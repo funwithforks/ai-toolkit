@@ -147,6 +147,18 @@ def rotate(x: torch.Tensor, rot_size: int) -> torch.Tensor:
     return torch.matmul(xb, h).reshape(shape)
 
 
+# NOTE (2026-11-15): a register-resident fast-Hadamard-butterfly rotate was
+# built and measured against this GEMM form and lost: butterfly 0.375 ms vs
+# gemm 0.213 ms at (9256, 6144) bf16, 0.627 vs 0.333 at (16384, 6144); the
+# quant-fused variant (one x read, int8 out) ties the current
+# rotate+triton-act-quant chain (~0.34 ms) because the per-row amax forces a
+# scratch round trip between the butterfly and the quantize. A fat-tile
+# re-batch of the same GEMM (block axis leading) is bitwise-identical but
+# ~2x slower (transpose copies + worse cublas tiles). The batched-GEMM form
+# above is the practical floor for this scheme on sm_120; the per-linear
+# rotate+act-quant cost that remains at 4MP is the scheme's own overhead.
+
+
 def to_blocked(m: torch.Tensor) -> torch.Tensor:
     """Rearrange an (R, C) scale matrix into the swizzled layout torch._scaled_mm
     expects for block-scaled fp4 (cublas 128x4-tile layout)."""
