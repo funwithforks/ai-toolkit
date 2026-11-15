@@ -301,6 +301,7 @@ class Krea2Pipeline:
         latents: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         ref_latents: Optional[List[List[torch.Tensor]]] = None,
+        return_latents: bool = False,
         **kwargs,
     ) -> List[Image.Image]:
         model = self.model
@@ -390,6 +391,12 @@ class Krea2Pipeline:
             if emit is not None and getattr(model, "sample_step_hook", None) is not None:
                 emit(latents - float(tcurr) * v, i, num_steps)
             latents = latents + (tprev - tcurr) * v
+
+        if return_latents:
+            # latent-output mode (staged sampling): the caller owns the
+            # latents from here; no decode, no vae. Kept in fp32 exactly as
+            # the Euler loop produced them, batch dim intact.
+            return [latents]
 
         images = model.decode_latents(latents, device=device, dtype=dtype)
         images = images.float().clamp(-1.0, 1.0)

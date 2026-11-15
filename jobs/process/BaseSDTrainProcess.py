@@ -943,7 +943,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 drop_fp32_outcome_wrapper(model)
         
         # prepare other things
-        self.optimizer = self.accelerator.prepare(self.optimizer)
+        if self.optimizer is not None:
+            self.optimizer = self.accelerator.prepare(self.optimizer)
         if self.lr_scheduler is not None:
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
         # self.data_loader = self.accelerator.prepare(self.data_loader)
@@ -2634,6 +2635,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         tokenizer = self.sd.tokenizer
         text_encoder = self.sd.text_encoder
         noise_scheduler = self.sd.noise_scheduler
+        optimizer = self.optimizer  # None for sampling-only runs (steps: 0)
 
         if self.train_config.xformers:
             if vae is not None:
@@ -3010,9 +3012,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
         
         # esure params require grad
         self.ensure_params_requires_grad(force=True)
-        optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
-                                  optimizer_params=self.train_config.optimizer_params)
-        self.optimizer = optimizer
+        if self.train_config.steps == 0:
+            # sampling-only run: nothing trains, so no optimizer/scheduler
+            # exists; the pre-loop and loop code paths guard on it
+            self.optimizer = None
+        elif not self.params:
+            raise ValueError(
+                "No trainable parameters but train.steps is "
+                f"{self.train_config.steps}: nothing would train. Set steps: 0 "
+                "for a sampling-only run, or enable a trainable network."
+            )
+        else:
+            optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
+                                      optimizer_params=self.train_config.optimizer_params)
+            self.optimizer = optimizer
         
         # set it to do paramiter swapping
         if self.train_config.do_paramiter_swapping:
@@ -3173,13 +3186,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if 'max_iterations' not in lr_scheduler_params:
             lr_scheduler_params['total_iters'] = self.train_config.steps
 
-        lr_scheduler = get_lr_scheduler(
-            self.train_config.lr_scheduler,
-            optimizer,
-            **lr_scheduler_params
+        lr_scheduler = (
+            get_lr_scheduler(
+                self.train_config.lr_scheduler,
+                self.optimizer,
+                **lr_scheduler_params
+            )
+            if self.optimizer is not None else None
         )
         self.lr_scheduler = lr_scheduler
-
         # wrap the datasets built during the prep phases into dataloaders
         # (all caching was already driven explicitly)
         if self.datasets is not None:
@@ -3447,9 +3462,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         main_since_reg = 0
 
         # zero any gradients
-        optimizer.zero_grad()
+        if self.optimizer is not None:
+            self.optimizer.zero_grad()
 
-        self.lr_scheduler.step(self.step_num)
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step(self.step_num)
 
         self.sd.set_device_state(self.train_device_state_preset)
         flush()

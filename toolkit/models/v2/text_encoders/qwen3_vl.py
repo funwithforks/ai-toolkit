@@ -62,30 +62,41 @@ class Qwen3VLTextEncoder(Qwen3VLForConditionalGeneration, OstrisTransformersMixi
 
     @classmethod
     def convert_state_dict_on_load(cls, state_dict):
-        """Comfy repack of this encoder is a text-tower-only file: its keys
-        sit at ``model.layers.*`` (Qwen3VLTextModel layout) while this class
-        nests the decoder at ``model.language_model.layers.*``. Remap the
-        prefix so the single-file path can attach its quantized linears and
-        assign everything else. Hub-repo files already carry the nested
-        layout and pass through untouched."""
-        if not any(k.startswith("model.layers.") for k in state_dict):
+        """Comfy repacks of this encoder are text-tower-only files. The fp8
+        repack keys sit at ``model.layers.*`` (Qwen3VLTextModel layout) while
+        this class nests the decoder at ``model.language_model.layers.*`` —
+        remap that prefix. The int8 convrot repacks are already stored in the
+        nested layout and only need the tied lm_head below. Hub-repo files
+        carry neither layout marker and pass through untouched."""
+        has_flat = any(k.startswith("model.layers.") for k in state_dict)
+        has_nested = any(k.startswith("model.language_model.layers.") for k in state_dict)
+        if not has_flat and not has_nested:
             return state_dict
-        converted = {}
-        for key, value in state_dict.items():
-            if key.startswith("model.visual."):
-                # the visual tower rides along in this repack; it is dropped
-                # after load (drop_vision_tower), its prefix already matches
+        if has_flat:
+            converted = {}
+            for key, value in state_dict.items():
+                if key.startswith("model.visual."):
+                    # the visual tower rides along in this repack; it is dropped
+                    # after load (drop_vision_tower), its prefix already matches
+                    converted[key] = value
+                elif key.startswith("model."):
+                    key = "model.language_model." + key[len("model."):]
                 converted[key] = value
-            elif key.startswith("model."):
-                key = "model.language_model." + key[len("model."):]
-            converted[key] = value
-        # this repack carries no lm_head: it is the tied-embedding case, so
-        # the head is the embedding table itself
-        if "model.language_model.embed_tokens.weight" in converted and not any(
-            k.startswith("lm_head.") for k in converted
-        ):
-            converted["lm_head.weight"] = converted["model.language_model.embed_tokens.weight"]
-        return converted
+            state_dict = converted
+        # comfy files drop the tied lm_head; strict load wants the key. When
+        # the embedding table is quantized, tie the whole quantized group
+        # (weight + scale + marker) instead and let the comfy-quant import
+        # build the head like any other quantized linear.
+        embed = state_dict.get("model.language_model.embed_tokens.weight")
+        if embed is not None and "lm_head.weight" not in state_dict:
+            if embed.is_floating_point():
+                state_dict["lm_head.weight"] = embed
+            else:
+                for suffix in ("weight", "weight_scale", "comfy_quant"):
+                    src = state_dict.get(f"model.language_model.embed_tokens.{suffix}")
+                    if src is not None:
+                        state_dict[f"lm_head.{suffix}"] = src
+        return state_dict
 
     @classmethod
     def get_transformer_block_names(cls):

@@ -34,6 +34,7 @@ from transformers import (
 from optimum.quanto import freeze
 
 from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConfig
+from toolkit.basic import flush
 from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.models.base_model import BaseModel
 from toolkit.models.phased_load import PhasedLoadMixin
@@ -197,6 +198,17 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
         # trained with kv_cache enabled for kv-cached inference (the ComfyUI
         # node / hub pipeline kv_cache toggles) to work properly.
         self.kv_cache = bool(self.model_config.model_kwargs.get("kv_cache", False))
+        # latent_output model_kwarg: staged sampling with no decode. Sampling
+        # returns raw latents (fp32) and decode_staged_samples saves them as
+        # a latent dataset (safetensors + txt sidecar); the vae never loads.
+        self.staged_sampling = bool(
+            self.model_config.model_kwargs.get("latent_output", False)
+        )
+        if self.staged_sampling and self.is_edit:
+            raise ValueError(
+                "latent_output (latent dataset generation) does not support "
+                "edit/control models: reference latents require the vae."
+            )
 
     @staticmethod
     def get_train_scheduler():
@@ -490,8 +502,50 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
             latents=gen_config.latents,
             generator=generator,
             ref_latents=ref_latents,
+            return_latents=self.staged_sampling,
         )[0]
         return img
+
+    def decode_staged_samples(self, staged_samples):
+        """latent_output mode: the 'decode' pass saves the latents themselves.
+
+        Each payload becomes a fp32 safetensors ``(16, h, w)`` latent whose
+        metadata header carries the prompt, resolution, and inference
+        parameters. The vae is never loaded. Writes land via tmp + atomic
+        replace so a partially written latent is never visible.
+        """
+        from toolkit.metadata import get_meta_for_safetensors
+
+        total = len(staged_samples)
+        mkw = self.model_config.model_kwargs
+        for gen_config, idx, payload in staged_samples:
+            latent = payload.detach().to('cpu').float().squeeze(0)
+            stem = os.path.splitext(
+                gen_config.get_image_path(idx, total))[0]
+            path = stem + '.safetensors'
+            tmp_folder = os.path.join(gen_config.output_folder, '.tmp')
+            os.makedirs(tmp_folder, exist_ok=True)
+            meta = {
+                'prompt': str(gen_config.prompt),
+                'negative_prompt': str(gen_config.negative_prompt),
+                'width': str(gen_config.width),
+                'height': str(gen_config.height),
+                'seed': str(gen_config.seed),
+                'steps': str(gen_config.num_inference_steps),
+                'guidance_scale': str(gen_config.guidance_scale),
+                'arch': self.arch,
+                'model': str(self.model_config.name_or_path),
+                'schedule_mu': str(mkw.get('schedule_mu', 'resolution_interpolated')),
+                'latent_channels': str(latent.shape[0]),
+            }
+            save_file(
+                {'latent': latent},
+                os.path.join(tmp_folder, os.path.basename(path)),
+                metadata=get_meta_for_safetensors(meta),
+            )
+            os.replace(os.path.join(tmp_folder, os.path.basename(path)), path)
+            self._after_sample_image(idx, total)
+            flush()
 
     # ------------------------------------------------------------------
     # Reference-image helpers

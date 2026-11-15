@@ -283,9 +283,17 @@ class SDTrainer(BaseSDTrainProcess):
     def _fixed_embed_cache_path(self, kind, text, flags, for_write=False):
         model_id = f"{self.sd.arch}|{self.sd.model_config.name_or_path}"
         space_version = getattr(self.sd, 'text_embedding_space_version', 0)
+        # One copy per unique prompt: a sample embed depends only on the text
+        # (plus model/space/flags), never on the sample index, so the filename
+        # digests the base kind. The full kind (with index) stays the
+        # positional load key, so the same prompt generated at several
+        # resolutions maps every index to the same file.
+        digest_kind = kind
+        if kind.startswith('sample_pos_') or kind.startswith('sample_neg_'):
+            digest_kind = kind.rsplit('_', 1)[0]
         flag_str = '|'.join(f'{k}={v}' for k, v in sorted(flags.items()))
         digest = hashlib.md5(
-            f"{kind}|{model_id}|{space_version}|{text}|{flag_str}".encode()
+            f"{digest_kind}|{model_id}|{space_version}|{text}|{flag_str}".encode()
         ).hexdigest()[:16]
         filename = f"{kind}_{digest}.safetensors"
         # Shared cache, keyed by model: what a prompt encodes to does not
@@ -375,8 +383,14 @@ class SDTrainer(BaseSDTrainProcess):
     def _load_fixed_embeds_from_cache(self):
         print_acc("Loading fixed prompt embeddings from cache")
         sample_cache = {}
+        loaded_by_path = {}  # one object per unique embed file, however many indices map to it
         for kind, text, flags in self._fixed_embed_targets():
-            embeds = PromptEmbeds.load(self._fixed_embed_cache_path(kind, text, flags))
+            path = self._fixed_embed_cache_path(kind, text, flags)
+            if path in loaded_by_path:
+                embeds = loaded_by_path[path]
+            else:
+                embeds = PromptEmbeds.load(path)
+                loaded_by_path[path] = embeds
             if kind == 'unconditional':
                 self.unconditional_embeds = embeds.to(
                     self.device_torch, dtype=self.sd.torch_dtype

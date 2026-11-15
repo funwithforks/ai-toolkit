@@ -1,4 +1,5 @@
 import os
+import json
 import time
 from typing import List, Optional, Literal, Tuple, Union, TYPE_CHECKING, Dict
 import random
@@ -122,13 +123,42 @@ class SampleConfig:
         self.comfy_workflow_dir: Optional[str] = kwargs.get('comfy_workflow_dir', None)
         self.comfy_workflow_path: Optional[str] = kwargs.get('comfy_workflow_path', None)
 
-        prompts: list[str] = kwargs.get('prompts', [])
-        
+        prompts: Union[str, List[str]] = kwargs.get('prompts', [])
+        # A string `prompts` is a path to a prompt file: one prompt per line
+        # (.txt) or a json list of strings (.json). Mass-generation prompt
+        # lists do not belong inline in the job config. Same convention as
+        # GenerateProcess.
+        if isinstance(prompts, str):
+            with open(prompts, 'r', encoding='utf-8') as f:
+                if prompts.endswith('.json'):
+                    file_prompts = json.load(f)
+                    if not isinstance(file_prompts, list):
+                        raise ValueError(
+                            f"Prompt json must be a list of strings: {prompts}")
+                    prompts = [str(x) for x in file_prompts]
+                else:
+                    prompts = [line.strip() for line in f if len(line.strip()) > 0]
+        prompts = [str(x) for x in prompts]
+
+        # stop condition: draw N prompts at random (seeded) instead of all
+        num_random_prompts = kwargs.get('num_random_prompts', None)
+        if num_random_prompts is not None:
+            rng = random.Random(kwargs.get('random_prompt_seed', 0))
+            prompts = rng.sample(prompts, min(int(num_random_prompts), len(prompts)))
+
         self.samples: Optional[List[SampleItem]] = None
         # use the legacy prompts if it is passed that way to get samples object
         default_samples_kwargs = [
             {"prompt": x} for x in prompts
         ]
+        # resolutions: [[w, h], ...] -- every prompt is generated at every
+        # listed resolution. An explicit `samples` list bypasses this.
+        resolutions = kwargs.get('resolutions', None)
+        if resolutions is not None:
+            default_samples_kwargs = [
+                {"prompt": p, "width": int(w), "height": int(h)}
+                for p in prompts for w, h in resolutions
+            ]
         raw_samples = kwargs.get('samples', default_samples_kwargs)
         self.samples = [SampleItem(self, **item) for item in raw_samples]
         # only for models that support it, (qwen image edit 2509 for now)
