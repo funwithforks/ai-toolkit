@@ -226,15 +226,28 @@ class PositionalEncoding(torch.nn.Module):
         self.axdims = axdims  # how to split the head dimension across the position axes
         self.theta = theta
         self.ntk = ntk
+        # step-invariant table cache: pos is rebuilt identically every denoise
+        # step at a fixed resolution, and the fp64->fp32 table rebuild is pure
+        # launch-bound overhead (~10 ms/forward). Keyed on layout, verified by
+        # content, so a same-shape different-content pos can never hit.
+        self._table_cache: dict = {}
 
     def forward(self, pos: Tensor) -> Tensor:
-        return torch.cat(
+        key = (tuple(pos.shape), str(pos.device), pos.dtype)
+        ent = self._table_cache.get(key)
+        if ent is not None and torch.equal(ent[0], pos):
+            return ent[1]
+        out = torch.cat(
             [
                 rope(pos[..., i], d, self.theta, self.ntk)
                 for i, d in enumerate(self.axdims)
             ],
             dim=-3,
         )
+        if len(self._table_cache) > 4:
+            self._table_cache.pop(next(iter(self._table_cache)))
+        self._table_cache[key] = (pos, out)
+        return out
 
 
 class QKNorm(torch.nn.Module):

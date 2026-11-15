@@ -1239,6 +1239,36 @@ def quantize_int8_rows_fused(x: torch.Tensor, qmax: int = 127):
 
 
 _actq_share: dict = {}
+_rot_share: dict = {}
+
+
+def _rotate_shared(x: torch.Tensor, rot: int, in_f: int) -> torch.Tensor:
+    """rotate() once per unique input per forward.
+
+    The sibling linears of a block (q/k/v/gate, the SwiGLU gate/up pair)
+    consume the IDENTICAL activation tensor, and each sibling's forward
+    rotates it itself — distinct rotated tensors that also keep the
+    _actq_share act-quant cache below from ever hitting (its key is the
+    activation's data_ptr). Caching the rotated tensor on the input's
+    identity collapses each sibling group to one rotate and one act-quant
+    per forward. The rotation is a pure function of (x, rot, in_f), so a
+    hit is bitwise-identical to recomputing; the same weakref+version guard
+    as _actq_share means a freed-and-recycled data_ptr or an in-place
+    mutation can never return a stale rotation. Skipped while compiling.
+    """
+    share = x.is_cuda and not torch.compiler.is_compiling()
+    key = None
+    if share:
+        key = (x.data_ptr(), x._version, tuple(x.shape), rot)
+        ent = _rot_share.get(key)
+        if ent is not None and ent[0]() is x and ent[1] == x._version:
+            return ent[2]
+    r = rotate(x, rot).reshape(-1, in_f)
+    if share:
+        if len(_rot_share) > 6:
+            _rot_share.pop(next(iter(_rot_share)))
+        _rot_share[key] = (weakref.ref(x), x._version, r)
+    return r
 
 
 def _int8_act_quant_padded(
@@ -2318,7 +2348,7 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
             # row padding for _int_mm happens inside the act-quant op (compile
             # safety); slice the mm output back to m rows (a contiguous prefix)
             aq, a_s = _int8_act_quant_padded(
-                rotate(x, rot).reshape(-1, in_f), self.act_qmax
+                _rotate_shared(x, rot, in_f), self.act_qmax
             )
             i32 = torch._int_mm(aq, self._qdata(module).t())
             out = _int8_epilogue(
