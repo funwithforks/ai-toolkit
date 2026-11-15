@@ -4,7 +4,7 @@ import path from 'path';
 import zlib from 'zlib';
 import { promisify } from 'util';
 import { getDatasetsRoot } from '@/server/settings';
-import { mediaExtensions } from '@/server/datasetCounts';
+import { mediaExtensions, generatedDirNames } from '@/server/datasetCounts';
 
 const brotliCompress = promisify(zlib.brotliCompress);
 const gzipCompress = promisify(zlib.gzip);
@@ -88,7 +88,7 @@ async function findImagesRecursively(dir: string): Promise<string[]> {
     const itemPath = path.join(dir, name);
 
     if (entry.isDirectory()) {
-      if (name === '_controls') continue;
+      if (name === '_controls' || generatedDirNames.has(name)) continue;
       subdirs.push(itemPath);
     } else if (entry.isFile()) {
       const ext = path.extname(name).toLowerCase();
