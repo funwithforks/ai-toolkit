@@ -209,14 +209,10 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
                 "latent_output (latent dataset generation) does not support "
                 "edit/control models: reference latents require the vae."
             )
-        # latent payloads are ~1 MB each on gpu; flushing the allocator every
-        # sample would push the next sample's transients back through
-        # cudaMalloc. 64 keeps the accumulation bound near 64 MB.
-        self.staged_flush_interval = (
-            int(self.model_config.model_kwargs.get("staged_flush_every", 64))
-            if self.staged_sampling
-            else 1
-        )
+        # never decodes, so the per-sample allocator flush buys nothing and
+        # costs a full cudaMalloc warm-up per sample; payloads accumulate on
+        # gpu for the round (~1 MB per latent)
+        self.staged_sample_flush = not self.staged_sampling
 
     @staticmethod
     def get_train_scheduler():

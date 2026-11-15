@@ -860,14 +860,12 @@ class BaseModel:
                         staged_samples.append((gen_config, i, img))
                         # return the allocator segments this sample's
                         # transients held so they don't accumulate across
-                        # samples of the round. Models with small payloads
-                        # (latent datasets) can stretch the interval via
-                        # staged_flush_interval - empty_cache between every
-                        # sample forces the next sample's transients back
-                        # through cudaMalloc (~0.7 s/sample on a 5090).
-                        if (i + 1) % getattr(
-                            self, "staged_flush_interval", 1
-                        ) == 0:
+                        # samples of the round. Models that never decode
+                        # (latent-output datasets) opt out via
+                        # staged_sample_flush = False: empty_cache between
+                        # samples pushes the next sample's transients back
+                        # through cudaMalloc.
+                        if getattr(self, "staged_sample_flush", True):
                             flush()
                     else:
                         gen_config.save_image_atomic(img, i)
