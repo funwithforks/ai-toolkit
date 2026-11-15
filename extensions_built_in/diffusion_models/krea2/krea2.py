@@ -275,6 +275,35 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
                     f"quantized linears (upstream grads quantized to int8; "
                     f"set model_kwargs int8_bwd=false for the eager backward)"
                 )
+        # fused CUTLASS int8 forward GEMM (comfy_kitchen): GEMM+dequant+bias
+        # in one kernel instead of _int_mm + the triton epilogue. Opt-in
+        # (model_kwargs int8_cutlass_gemm=true): not bitwise vs the _int_mm
+        # path, so quality must be accepted on the latents; every other
+        # model and the default here stay on _int_mm. The no-grad forward
+        # falls back per launch when the kernel declines a shape.
+        if self.model_config.model_kwargs.get("int8_cutlass_gemm", False):
+            from toolkit.util.convrot_quant import _get_cutlass_int8
+
+            if _get_cutlass_int8() is not None:
+                n = 0
+                for m in transformer.modules():
+                    if getattr(m, "cr8_qdata", None) is not None:
+                        m.cr8_cutlass_gemm = True
+                        n += 1
+                if n:
+                    self.print_and_status_update(
+                        f"  - int8 forward GEMM via fused CUTLASS on {n} "
+                        f"quantized linears (set model_kwargs "
+                        f"int8_cutlass_gemm=false for torch._int_mm)"
+                    )
+            else:
+                from toolkit.util.convrot_quant import _cutlass_state
+
+                self.print_and_status_update(
+                    f"  - int8_cutlass_gemm requested but the CUTLASS kernel "
+                    f"is unavailable ({_cutlass_state.get('why')}); staying "
+                    f"on torch._int_mm"
+                )
         flush()
         return transformer
 

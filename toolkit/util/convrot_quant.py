@@ -2350,6 +2350,22 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
             aq, a_s = _int8_act_quant_padded(
                 _rotate_shared(x, rot, in_f), self.act_qmax
             )
+            if getattr(module, "cr8_cutlass_gemm", False):
+                # opt-in fused GEMM+dequant+bias (one kernel instead of
+                # _int_mm + triton epilogue). Returns None on any unsupported
+                # shape/library and the _int_mm path runs unchanged.
+                out = _cutlass_gemm_forward(
+                    aq,
+                    a_s,
+                    self._qdata(module),
+                    self._scales(module),
+                    module.bias,
+                    x.dtype,
+                    m,
+                    None,
+                )
+                if out is not None:
+                    return out.reshape(*x.shape[:-1], out_f)
             i32 = torch._int_mm(aq, self._qdata(module).t())
             out = _int8_epilogue(
                 i32[:m], a_s[:m], self._scales(module), module.bias, x.dtype
