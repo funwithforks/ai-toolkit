@@ -709,9 +709,17 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
         combined = torch.cat((context, img), dim=1)
 
         # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
+        # Eager needs none of it: the int8 act-quant pads its M internally, the
+        # attention kernels take any sequence length, and the alignment slots
+        # are masked out of softmax anyway -- under compile the pad stays so
+        # kernel shapes stop re-specializing.
         fulllen = combined.shape[1]
         _padlen = (-fulllen) % 256
-        if _padlen > 0:
+        _padded = _padlen > 0 and torch.compiler.is_compiling()
+        if _padded:
+            combined = F.pad(combined, (0, 0, 0, _padlen))
+            mask = F.pad(mask, (0, _padlen), value=False)
+            pos = F.pad(pos, (0, 0, 0, _padlen))
             combined = F.pad(combined, (0, 0, 0, _padlen))
             mask = F.pad(mask, (0, _padlen), value=False)
             pos = F.pad(pos, (0, 0, 0, _padlen))
@@ -789,7 +797,8 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             blockvec = (tvec, self.tproj(t0), txtlen + imglen - reflen)
 
         padmask = mask  # (B, L) key-padding mask, incl. the 256-alignment pad
-        if packed or (trivial_mask and _padlen == 0):
+        if packed or (trivial_mask and not _padded):
+            # all-valid keys and no applied pad: no mask object needed
             mask = None
         else:
             mask = _mask(mask)

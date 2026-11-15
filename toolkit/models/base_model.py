@@ -858,11 +858,17 @@ class BaseModel:
                         # the model returned latents, not an image: decode
                         # every one at the end with the vae loaded
                         staged_samples.append((gen_config, i, img))
-                        # mirror the non-staged branch: return the allocator
-                        # segments this sample's transients held (embeds,
-                        # denoise buffers) so they don't accumulate across
-                        # samples of the round
-                        flush()
+                        # return the allocator segments this sample's
+                        # transients held so they don't accumulate across
+                        # samples of the round. Models with small payloads
+                        # (latent datasets) can stretch the interval via
+                        # staged_flush_interval - empty_cache between every
+                        # sample forces the next sample's transients back
+                        # through cudaMalloc (~0.7 s/sample on a 5090).
+                        if (i + 1) % getattr(
+                            self, "staged_flush_interval", 1
+                        ) == 0:
+                            flush()
                     else:
                         gen_config.save_image_atomic(img, i)
                         gen_config.log_image(img, i)
