@@ -134,8 +134,9 @@ matter:
 
 ### save block
 
-- `save.disable_saving: true` — no checkpoints, no optimizer state; the
-  job cannot be resumed and does not need to be.
+- `save.disable_saving: true` — no model checkpoints or optimizer state;
+  a latent job needs neither (dataset resumption is metadata-driven, see
+  the stop conditions below — not checkpoint-based).
 
 ### sample block
 
