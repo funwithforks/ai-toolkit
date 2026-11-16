@@ -709,17 +709,19 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
         combined = torch.cat((context, img), dim=1)
 
         # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
-        # Eager needs none of it: the int8 act-quant pads its M internally, the
-        # attention kernels take any sequence length, and the alignment slots
-        # are masked out of softmax anyway -- under compile the pad stays so
-        # kernel shapes stop re-specializing.
+        # The pad and the L x L mask build are pure overhead when the sequence
+        # is all-valid (the alignment slots are masked out of softmax anyway),
+        # but skipping them re-partitions flash-attention blocks and shifts
+        # numerics at the ulp level — so it happens only under torch.compile
+        # (where the pad exists to stabilize kernel shapes anyway) or on
+        # explicit opt-in (fast_attention_paths, set by generation-only
+        # configs). Training and every existing config keep the exact
+        # padded path.
         fulllen = combined.shape[1]
         _padlen = (-fulllen) % 256
-        _padded = _padlen > 0 and torch.compiler.is_compiling()
+        _fast_attn = getattr(self, "fast_attention_paths", False)
+        _padded = _padlen > 0 and (torch.compiler.is_compiling() or not _fast_attn)
         if _padded:
-            combined = F.pad(combined, (0, 0, 0, _padlen))
-            mask = F.pad(mask, (0, _padlen), value=False)
-            pos = F.pad(pos, (0, 0, 0, _padlen))
             combined = F.pad(combined, (0, 0, 0, _padlen))
             mask = F.pad(mask, (0, _padlen), value=False)
             pos = F.pad(pos, (0, 0, 0, _padlen))

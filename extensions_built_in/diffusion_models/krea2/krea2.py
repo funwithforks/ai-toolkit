@@ -308,6 +308,11 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
                     f"is unavailable ({_cutlass_state.get('why')}); staying "
                     f"on torch._int_mm"
                 )
+        # inference-only fast paths (no 256-pad, mask-free all-valid
+        # attention): ulp-level numerics shift, so generation-only configs
+        # opt in and training keeps the exact padded path
+        if self.model_config.model_kwargs.get("fast_attention_paths", False):
+            transformer.fast_attention_paths = True
         # fused rotate+hadamard+quant (one CTA per row, shared-memory
         # butterfly, per-row amax folded in): replaces the gemm rotate +
         # triton act-quant chain at ~1.6x. Opt-in (model_kwargs
