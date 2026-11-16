@@ -630,7 +630,7 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
             )
             os.replace(os.path.join(tmp_folder, os.path.basename(path)), path)
             self._after_sample_image(idx, total)
-            flush()
+    flush()
 
     # ------------------------------------------------------------------
     # Reference-image helpers

@@ -202,9 +202,14 @@ _fused_rq_buffers: dict = {}
 def _fused_rotate_quant(x2d: torch.Tensor, rot_size: int, qmax: int):
     """Fused rotate+quantize for a contiguous (M, K) bf16 row-major input.
     Returns (q (Mpad, K) int8, scales (Mpad,) fp32) with Mpad rounded up to
-    a multiple of 32 and the pad rows at q=0 / scale=1."""
+    a multiple of 32 and the pad rows at q=0 / scale=1. Returns None when
+    the row width exceeds the shared-memory budget (the CTA-per-row design
+    holds the row in shared; wide rows crush occupancy and lose to the
+    gemm chain — measured at K=16384: 1.494 ms fused vs 1.422 chain)."""
     ext = _get_fused_rq_ext()
     M, K = x2d.shape
+    if K * 4 + 1024 > 49152:  # K·4 row + reduction scratch over 48KB
+        return None
     Mpad = (M + 31) // 32 * 32
     device = x2d.device
     key = (device, Mpad, K)
@@ -2430,7 +2435,11 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
                 x2d = x.reshape(-1, in_f)
                 if not x2d.is_contiguous():
                     x2d = x2d.contiguous()
-                aq, a_s = _fused_rotate_quant(x2d, rot, self.act_qmax)
+                rq = _fused_rotate_quant(x2d, rot, self.act_qmax)
+            else:
+                rq = None
+            if rq is not None:
+                aq, a_s = rq
             else:
                 aq, a_s = _int8_act_quant_padded(
                     _rotate_shared(x, rot, in_f), self.act_qmax

@@ -341,6 +341,7 @@ class Krea2Pipeline:
         # transfers) is the only amortizable cost; hoist it if it ever
         # shows up in a profile rather than batching the denoise.
 
+        torch.cuda.synchronize()
         cond_feats, cond_mask = pad_text_features(
             conditional_embeds.text_embeds, device, dtype
         )
@@ -348,7 +349,6 @@ class Krea2Pipeline:
             uncond_feats, uncond_mask = pad_text_features(
                 unconditional_embeds.text_embeds, device, dtype
             )
-
         # min_res / max_res define the (x1,y1)-(x2,y2) interpolation endpoints for mu.
         align = ae_scale * patch
         x1 = (minres // align) ** 2
