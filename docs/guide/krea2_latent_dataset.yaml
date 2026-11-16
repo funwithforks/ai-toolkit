@@ -1,0 +1,69 @@
+# krea2 latent dataset generation — CLI config template.
+#
+# Generates fp32 latent safetensors datasets (no images, no VAE decode) from
+# prompt lists across multiple resolutions, using the krea2 turbo int8
+# convrot checkpoint with the inference fast paths. Training is unaffected:
+# every fast path here is opt-in and defaults off elsewhere.
+#
+# Requirements:
+#   - MODELS_PATH (or the hub via HF_ENDPOINT) holding:
+#       diffusion_models/krea2_turbo_int8_convrot.safetensors
+#       text_encoders/qwen3vl_4b_int8_convrot.safetensors
+#     Both resolve through the comfy-candidates door: a local file under
+#     MODELS_PATH wins, otherwise the hub reference downloads once.
+#   - HF_ENDPOINT set if pulling from a mirror.
+#
+# Knobs:
+#   sample.prompts      a list, or a path to a .txt (one prompt per line)
+#                       or .json (list of strings) file
+#   sample.resolutions  [[w, h], ...] — every prompt is generated at every
+#                       listed resolution
+#   sample.num_random_prompts / random_prompt_seed
+#                       draw N prompts at random instead of all (the second
+#                       stop condition); omit for all prompts
+#   sample.seed         walk_seed=false keeps one seed per prompt
+#
+# Outputs land under <training_folder>/<name>/samples/ as
+# [time]_<step>_<count>.safetensors whose metadata carries the prompt,
+# resolution, seed,
+# steps, guidance, schedule, and model identity.
+
+job: extension
+config:
+  name: krea2_latent_dataset
+  training_folder: output
+  process:
+  - type: sd_trainer
+    training_folder: output
+    device: cuda
+    model:
+      arch: krea2
+      name_or_path: krea/Krea-2-Turbo
+      dtype: bf16
+      quantize: none
+      model_kwargs:
+        checkpoint_filename: diffusion_models/krea2_turbo_int8_convrot.safetensors
+        text_encoder_path: Comfy-Org/Krea-2/text_encoders/qwen3vl_4b_int8_convrot.safetensors
+        int8_bwd: false
+        schedule_mu: 1.15
+        sample_schedule: simple
+        fast_attention_paths: true
+        int8_fused_rotate: true
+        int8_cutlass_gemm: true
+        latent_output: true
+    train:
+      dtype: bf16
+      steps: 0
+      skip_first_sample: true
+      unload_text_encoder: true
+    save:
+      disable_saving: true
+    sample:
+      neg: ''
+      guidance_scale: 1.0
+      sample_steps: 8
+      seed: 42
+      prompts:
+      - a red apple on a wooden table
+      - a rainy city street at night with neon signs
+      resolutions: [[512, 512], [832, 1216], [1024, 1024], [1536, 1536], [2048, 2048]]

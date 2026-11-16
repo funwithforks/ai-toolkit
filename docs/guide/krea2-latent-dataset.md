@@ -18,7 +18,7 @@ loaded, nothing is decoded, no images are produced. The save path is
 `Krea2Model.decode_staged_samples` (krea2.py), driven by the existing
 staged-sampling contract — there is no standalone script, no new job type,
 and no new config schema. A verified template config ships at
-`docs/kernel_opt/configs/krea2_latent_dataset.yaml`.
+`docs/guide/krea2_latent_dataset.yaml`.
 
 ## 2. Common misreadings, pre-answered
 
@@ -71,7 +71,7 @@ is wrong for the current tree.
 
 ## 4. The job config, every key explained
 
-Start from `docs/kernel_opt/configs/krea2_latent_dataset.yaml` — it is
+Start from `docs/guide/krea2_latent_dataset.yaml` — it is
 verified end-to-end and carries generic example prompts. The keys that
 matter:
 
