@@ -558,6 +558,25 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
         # CFG is 0 normalized for this model
         guidance = max(0.0, gen_config.guidance_scale - 1.0)
 
+        # latent datasets: draw the initial noise on-device. A cpu-generator
+        # randn + h2d costs ~4-6 ms per sample at 4MP and this path generates
+        # thousands; a device generator seeded from the recorded seed is
+        # ~0.01 ms. (The seed lands in the safetensors metadata either way.)
+        latents_in = gen_config.latents
+        if latents_in is None and self.staged_sampling:
+            g = torch.Generator(device=self.device_torch).manual_seed(
+                gen_config.seed
+            )
+            latents_in = torch.randn(
+                1,
+                KREA2_MMDIT_CONFIG["channels"],
+                gen_config.height // self.vae_scale_factor,
+                gen_config.width // self.vae_scale_factor,
+                device=self.device_torch,
+                dtype=torch.float32,
+                generator=g,
+            )
+
         img = pipeline(
             conditional_embeds=conditional_embeds,
             unconditional_embeds=unconditional_embeds,
@@ -565,7 +584,7 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
             width=gen_config.width,
             num_inference_steps=gen_config.num_inference_steps,
             guidance_scale=guidance,
-            latents=gen_config.latents,
+            latents=latents_in,
             generator=generator,
             ref_latents=ref_latents,
             return_latents=self.staged_sampling,
