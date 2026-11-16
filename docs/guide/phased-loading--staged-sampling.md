@@ -14,6 +14,13 @@ during the expensive loop; the vae only returns at the end to turn latents
 into pixels. It is opt-in per model and must stay completely invisible to
 models that do not set it.
 
+For krea2, this contract also carries **latent dataset generation**
+(`model_kwargs.latent_output: true`): the "decode" phase saves fp32 latent
+safetensors instead of decoding, and the vae is never loaded at all. The
+complete usage guide — job config, knobs, outputs, performance — is
+docs/guide/krea2-latent-dataset.md; do not re-derive the job shape from
+this file.
+
 ## The switch
 
 `BaseModel.staged_sampling` (`toolkit/models/base_model.py:385`), default
