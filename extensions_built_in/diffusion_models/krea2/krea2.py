@@ -332,9 +332,11 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
                 if n:
                     self.print_and_status_update(
                         f"  - int8 rotate+quant via the fused shared-memory "
-                        f"butterfly on {n} quantized linears (set "
-                        f"model_kwargs int8_fused_rotate=false for the "
-                        f"gemm rotate + act-quant chain)"
+                        f"butterfly enabled on {n} quantized linears "
+                        f"(rows wider than the shared-memory budget fall "
+                        f"back to the gemm rotate + act-quant chain per "
+                        f"launch; set model_kwargs int8_fused_rotate=false "
+                        f"for the chain everywhere)"
                     )
             else:
                 self.print_and_status_update(
