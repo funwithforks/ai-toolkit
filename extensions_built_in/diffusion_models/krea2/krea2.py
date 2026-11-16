@@ -622,6 +622,7 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
                 'guidance_scale': str(gen_config.guidance_scale),
                 'arch': self.arch,
                 'model': str(self.model_config.name_or_path),
+                'vae_id': str(self.vae_id),
                 'schedule_mu': str(mkw.get('schedule_mu', 'resolution_interpolated')),
                 'latent_channels': str(latent.shape[0]),
             }

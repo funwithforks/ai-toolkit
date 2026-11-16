@@ -527,6 +527,42 @@ class BaseModel:
         return install_sample_step_hooks(self, pipeline)
 
     @torch.no_grad()
+    def _scan_completed_staged(self, image_configs):
+        """Metadata-driven resume for staged latent runs: scan the output
+        directory's safetensors headers and return the set of completed
+        (prompt, width, height, seed) tuples. A restarted or extended run
+        generates only the remainder; nothing is deleted. Filenames are
+        generation-time-stamped and cannot be matched, so the skip is
+        metadata-based by necessity."""
+        import json
+        from safetensors import safe_open
+
+        completed = set()
+        seen_dirs = set()
+        sc = self.get_bucket_divisibility()
+        for gen_config in image_configs:
+            out_dir = gen_config.output_folder
+            if out_dir is None or out_dir in seen_dirs or not os.path.isdir(out_dir):
+                continue
+            seen_dirs.add(out_dir)
+            for name in os.listdir(out_dir):
+                if not name.endswith(".safetensors"):
+                    continue
+                try:
+                    with safe_open(os.path.join(out_dir, name), framework="pt") as f:
+                        md = f.metadata()
+                    if md is None:
+                        continue
+                    completed.add((
+                        md.get("prompt"),
+                        int(md["width"]) // sc * sc,
+                        int(md["height"]) // sc * sc,
+                        int(md["seed"]),
+                    ))
+                except Exception:
+                    continue  # unreadable/partial file: regenerate it
+        return completed
+
     def generate_images(
             self,
             image_configs: List[GenerateImageConfig],
@@ -585,6 +621,19 @@ class BaseModel:
 
         unwrap_step_hooks = self._install_sample_step_hooks(pipeline)
 
+        # staged latent runs resume by metadata: skip configs whose
+        # (prompt, resolution, seed) already exist on disk. A killed run
+        # becomes "run it again"; an extended prompt list generates only
+        # the new prompts. Nothing is deleted.
+        completed_staged = set()
+        if self.staged_sampling:
+            completed_staged = self._scan_completed_staged(image_configs)
+            if completed_staged:
+                print_acc(
+                    f"  - staged resume: {len(completed_staged)} completed "
+                    f"latent(s) found on disk; matching samples will be skipped"
+                )
+
         start_multiplier = 1.0
         if network is not None:
             start_multiplier = network.multiplier
@@ -598,6 +647,17 @@ class BaseModel:
 
                 for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=True, position=0):
                     gen_config = image_configs[i]
+
+                    if self.staged_sampling and completed_staged:
+                        _sc = self.get_bucket_divisibility()
+                        _key = (
+                            gen_config.prompt,
+                            gen_config.width // _sc * _sc,
+                            gen_config.height // _sc * _sc,
+                            gen_config.seed,
+                        )
+                        if _key in completed_staged:
+                            continue
 
                     extra = {}
                     validation_image = None

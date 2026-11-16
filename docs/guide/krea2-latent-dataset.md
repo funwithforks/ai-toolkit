@@ -166,8 +166,8 @@ matter:
   — one file per generated latent, fp32, shape `(16, H/8, W/8)`, written
   via a hidden `.tmp` dir + atomic rename (watchers never see a partial
   file). Metadata keys: `prompt`, `negative_prompt`, `width`, `height`,
-  `seed`, `steps`, `guidance_scale`, `arch`, `model`, `schedule_mu`,
-  `latent_channels`, `software`, `format: pt`.
+  `seed`, `steps`, `guidance_scale`, `arch`, `model`, `vae_id`,
+  `schedule_mu`, `latent_channels`, `software`, `format: pt`.
 - Embeddings: `<training_folder>/.prompt_embed_cache/<model-hash>/` — one
   copy per unique prompt text regardless of how many resolutions reuse it.
   **Delete this directory after the latents are verified**; it is a cache,
@@ -180,9 +180,13 @@ matter:
 2. **N random prompts x all resolutions**: add
    `num_random_prompts: N` (+ `random_prompt_seed` for reproducibility).
 
-There is no third stop condition and no resume: a killed run is restarted
-by deleting the partial `samples/` directory (the embed cache makes the
-restart cheap — no text-encoder load).
+**Resume is automatic and metadata-driven**: on start the job scans the
+output directory's safetensors headers and skips any sample whose
+(prompt, resolution, seed) already exists on disk. A killed run becomes
+"run it again"; an extended prompt list generates only the new prompts;
+nothing is deleted. Filename-based skipping is impossible (names carry a
+generation timestamp), which is why the skip reads metadata headers.
+There is no third stop condition.
 
 ## 7. Performance (measured, RTX 5090 @ 550 W, RTX 6000 Pro @ 550 W)
 
