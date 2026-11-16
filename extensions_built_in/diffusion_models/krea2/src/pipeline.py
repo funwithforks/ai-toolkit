@@ -333,6 +333,14 @@ class Krea2Pipeline:
             )
         latents = latents.to(device, dtype=torch.float32)
 
+        # NOTE (2026-11-15): per-image batching was measured as a strict loss
+        # at every resolution (512x512 B=8: 0.98x, 768x512: 0.94x — the GPU
+        # work scales linearly with batch members and the CPU dispatch
+        # overlaps it asynchronously), so the generate loop stays batch-1.
+        # Per-sample prep that repeats here (this noise draw, embed
+        # transfers) is the only amortizable cost; hoist it if it ever
+        # shows up in a profile rather than batching the denoise.
+
         cond_feats, cond_mask = pad_text_features(
             conditional_embeds.text_embeds, device, dtype
         )
@@ -345,7 +353,22 @@ class Krea2Pipeline:
         align = ae_scale * patch
         x1 = (minres // align) ** 2
         x2 = (maxres // align) ** 2
-        ts = timesteps(gh * gw, num_inference_steps, x1, x2, y1=y1, y2=y2, mu=mu)
+        if mkw.get("sample_schedule", "mu_shift") == "simple":
+            # ComfyUI simple_scheduler: index-uniform sampling of the model's
+            # sigma table (ModelSamplingDiscreteFlow: time_snr_shift with the
+            # krea2 shift), descending with a trailing 0.0. Same flow-time
+            # space as timesteps() — the Euler loop below consumes any
+            # monotone grid ending at 0. The mu/seq_len args are unused on
+            # this path.
+            sh = float(mkw.get("sample_schedule_simple_shift", 1.15))
+            n = 1000
+            tt = torch.arange(1, n + 1, dtype=torch.float64) / n
+            table = (sh * tt) / (1 + (sh - 1) * tt)
+            ss = n / num_inference_steps
+            ts = [float(table[-(1 + int(x * ss))]) for x in range(num_inference_steps)]
+            ts.append(0.0)
+        else:
+            ts = timesteps(gh * gw, num_inference_steps, x1, x2, y1=y1, y2=y2, mu=mu)
 
         # With the kv_cache model kwarg (isolated ref attention) the ref K/V
         # are step-invariant, so the very first model call doubles as the
