@@ -308,6 +308,34 @@ class Krea2Model(PhasedLoadMixin, BaseModel):
                     f"is unavailable ({_cutlass_state.get('why')}); staying "
                     f"on torch._int_mm"
                 )
+        # fused rotate+hadamard+quant (one CTA per row, shared-memory
+        # butterfly, per-row amax folded in): replaces the gemm rotate +
+        # triton act-quant chain at ~1.6x. Opt-in (model_kwargs
+        # int8_fused_rotate=true); composes with int8_cutlass_gemm (the
+        # fused kernel feeds either GEMM engine). Falls back to the chain
+        # per launch if the extension is missing.
+        if self.model_config.model_kwargs.get("int8_fused_rotate", False):
+            from toolkit.util.convrot_quant import _get_fused_rq_ext
+
+            ext = _get_fused_rq_ext()
+            if ext is not None and ext is not False:
+                n = 0
+                for m in transformer.modules():
+                    if getattr(m, "cr8_qdata", None) is not None:
+                        m.cr8_fused_rq = True
+                        n += 1
+                if n:
+                    self.print_and_status_update(
+                        f"  - int8 rotate+quant via the fused shared-memory "
+                        f"butterfly on {n} quantized linears (set "
+                        f"model_kwargs int8_fused_rotate=false for the "
+                        f"gemm rotate + act-quant chain)"
+                    )
+            else:
+                self.print_and_status_update(
+                    "  - int8_fused_rotate requested but the extension is "
+                    "unavailable; staying on the gemm rotate + act-quant chain"
+                )
         flush()
         return transformer
 

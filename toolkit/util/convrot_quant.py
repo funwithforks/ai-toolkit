@@ -154,9 +154,69 @@ def rotate(x: torch.Tensor, rot_size: int) -> torch.Tensor:
 # rotate+triton-act-quant chain (~0.34 ms) because the per-row amax forces a
 # scratch round trip between the butterfly and the quantize. A fat-tile
 # re-batch of the same GEMM (block axis leading) is bitwise-identical but
-# ~2x slower (transpose copies + worse cublas tiles). The batched-GEMM form
-# above is the practical floor for this scheme on sm_120; the per-linear
-# rotate+act-quant cost that remains at 4MP is the scheme's own overhead.
+# ~2x slower (transpose copies + worse cublas tiles). What DOES win is the
+# fused CUDA kernel below (one CTA per row, the butterfly in shared memory,
+# amax + int8 folded in): 0.201 ms vs 0.324 at (9256, 6144), 0.344 vs 0.545
+# at (16384, 6144) — 1.6x over rotate+act-quant, one read of x, one write
+# of int8. Opt-in per module via cr8_fused_rq.
+
+
+_fused_rq_ext = None
+
+
+def _get_fused_rq_ext():
+    """Lazy build of toolkit/kernels/rot_fht/fused.cu: one CTA per row, the
+    block regular-Hadamard rotation in shared memory with the per-row amax
+    and int8 quantize folded in. Returns (q (Mpad, K) int8, scales (Mpad,))
+    for a (M, K) bf16 input; rows >= M stay at the caller's init (0 / 1.0).
+    Returns False when the build fails (caller stays on the gemm chain)."""
+    global _fused_rq_ext
+    if _fused_rq_ext is not None:
+        return _fused_rq_ext
+    try:
+        import os
+        from torch.utils.cpp_extension import load
+
+        src = os.path.join(
+            os.path.dirname(__file__), "..", "kernels", "rot_fht", "fused.cu"
+        )
+        ext = load(
+            name="rot_fht_quant_ext",
+            sources=[src],
+            extra_cuda_cflags=["-O3"],
+            verbose=False,
+        )
+        _fused_rq_ext = ext
+    except Exception as e:
+        print_acc(
+            "ConvRot: fused rotate+quant extension failed to build "
+            f"({e}); staying on the gemm rotate + act-quant chain"
+        )
+        _fused_rq_ext = False
+    return _fused_rq_ext
+
+
+_fused_rq_buffers: dict = {}
+
+
+def _fused_rotate_quant(x2d: torch.Tensor, rot_size: int, qmax: int):
+    """Fused rotate+quantize for a contiguous (M, K) bf16 row-major input.
+    Returns (q (Mpad, K) int8, scales (Mpad,) fp32) with Mpad rounded up to
+    a multiple of 32 and the pad rows at q=0 / scale=1."""
+    ext = _get_fused_rq_ext()
+    M, K = x2d.shape
+    Mpad = (M + 31) // 32 * 32
+    device = x2d.device
+    key = (device, Mpad, K)
+    buf = _fused_rq_buffers.get(key)
+    if buf is None:
+        q = torch.zeros(Mpad, K, device=device, dtype=torch.int8)
+        s = torch.ones(Mpad, device=device, dtype=torch.float32)
+        buf = (q, s)
+        _fused_rq_buffers[key] = buf
+    q, s = buf
+    ext.rot_fht_quant(x2d, q, s, qmax)
+    return q, s
 
 
 def to_blocked(m: torch.Tensor) -> torch.Tensor:
@@ -2359,9 +2419,22 @@ class ConvRotInt8Quantizer(OstrisQuantizer):
         if _int8_gemm_supported(x.device):
             # row padding for _int_mm happens inside the act-quant op (compile
             # safety); slice the mm output back to m rows (a contiguous prefix)
-            aq, a_s = _int8_act_quant_padded(
-                _rotate_shared(x, rot, in_f), self.act_qmax
-            )
+            if getattr(module, "cr8_fused_rq", False):
+                # opt-in fused rotate+quantize (one CTA per row, shared-memory
+                # butterfly, amax folded in): ~1.6x over the gemm+act-quant
+                # chain. Falls back to the chain if the extension is missing.
+                ext = _get_fused_rq_ext()
+            else:
+                ext = None
+            if ext is not None and ext is not False:
+                x2d = x.reshape(-1, in_f)
+                if not x2d.is_contiguous():
+                    x2d = x2d.contiguous()
+                aq, a_s = _fused_rotate_quant(x2d, rot, self.act_qmax)
+            else:
+                aq, a_s = _int8_act_quant_padded(
+                    _rotate_shared(x, rot, in_f), self.act_qmax
+                )
             if getattr(module, "cr8_cutlass_gemm", False):
                 # opt-in fused GEMM+dequant+bias (one kernel instead of
                 # _int_mm + triton epilogue). Returns None on any unsupported
