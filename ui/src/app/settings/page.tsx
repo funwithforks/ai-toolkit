@@ -128,6 +128,25 @@ export default function Settings() {
                     placeholder="Enter models folder path"
                   />
                 </div>
+
+                <div>
+                  <label htmlFor="HF_ENDPOINT" className="block text-sm font-medium mb-2">
+                    Hugging Face Endpoint
+                    <div className="text-gray-500 text-sm ml-1">
+                      Mirror for Hugging Face downloads (e.g. a local caching proxy). Used by runtool-spawned training
+                      runs when HF_ENDPOINT is not already set in the environment. If blank, huggingface.co is used.
+                    </div>
+                  </label>
+                  <input
+                    type="text"
+                    id="HF_ENDPOINT"
+                    name="HF_ENDPOINT"
+                    value={settings.HF_ENDPOINT}
+                    onChange={handleChange}
+                    className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
+                    placeholder="https://huggingface.co"
+                  />
+                </div>
               </div>
             </div>
           </div>

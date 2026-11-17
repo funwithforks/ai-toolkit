@@ -398,6 +398,16 @@ def supervise(run_id):
         return 2
     env = dict(os.environ)
     env.update({k: str(v) for k, v in manifest.get("env", {}).items()})
+    # HF mirror override: an explicit HF_ENDPOINT in the spawning
+    # environment (submitter shell, opencode host, suite env_over) wins;
+    # the UI setting fills the gap so agent and remote runs pick up the
+    # machine's mirror without any shell config. Applied here, the single
+    # choke point every spawned run passes through, before the trainer
+    # process starts (hub/diffusers read HF_ENDPOINT at import time).
+    hf_endpoint = get_ui_setting("HF_ENDPOINT")
+    if hf_endpoint and "HF_ENDPOINT" not in env:
+        env["HF_ENDPOINT"] = hf_endpoint
+        emit(paths, "hf_endpoint_applied", value=hf_endpoint)
     emit(paths, "supervise_start", argv=manifest["argv"])
     with open(paths.stdout, "ab") as out, open(paths.stderr, "ab") as err:
         proc = subprocess.Popen(
