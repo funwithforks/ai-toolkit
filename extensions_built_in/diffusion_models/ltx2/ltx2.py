@@ -23,14 +23,16 @@ from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
-from .ltx23_stream import (
+from toolkit.util.weight_stream import (
     build_stream_plan,
-    gemma3_stream_key,
-    pack_audio_latents,
     plain_stream_load,
-    quantize_streamed_plan,
     stream_assign,
     stream_meta_check,
+)
+from .ltx23_stream import (
+    gemma3_stream_key,
+    pack_audio_latents,
+    quantize_streamed_plan,
 )
 from accelerate import init_empty_weights
 from toolkit.accelerator import unwrap_model

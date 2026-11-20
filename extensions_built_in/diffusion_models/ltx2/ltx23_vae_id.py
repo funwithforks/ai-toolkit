@@ -28,7 +28,11 @@ from .ltx23_files import (
     LTX23VideoVAE,
     resolve_component_source,
 )
-from .ltx23_stream import build_stream_plan, stream_assign, stream_meta_check
+from toolkit.util.weight_stream import (
+    build_stream_plan,
+    stream_assign,
+    stream_meta_check,
+)
 
 
 def _load_ltx2_vae(model):

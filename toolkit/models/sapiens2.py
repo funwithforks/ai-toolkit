@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.init import trunc_normal_
 from torch.utils.checkpoint import checkpoint
-from toolkit.paths import MODELS_PATH
 import os
 
 
@@ -1067,25 +1066,42 @@ class Sapiens2Matting(nn.Module):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> "Sapiens2Matting":
-        import huggingface_hub
-        from safetensors.torch import load_file
+        # Direct-to-GPU load on the shared rail: file resolved through the
+        # resolver chain (model dir override -> MODELS_PATH/mask/sapiens2 ->
+        # recursive search -> hub download into that folder), then streamed
+        # tensor-by-tensor onto `device` by WeightSource -- peak host ram is
+        # the largest tensor, never the ~5.7 GB fp32 file plus a CPU copy of
+        # the model. `dtype` is an explicit per-model choice applied per
+        # tensor at stream time; None keeps the shipped precision.
+        from accelerate import init_empty_weights
 
-        safetensors_path = os.path.join(MODELS_PATH, "mask", "sapiens2", filename)
-        if not os.path.exists(safetensors_path):
-            print(f"Downloading pretrained weights from HuggingFace Hub: {repo_id}/{filename}...")
-            os.makedirs(os.path.dirname(safetensors_path), exist_ok=True)
-            safetensors_path = huggingface_hub.hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                local_dir=os.path.join(MODELS_PATH, "mask", "sapiens2"),
-            )
+        from toolkit.models.v2.resolver import resolve_component_file
+        from toolkit.util.weight_stream import stream_load_module
+
+        safetensors_path = resolve_component_file(
+            f"{repo_id}/{filename}",
+            folder=os.path.join("mask", "sapiens2"),
+            component="sapiens2 matting",
+            status_fn=print,
+        )
         print(f"Loading mask model sapiens2 from {safetensors_path}")
-        model = cls(arch=arch, img_size=img_size, patch_size=patch_size)
-        state_dict = load_file(safetensors_path)
-        model.load_state_dict(state_dict)
+        with init_empty_weights(include_buffers=False):
+            model = cls(arch=arch, img_size=img_size, patch_size=patch_size)
+        # checkpoint keys match the module exactly (the old strict
+        # load_state_dict demanded it) -- identity plan, no remap
+        stream_load_module(
+            model,
+            safetensors_path,
+            device,
+            dtype=dtype,
+            name="sapiens2 matting",
+        )
+        # place/cast the computed buffers (rope periods; constructed real on
+        # CPU under the shell, small) exactly where the old whole-model
+        # .to(device, dtype) left them; params are already home, so this is
+        # a no-op for them
+        model.to(device=device, dtype=dtype)
         model.eval()
-        if device is not None or dtype is not None:
-            model.to(device=device, dtype=dtype)
         return model
 
     @property

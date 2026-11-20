@@ -1,10 +1,14 @@
-"""LTX-2.3 streamed loading helpers.
+"""LTX-2.3 streamed loading: model-specific key logic on top of the shared
+stream primitives.
 
-Pure functions: no model imports, no globals. The 2.3 loaders (ltx2.py) and
-the ltx2 vae_id entry (ltx23_vae_id.py) both build plans with these and fault
-tensors through a WeightSource one key at a time, so no whole-checkpoint
-state dict is ever materialized -- the 46 GB mono file loads at a peak of one
-tensor (as-shipped) or one block (stream-quantized).
+The general primitives (``build_stream_plan`` / ``stream_assign`` /
+``stream_meta_check`` / ``plain_stream_load`` and their internals) live in
+``toolkit.util.weight_stream`` -- the shared home for every stream-to-GPU
+consumer. What stays here is LTX-2.3's own key semantics: the 2.3 loaders
+(ltx2.py) and the ltx2 vae_id entry (ltx23_vae_id.py) build plans with these
+and fault tensors through a WeightSource one key at a time, so no
+whole-checkpoint state dict is ever materialized -- the 46 GB mono file loads
+at a peak of one tensor (as-shipped) or one block (stream-quantized).
 
 Semantics come from the upstream 2.3 load path
 (extensions_built_in/diffusion_models/ltx2/convert_ltx2_to_diffusers.py): the
@@ -24,6 +28,7 @@ from toolkit.util.quantize import (
     get_qtype,
     group_stream_plan_by_blocks,
 )
+from toolkit.util.weight_stream import stream_assign, stream_meta_check
 
 
 def gemma3_stream_key(key: str) -> Optional[str]:
@@ -63,194 +68,6 @@ def gemma3_stream_key(key: str) -> Optional[str]:
     if nk.startswith("model.norm."):
         return "model.language_model.norm." + nk[len("model.norm."):]
     return nk
-
-
-def remap_file_key(
-    key: str, rename_dict: Dict[str, str], special_keys_remap: Dict[str, object]
-) -> Optional[str]:
-    """Apply the converters' key renames to one key. The special handlers are
-    in-place dict key ops on the batched converters; emulated here on a
-    one-key carrier (they never read the values). Returns None when a handler
-    drops the key."""
-    new_key = key
-    for replace_key, rename_key in rename_dict.items():
-        new_key = new_key.replace(replace_key, rename_key)
-    for special_key, handler in special_keys_remap.items():
-        if special_key not in new_key:
-            continue
-        carrier = {new_key: None}
-        handler(new_key, carrier)
-        if not carrier:
-            return None  # key dropped by the handler
-        new_key = next(iter(carrier))
-    return new_key
-
-
-def build_stream_plan(
-    source,
-    prefix: str,
-    rename_dict: Dict[str, str],
-    special_keys_remap: Dict[str, object],
-    skip_prefixes: Tuple[str, ...] = (),
-    keep_prefixes: Tuple[str, ...] = (),
-) -> Dict[str, Tuple[object, str]]:
-    """Map one WeightSource's keys onto meta-shell module keys.
-
-    ``prefix`` filters the file (e.g. "model.diffusion_model." for the mono
-    checkpoint's dit section, "" for a bare-key split file); keys under
-    ``skip_prefixes`` (relative to the prefix) are left out, and when
-    ``keep_prefixes`` is given only keys under one of them survive -- the
-    connector/transformer split of one dit file classifies with the same
-    tuple both ways."""
-    plan: Dict[str, Tuple[object, str]] = {}
-    for file_key in source.keys():
-        if prefix and not file_key.startswith(prefix):
-            continue
-        key = file_key[len(prefix):] if prefix else file_key
-        if any(key.startswith(sp) for sp in skip_prefixes):
-            continue
-        if keep_prefixes and not any(key.startswith(kp) for kp in keep_prefixes):
-            continue
-        mapped = remap_file_key(key, rename_dict, special_keys_remap)
-        if mapped is not None:
-            plan[mapped] = (source, file_key)
-    return plan
-
-
-def _probe_load_mem(tag: str, i: int, total: int) -> None:
-    """Live rss/vram probe every 200 items (and on demand): the trajectory
-    names the culprit if a load ooms mid-stream (per-tensor paths cap at
-    largest-tensor ram; a whole-dict path ramps to model size). Gated behind
-    AITK_LOAD_DEBUG=1 -- per-block prints flood a normal run's output."""
-    if not os.environ.get("AITK_LOAD_DEBUG") == "1":
-        return
-    if i % 200:
-        return
-    for line in open("/proc/self/status"):
-        if line.startswith("VmRSS"):
-            rss = int(line.split()[1]) / 1024
-            vram = (
-                torch.cuda.memory_allocated() / 1e9
-                if torch.cuda.is_available()
-                else 0.0
-            )
-            print(
-                f"[load-mem] {tag}: {i}/{total} rss {rss:.0f}MB vram {vram:.1f}GB",
-                flush=True,
-            )
-            break
-
-
-def _assign_to_owner(module: torch.nn.Module, mod_key: str, tensor) -> None:
-    """Assign one tensor to its owning submodule, not the root.
-
-    A root-level load_state_dict walks every child -- including modules a
-    previous stream-quantize step already converted, whose custom
-    _load_from_state_dict pops its keys unconditionally and raises on a
-    partial dict. Deeper keys are delivered to their own parent (that
-    subtree is quantization-free at assign time: blocks are fully assigned
-    before they are quantized, and the extras live outside the block
-    lists); top-level keys are assigned directly for the same reason."""
-    parent_path, _, _ = mod_key.rpartition(".")
-    if parent_path:
-        rel_key = mod_key[len(parent_path) + 1:]
-        target = module.get_submodule(parent_path)
-        target.load_state_dict({rel_key: tensor}, assign=True, strict=False)
-        return
-    if mod_key in module._parameters:
-        old = module._parameters[mod_key]
-        module._parameters[mod_key] = torch.nn.Parameter(
-            tensor, requires_grad=old.requires_grad
-        )
-    elif mod_key in module._buffers:
-        module._buffers[mod_key] = tensor
-    else:
-        raise KeyError(
-            f"{mod_key} is neither a top-level parameter nor a buffer of "
-            f"{type(module).__name__}"
-        )
-
-
-def stream_assign(
-    module: torch.nn.Module,
-    plan: Dict[str, Tuple[object, str]],
-    device,
-    name: str,
-    cast_dtype: Optional[torch.dtype] = None,
-    orig_dtype: Optional[torch.dtype] = None,
-) -> int:
-    """Assign every planned tensor into the (meta) module, one get() at a
-    time, handling comfy-quant marker groups module-at-a-time. Nothing is
-    copied or recast unless ``cast_dtype`` is given -- that is the quantize
-    path's job, mirroring the batched rail's whole-model ``.to(dtype)`` before
-    quantization (the fp32 modulation tables ride that cast there too).
-    Returns the number of pre-quantized layers attached. No completeness
-    check here: stream in pieces with ``stream_meta_check`` at the end."""
-    from toolkit.util.comfy_quant_import import import_comfy_quantized_layers
-
-    orig_dtype = orig_dtype if orig_dtype is not None else torch.bfloat16
-    num_quantized = 0
-    consumed = set()
-    for marker_key in sorted(k for k in plan if k.endswith(".comfy_quant")):
-        prefix = marker_key[: -len(".comfy_quant")]
-        group = {}
-        group_files = []
-        for mod_key, (source, file_key) in plan.items():
-            if mod_key == prefix or mod_key.startswith(prefix + "."):
-                group[mod_key] = source.get(file_key, device)
-                group_files.append(file_key)
-        remaining, n = import_comfy_quantized_layers(
-            module, group, orig_dtype=orig_dtype
-        )
-        for mod_key, tensor in remaining.items():
-            _assign_to_owner(module, mod_key, tensor)
-        consumed.update(group_files)
-        num_quantized += n
-    total = len(plan)
-    for mod_key, (source, file_key) in plan.items():
-        if file_key in consumed:
-            continue
-        tensor = source.get(file_key, device)
-        if cast_dtype is not None and tensor.dtype != cast_dtype:
-            tensor = tensor.to(cast_dtype)
-        _assign_to_owner(module, mod_key, tensor)
-        _probe_load_mem(name, len(plan), total)
-    return num_quantized
-
-
-def stream_meta_check(module: torch.nn.Module, name: str) -> None:
-    """The strict=True stand-in: any param/buffer still on meta after a
-    stream means the plan missed a tensor -- fail loudly, never ship a
-    silently-half-loaded model.
-
-    Deliberately NOT state_dict(): the save-dequantization patch (if applied)
-    turns that into a full-model dequantization materialized in host ram.
-    named_parameters/named_buffers walk the live tensors -- params and
-    persistent buffers, the same set the batch path's strict load covers."""
-    still_meta = [
-        n for n, t in module.named_parameters() if t.is_meta
-    ] + [n for n, t in module.named_buffers() if t.is_meta]
-    if still_meta:
-        raise ValueError(
-            f"{name} stream load left {len(still_meta)} unfilled params/"
-            f"buffers, first few: {still_meta[:8]}"
-        )
-
-
-def plain_stream_load(
-    module: torch.nn.Module,
-    plan: Dict[str, Tuple[object, str]],
-    device,
-    name: str,
-    orig_dtype: Optional[torch.dtype] = None,
-) -> int:
-    """The as-shipped rail: assign everything at the precision it ships in
-    (quantize: none/false means zero quantization code runs), then prove the
-    plan complete. Returns the number of pre-quantized layers attached (the
-    caller runs the mixed-file post load when it is non-zero)."""
-    num_quantized = stream_assign(module, plan, device, name, orig_dtype=orig_dtype)
-    stream_meta_check(module, name)
-    return num_quantized
 
 
 def quantize_streamed_plan(

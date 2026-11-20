@@ -353,9 +353,15 @@ host ram on every call. Never call `state_dict()` on a patched module --
 completeness gates scan `named_parameters`/`named_buffers` instead
 (`stream_meta_check`), and the patch applies only after the gate.
 
-**Reference implementation:** the LTX-2.3 rail
-(`extensions_built_in/diffusion_models/ltx2/ltx23_stream.py` +
-`LTX23Model._load_transformer`). Equivalence evidence: per-block bitwise
+**Reference implementation:** the shared primitives live in
+`toolkit/util/weight_stream.py` (`build_stream_plan` / `stream_assign` /
+`stream_meta_check` / `plain_stream_load`); the LTX-2.3 rail
+(`extensions_built_in/diffusion_models/ltx2/ltx23_stream.py` model-specific
+key tables + `LTX23Model._load_transformer`) is its reference consumer.
+Standalone models that are not in the comfy format (mask/control helpers,
+HF-layout checkpoints) load through `weight_stream.stream_load_module` --
+identity key plan, explicit device required, no CPU staging (the sapiens2
+matting mask model is the first user). Equivalence evidence: per-block bitwise
 identity against the batched input route on first/middle/last blocks of the
 real checkpoint, plan completeness 0 missing / 0 extra on every component of
 both rails, and a real `get_noise_prediction` forward through the loaded
@@ -377,6 +383,8 @@ model.
 | Reference identity/no-weights id (constructs its vae; the comfy door is never exercised) | `iris3b/iris3b_vae_id.py` + `FakeVAE.encode_images/decode_latents` (the `iris3b` id) |
 | Lifecycle phase selection (`phases`) | `config_modules.py` `TrainConfig.phases`; guards/exits in `BaseSDTrainProcess.run()` |
 | Lazy reader, per-key placement | `weight_source.py:25` `:90` (mmap fallback: seek reads when the file cannot be mapped) |
+| Shared stream primitives (plan/assign/meta-check rails) | `toolkit/util/weight_stream.py` |
+| Standalone (non-comfy) model load entry | `toolkit/util/weight_stream.py` `stream_load_module` (first user: `toolkit/models/sapiens2.py` `Sapiens2Matting.from_pretrained`) |
 | Stream-to-meta-shell reference | `ltx2.py:1609` `_stream_load`, `:1593` `_remap_file_key` |
 | Stream-quantize reference (shared bodies, grouper, marker) | `quantize.py` `_quantize_stream_block` / `_quantize_extras_pass` / `group_stream_plan_by_blocks`; `ltx23_stream.py` `quantize_streamed_plan` |
 | Batched path only when required | `ltx2.py:1570` `_as_shipped_stream_target` |
