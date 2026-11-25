@@ -24,7 +24,7 @@ def offsets_kernel(F, OFF, COUNT, T:tl.constexpr, N:tl.constexpr, NN:tl.constexp
     tl.store(COUNT+bh*N+qi,tl.sum(c,0))
 
 @triton.jit
-def compact_kernel(F, BITS, OFF, IDS, T:tl.constexpr,N:tl.constexpr,J:tl.constexpr=8):
+def compact_kernel(F, BITS, OFF, IDS, T:tl.constexpr,N:tl.constexpr,J:tl.constexpr=8,IDST=1):
     qi,bh,jtile=tl.program_id(0),tl.program_id(1),tl.program_id(2)
     js=jtile*J+tl.arange(0,J);ts=tl.arange(0,64)
     ix=(bh*N+qi)*N+js
@@ -34,10 +34,10 @@ def compact_kernel(F, BITS, OFF, IDS, T:tl.constexpr,N:tl.constexpr,J:tl.constex
         selected=((f==-1)[:,None]|((f>0)[:,None]&(((bits[:,None]>>ts[None,:].to(tl.uint64))&1)!=0)))&((js[:,None]*64+ts[None,:])<T)&(js<N)[:,None]
         rank=tl.cumsum(selected.to(tl.int32),1)-1
         start=tl.load(OFF+ix,js<N,0)
-        tl.store(IDS+(bh*N+qi).to(tl.int64)*T+start[:,None]+rank,js[:,None]*64+ts[None,:],selected)
+        tl.store(IDS+(bh*N+qi).to(tl.int64)*IDST+start[:,None]+rank,js[:,None]*64+ts[None,:],selected)
 
 @triton.jit
-def compact_popc(F,BITS,OFF,IDS,T:tl.constexpr,N:tl.constexpr,J:tl.constexpr=32):
+def compact_popc(F,BITS,OFF,IDS,T:tl.constexpr,N:tl.constexpr,J:tl.constexpr=32,IDST=1):
     qi,bh,jtile=tl.program_id(0),tl.program_id(1),tl.program_id(2)
     js=jtile*J+tl.arange(0,J);ts=tl.arange(0,64)
     ix=(bh*N+qi)*N+js
@@ -49,13 +49,13 @@ def compact_popc(F,BITS,OFF,IDS,T:tl.constexpr,N:tl.constexpr,J:tl.constexpr=32)
         rank=tl.inline_asm_elementwise("popc.b64 $0, $1;","=r,l",[bits[:,None]&lower[None,:]],dtype=tl.int32,is_pure=True,pack=1)
         rank=tl.where((f==-1)[:,None],ts[None,:],rank)
         start=tl.load(OFF+ix,js<N,0)
-        tl.store(IDS+(bh*N+qi).to(tl.int64)*T+start[:,None]+rank,js[:,None]*64+ts[None,:],selected)
+        tl.store(IDS+(bh*N+qi).to(tl.int64)*IDST+start[:,None]+rank,js[:,None]*64+ts[None,:],selected)
 
 
 @triton.jit
 def packed_attention(Q,K,V,KC,VM,F,IDS,COUNT,O,KS,VS,COV,
                      T:tl.constexpr,N:tl.constexpr,H:tl.constexpr,D:tl.constexpr,
-                     PREFIX:tl.constexpr,SCALE:tl.constexpr,BK:tl.constexpr=64,HEAD_MAJOR:tl.constexpr=False,FP8:tl.constexpr=False,BQ:tl.constexpr=64,GAMMA:tl.constexpr=0.,QST:tl.constexpr=0,KST:tl.constexpr=0,VST:tl.constexpr=0,OST:tl.constexpr=0):
+                     PREFIX:tl.constexpr,SCALE:tl.constexpr,BK:tl.constexpr=64,HEAD_MAJOR:tl.constexpr=False,FP8:tl.constexpr=False,BQ:tl.constexpr=64,GAMMA:tl.constexpr=0.,QST:tl.constexpr=0,KST:tl.constexpr=0,VST:tl.constexpr=0,OST:tl.constexpr=0,IDST=1):
     qtile,bh=tl.program_id(0),tl.program_id(1)
     if (qtile+1)*BQ <= PREFIX:
         return
@@ -94,7 +94,7 @@ def packed_attention(Q,K,V,KC,VM,F,IDS,COUNT,O,KS,VS,COV,
     total=tl.load(COUNT+bh*N+qi)
     for start in range(0,total,BK):
         pos=start+tl.arange(0,BK)
-        ids=tl.load(IDS+(bh*N+qi).to(tl.int64)*T+pos,pos<total,0)
+        ids=tl.load(IDS+(bh*N+qi).to(tl.int64)*IDST+pos,pos<total,0)
         kbase=(bh*T+ids[:,None]).to(tl.int64)*D if HEAD_MAJOR else (b*T+ids[:,None]).to(tl.int64)*KST+h*D
         k=tl.load(K+kbase+ds[None,:],(pos<total)[:,None],0.)
         vbase=(bh*T+ids[:,None]).to(tl.int64)*D if HEAD_MAJOR else (b*T+ids[:,None]).to(tl.int64)*VST+h*D
@@ -115,20 +115,28 @@ def packed_attention(Q,K,V,KC,VM,F,IDS,COUNT,O,KS,VS,COV,
     result=acc/l[:,None]
     tl.store(O+(b*T+rows[:,None]).to(tl.int64)*OST+h*D+ds[None,:],result,((rows<T)&(rows>=PREFIX))[:,None])
 
-def prepare(q,route):
+def prepare(q,route,cap_bytes=None):
     b,t,h,d=q.shape;n=triton.cdiv(t,64);key=(q.device,tuple(q.shape))
     if key not in CACHE:
         if len(CACHE)>=2:CACHE.clear()
         CACHE[key]=(torch.empty((b*h,n,n),device=q.device,dtype=torch.int32),
-                    torch.empty((b*h,n),device=q.device,dtype=torch.int32),
-                    torch.empty((b*h,n,t),device=q.device,dtype=torch.int32))
-    off,count,ids=CACHE[key]
+                    torch.empty((b*h,n),device=q.device,dtype=torch.int32))
+    off,count=CACHE[key]
     offsets_kernel[(n,b*h)](route['flags'],off,count,t,n,triton.next_power_of_2(n),num_warps=4)
     global CSR_CALLS
     if CSR_IMPL=="popc":kernel,j=compact_popc,16
     elif CSR_IMPL=="scan":kernel,j=compact_kernel,32
     else:raise ValueError("Unknown CSR implementation")
-    kernel[(n,b*h,triton.cdiv(n,j))](route['flags'],route['bits'],off,ids,t,n,j,num_warps=4)
+    # The ids row length is the largest per-query-block selection total,
+    # not T -- at video token counts the difference is an order of
+    # magnitude of index allocation and DRAM traffic. The max is exact,
+    # so no selection can overflow the buffer; the sync is one scalar
+    # read per call.
+    bound=int(count.max().item())
+    if cap_bytes is not None and b*h*n*max(bound,1)*4>cap_bytes:
+        return None
+    ids=torch.empty((b*h,n,max(bound,1)),device=q.device,dtype=torch.int32)
+    kernel[(n,b*h,triton.cdiv(n,j))](route['flags'],route['bits'],off,ids,t,n,j,ids.stride(1),num_warps=4)
     CSR_CALLS+=1
     return ids,count
 

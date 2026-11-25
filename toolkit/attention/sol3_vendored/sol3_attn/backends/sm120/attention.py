@@ -59,7 +59,8 @@ def _launch_joint(qs, ks, vs, part, out, ids, count, cov, gamma, prefix_tokens,
         tokens, blocks, heads, dimension, prefix_tokens,
         dimension ** -0.5 * math.log2(math.e), bk, False, False,
         GAMMA=gamma, QST=qs.stride(1), KST=ks.stride(1),
-        VST=vs.stride(1), OST=out.stride(1), num_warps=warps, num_stages=1,
+        VST=vs.stride(1), OST=out.stride(1), IDST=ids.stride(1),
+        num_warps=warps, num_stages=1,
     )
 
 
@@ -84,47 +85,50 @@ def forward(q, k, v, *, counters=None, config=None, prefix_tokens=0, dense=None)
         out = torch.empty_like(q)
         bk, warps = _PROFILE.joint_launch if state.optimized else (128, 8)
 
-        # The compaction index is (batch*heads, blocks, tokens) int32; its
-        # size decides whether every head fits one launch. Each kernel
-        # program owns one (batch, head) pair, so chunking is purely a
-        # memory bound -- never a math one.
-        ids_bytes = batch * heads * blocks * tokens * 4
+        # The compaction index is (batch*heads, blocks, tokens) int32 when
+        # sized by T; prepare sizes it by the largest per-query-block
+        # selection total instead (an order of magnitude less at video
+        # token counts) and returns None when even that exceeds the
+        # budget -- then the heads are processed in chunks, which is
+        # purely a memory bound: each kernel program owns one
+        # (batch, head) pair, so chunking never enters the math.
         budget = _ids_budget_bytes()
-        single = ids_bytes <= budget
-        if single:
-            ids, count = compact.prepare(q, route)
+        prepared = compact.prepare(q, route, cap_bytes=budget)
+        if prepared is not None:
+            ids, count = prepared
             _launch_joint(q, k, v, route, out, ids, count, covariance, gamma,
                           prefix_tokens, bk, warps)
             count_launch("joint_single")
-        else:
-            chunk = max(1, budget // max(1, batch * blocks * tokens * 4))
-            for start in range(0, heads, chunk):
-                end = min(heads, start + chunk)
-                part = _head_slice(route, start, end, heads, blocks, dimension)
-                cov = covariance.view(heads, dimension, dimension)[start:end] if covariance is not None else None
-                qs, ks, vs = (x[:, :, start:end] for x in (q, k, v))
-                if not plan.minimum_fits:
-                    for name in ("flags", "bits", "kc", "vm"):
-                        part[name] = part[name].contiguous()
-                    out[:, :, start:end] = sol3_compact.attention(
-                        qs.contiguous(), ks.contiguous(), vs.contiguous(), part,
-                        prefix_tokens=prefix_tokens, dense=dense, bk=128, warps=8, stages=1,
-                        covariance=cov, cov_gamma=gamma,
-                    )
-                    count_launch("compact_fallback")
-                    continue
-                ids, count = compact.prepare(qs, part)
-                _launch_joint(qs, ks, vs, part, out[:, :, start:end], ids, count,
-                              cov, gamma, prefix_tokens, bk, warps)
-                count_launch("joint")
-                count_launch(f"joint_bk{bk}_warps{warps}")
-            if prefix_tokens and plan.minimum_fits:
-                for start in range(0, heads, 4):
-                    end = min(heads, start + 4)
-                    out[:, :prefix_tokens, start:end] = dense(
-                        q[:, :prefix_tokens, start:end], k[:, :, start:end], v[:, :, start:end],
-                    )
-        if prefix_tokens and single:
-            # one dense call for all heads; the callback owns its layout
-            out[:, :prefix_tokens] = dense(q[:, :prefix_tokens], k, v)
+            if prefix_tokens:
+                # one dense call for all heads; the callback owns its layout
+                out[:, :prefix_tokens] = dense(q[:, :prefix_tokens], k, v)
+            return out, route
+        single = False
+        chunk = max(1, budget // max(1, batch * blocks * tokens * 4))
+        for start in range(0, heads, chunk):
+            end = min(heads, start + chunk)
+            part = _head_slice(route, start, end, heads, blocks, dimension)
+            cov = covariance.view(heads, dimension, dimension)[start:end] if covariance is not None else None
+            qs, ks, vs = (x[:, :, start:end] for x in (q, k, v))
+            if not plan.minimum_fits:
+                for name in ("flags", "bits", "kc", "vm"):
+                    part[name] = part[name].contiguous()
+                out[:, :, start:end] = sol3_compact.attention(
+                    qs.contiguous(), ks.contiguous(), vs.contiguous(), part,
+                    prefix_tokens=prefix_tokens, dense=dense, bk=128, warps=8, stages=1,
+                    covariance=cov, cov_gamma=gamma,
+                )
+                count_launch("compact_fallback")
+                continue
+            ids, count = compact.prepare(qs, part)
+            _launch_joint(qs, ks, vs, part, out[:, :, start:end], ids, count,
+                          cov, gamma, prefix_tokens, bk, warps)
+            count_launch("joint")
+            count_launch(f"joint_bk{bk}_warps{warps}")
+        if prefix_tokens and plan.minimum_fits:
+            for start in range(0, heads, 4):
+                end = min(heads, start + 4)
+                out[:, :prefix_tokens, start:end] = dense(
+                    q[:, :prefix_tokens, start:end], k[:, :, start:end], v[:, :, start:end],
+                )
         return out, route
