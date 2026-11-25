@@ -1004,9 +1004,6 @@ export default function SimpleJob({
                   setJobConfig(
                     {
                       validation_items: [{ image_path: '', prompt: '' }],
-                      resolution: 1024,
-                      validate_every_n_steps: 1,
-                      validation_sigmas: [0.5],
                     },
                     'config.process[0].train.validation_config',
                   );
@@ -1020,46 +1017,167 @@ export default function SimpleJob({
                   <p className="text-sm text-gray-400 mb-4">
                     Validation runs a stable loss check on a fixed set of images. Each image is encoded once at startup
                     and predicted at the selected sigmas with fixed seeds, so the result is always deterministic and
-                    comparable across the run. The average loss is logged as val/loss every time validation runs. The
-                    images need to match the concept of your dataset, but{' '}
+                    comparable across the run. The average loss is logged as val/loss every time validation runs, with
+                    per-sigma, per-item and cosine-similarity breakdowns alongside it. The images need to match the
+                    concept of your dataset, but{' '}
                     <span className="font-bold text-gray-300">do not include the validation images in the dataset</span>
                     . They must be images containing the concept you want to train, but not an image trained on.
                   </p>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                     <NumberInput
                       label="Validate Every"
-                      value={validationConfig.validate_every_n_steps}
+                      value={validationConfig.validate_every_n_steps ?? null}
                       onChange={value =>
                         setJobConfig(value, 'config.process[0].train.validation_config.validate_every_n_steps')
                       }
-                      placeholder="eg. 10"
+                      placeholder="default 10"
                       min={1}
-                      required
                     />
                     <NumberInput
                       label="Validation Resolution"
-                      value={validationConfig.resolution}
+                      value={validationConfig.resolution ?? null}
                       onChange={value => setJobConfig(value, 'config.process[0].train.validation_config.resolution')}
-                      placeholder="eg. 512"
+                      placeholder="default 512"
                       min={64}
-                      required
                     />
-                    <SelectInput
-                      label="Validation Sigmas"
-                      value={(validationConfig.validation_sigmas ?? [1.0, 0.75, 0.5, 0.25]).join(', ')}
-                      onChange={value =>
+                    <TextInput
+                      label="Sigmas (comma separated)"
+                      value={(validationConfig.validation_sigmas ?? []).join(', ')}
+                      onChange={value => {
+                        const parsed = value
+                          .split(',')
+                          .map((v: string) => parseFloat(v.trim()))
+                          .filter((n: number) => !isNaN(n));
                         setJobConfig(
-                          value.split(',').map((v: string) => parseFloat(v)),
+                          parsed.length > 0 ? parsed : undefined,
                           'config.process[0].train.validation_config.validation_sigmas',
-                        )
-                      }
+                        );
+                        if (parsed.length > 0) {
+                          setJobConfig(
+                            undefined,
+                            'config.process[0].train.validation_config.validation_schedule',
+                          );
+                        }
+                      }}
+                      placeholder="default 1, 0.75, 0.5, 0.25"
+                    />
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-2">
+                    <SelectInput
+                      label="Inference Schedule"
+                      value={validationConfig.validation_schedule?.scheduler ?? 'none'}
+                      onChange={value => {
+                        if (value === 'none') {
+                          setJobConfig(undefined, 'config.process[0].train.validation_config.validation_schedule');
+                        } else {
+                          setJobConfig(
+                            { scheduler: value, steps: validationConfig.validation_schedule?.steps ?? 20 },
+                            'config.process[0].train.validation_config.validation_schedule',
+                          );
+                          setJobConfig(undefined, 'config.process[0].train.validation_config.validation_sigmas');
+                        }
+                      }}
                       options={[
-                        { value: '0.5', label: '0.5' },
-                        { value: '1, 0.5', label: '1.0, 0.5' },
-                        { value: '1, 0.66, 0.33', label: '1.0, 0.66, 0.33' },
-                        { value: '1, 0.75, 0.5, 0.25', label: '1.0, 0.75, 0.5, 0.25' },
+                        { value: 'none', label: 'none (use sigmas)' },
+                        { value: 'normal', label: 'inference: normal' },
+                        { value: 'simple', label: 'inference: simple' },
+                        { value: 'beta', label: 'inference: beta' },
                       ]}
                     />
+                    {validationConfig.validation_schedule && (
+                      <NumberInput
+                        label="Schedule Steps"
+                        value={validationConfig.validation_schedule.steps ?? null}
+                        onChange={value =>
+                          setJobConfig(
+                            { ...validationConfig.validation_schedule, steps: value },
+                            'config.process[0].train.validation_config.validation_schedule',
+                          )
+                        }
+                        placeholder="eg. 20"
+                        min={1}
+                      />
+                    )}
+                  </div>
+                  <div className="mt-4 pt-4 border-t border-gray-800">
+                    <label className="flex items-center space-x-2 text-sm text-gray-300">
+                      <input
+                        type="checkbox"
+                        checked={!!validationConfig.checkpoint_validation}
+                        onChange={e => {
+                          setJobConfig(
+                            e.target.checked ? {} : undefined,
+                            'config.process[0].train.validation_config.checkpoint_validation',
+                          );
+                        }}
+                      />
+                      <span>Extensive validation at checkpoints</span>
+                    </label>
+                    {validationConfig.checkpoint_validation && (
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-3">
+                        <NumberInput
+                          label="Every N Steps (empty = at saves)"
+                          value={validationConfig.checkpoint_validation.every ?? null}
+                          onChange={value =>
+                            setJobConfig(
+                              value,
+                              'config.process[0].train.validation_config.checkpoint_validation.every',
+                            )
+                          }
+                          placeholder="at saves"
+                          min={1}
+                          allowEmpty
+                        />
+                        <TextInput
+                          label="Sigmas Override (comma separated)"
+                          value={(validationConfig.checkpoint_validation.sigmas ?? []).join(', ')}
+                          onChange={value => {
+                            const parsed = value
+                              .split(',')
+                              .map((v: string) => parseFloat(v.trim()))
+                              .filter((n: number) => !isNaN(n));
+                            setJobConfig(
+                              parsed.length > 0 ? parsed : undefined,
+                              'config.process[0].train.validation_config.checkpoint_validation.sigmas',
+                            );
+                            if (parsed.length > 0) {
+                              setJobConfig(
+                                undefined,
+                                'config.process[0].train.validation_config.checkpoint_validation.schedule',
+                              );
+                            }
+                          }}
+                          placeholder="inherit frequent tier"
+                        />
+                        <SelectInput
+                          label="Schedule Override"
+                          value={validationConfig.checkpoint_validation.schedule?.scheduler ?? 'none'}
+                          onChange={value => {
+                            if (value === 'none') {
+                              setJobConfig(
+                                undefined,
+                                'config.process[0].train.validation_config.checkpoint_validation.schedule',
+                              );
+                            } else {
+                              setJobConfig(
+                                { scheduler: value, steps: validationConfig.checkpoint_validation?.schedule?.steps ?? 20 },
+                                'config.process[0].train.validation_config.checkpoint_validation.schedule',
+                              );
+                              setJobConfig(
+                                undefined,
+                                'config.process[0].train.validation_config.checkpoint_validation.sigmas',
+                              );
+                            }
+                          }}
+                          options={[
+                            { value: 'none', label: 'inherit frequent tier' },
+                            { value: 'normal', label: 'inference: normal' },
+                            { value: 'simple', label: 'inference: simple' },
+                            { value: 'beta', label: 'inference: beta' },
+                          ]}
+                        />
+                      </div>
+                    )}
                   </div>
                   <div className="mt-4">
                     <label className="block text-xs text-gray-300 mb-2">

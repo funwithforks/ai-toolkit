@@ -146,6 +146,17 @@ export interface EMAConfig {
   ema_decay: number;
 }
 
+export interface ValidationSchedule {
+  scheduler: 'normal' | 'simple' | 'beta';
+  steps: number;
+}
+
+export interface CheckpointValidation {
+  every?: number;
+  sigmas?: number[];
+  schedule?: ValidationSchedule;
+}
+
 export interface ValidationItem {
   image_path: string;
   prompt: string;
@@ -156,6 +167,8 @@ export interface ValidationConfig {
   resolution: number;
   validate_every_n_steps: number;
   validation_sigmas?: number[];
+  validation_schedule?: ValidationSchedule;
+  checkpoint_validation?: CheckpointValidation;
 }
 
 export interface TrainConfig {
