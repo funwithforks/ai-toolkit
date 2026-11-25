@@ -73,6 +73,8 @@ _kit = TrainerKit(
         "sol3": _MK + ".sol3_attn",
     },
     extra_markers={
+        "sol3_load": r"Sol3 sparse attention enabled via model_kwargs",
+        "fwd_only_mode": r"forward-only training mode \(train\.forward_only\)",
         "mask_pass": r"Mask pass: loading '(?P<model>\S+)' for (?P<ndatasets>\d+) dataset",
         "mask_gen": r"Generating (?P<types>\S+) masks for",
         "conditioning_pass": r"Conditioning pass: generating '(?P<ctype>\S+)' for",
