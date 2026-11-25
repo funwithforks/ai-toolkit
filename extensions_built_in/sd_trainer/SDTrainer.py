@@ -1861,6 +1861,24 @@ class SDTrainer(BaseSDTrainProcess):
         guidance_embedding_scale = self.train_config.cfg_scale
         if self.train_config.do_guidance_loss:
             guidance_embedding_scale = self._guidance_loss_target_batch
+        if getattr(self.train_config, 'forward_only', False) and torch.is_grad_enabled():
+            # forward-only mode times the inference kernel path (no graph);
+            # required for forward-only attention swaps and it removes the
+            # transient activation graph no backward would ever use
+            with torch.no_grad():
+                return self.sd.predict_noise(
+                    latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                    conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=dtype),
+                    unconditional_embeddings=unconditional_embeds,
+                    timestep=timesteps,
+                    guidance_scale=self.train_config.cfg_scale,
+                    guidance_embedding_scale=guidance_embedding_scale,
+                    detach_unconditional=False,
+                    rescale_cfg=self.train_config.cfg_rescale,
+                    bypass_guidance_embedding=self.train_config.bypass_guidance_embedding,
+                    batch=batch,
+                    **kwargs
+                )
         return self.sd.predict_noise(
             latents=noisy_latents.to(self.device_torch, dtype=dtype),
             conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=dtype),
