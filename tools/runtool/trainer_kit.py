@@ -122,6 +122,12 @@ def base_params(**extra):
             desc="train.gradient_checkpointing (recompute saves memory, "
                  "costs time)",
         ),
+        "fwd_only": Param(
+            "bool", default=False,
+            desc="train.forward_only: skip loss/backward/optimizer/EMA/"
+                 "scheduler; steps time the forward pass alone "
+                 "(attention/kernel A/B benches)",
+        ),
         "sample": Param(
             "bool", default=False,
             desc="keep the owner template's sampling block LIVE (quality "
@@ -245,6 +251,7 @@ def param_fields(prefix):
         "batch_size": (train + ".batch_size", lambda p: int(p["batch_size"])),
         "steps": (train + ".steps", lambda p: int(p["steps"])),
         "ckpt": (train + ".gradient_checkpointing", lambda p: bool(p["ckpt"])),
+        "fwd_only": (train + ".forward_only", lambda p: bool(p["fwd_only"])),
         "sample": (train + ".disable_sampling", lambda p: not bool(p["sample"])),
     }
 

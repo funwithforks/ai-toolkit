@@ -2779,6 +2779,13 @@ class SDTrainer(BaseSDTrainProcess):
 
                         loss = loss + preservation_loss
 
+                # forward-only measurement mode (train.forward_only): the
+                # prediction above is the step's work; loss and backward are
+                # skipped so step timing reflects the forward alone. All
+                # loss-type branches converge here after their predict.
+                if getattr(self.train_config, 'forward_only', False):
+                    return None
+
                 # check if nan
                 if not torch.isfinite(loss):
                     print_acc("loss is nan")
@@ -2855,6 +2862,15 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             batch_list = [batch]
         total_loss = None
+        forward_only = bool(getattr(self.train_config, 'forward_only', False))
+        if forward_only and not getattr(self, '_forward_only_announced', False):
+            self._forward_only_announced = True
+            print(
+                "forward-only training mode (train.forward_only): loss, "
+                "backward, optimizer, EMA and scheduler are skipped; step "
+                "timing reflects the forward pass only",
+                flush=True,
+            )
         self.optimizer.zero_grad()
         # micro-batches per optimizer step: a batch list (gradient_accumulation) or repeated
         # calls (gradient_accumulation_steps). -1 (whole epoch) has no fixed count; left summed.
@@ -2882,15 +2898,16 @@ class SDTrainer(BaseSDTrainProcess):
                 torch.cuda.synchronize()
                 _t1 = _time.perf_counter()
             self.steps_this_boundary += 1
-            if total_loss is None:
-                total_loss = loss
-            else:
-                total_loss += loss
+            if loss is not None:
+                if total_loss is None:
+                    total_loss = loss
+                else:
+                    total_loss += loss
             if len(batch_list) > 1 and self.model_config.low_vram:
                 torch.cuda.empty_cache()
 
 
-        if not self.is_grad_accumulation_step:
+        if not forward_only and not self.is_grad_accumulation_step:
             # grads of memory-managed (offloaded) params are async D2H copies into
             # pinned tensors; join them before anything on the CPU reads .grad
             sync_grad_transfers()
@@ -2916,8 +2933,9 @@ class SDTrainer(BaseSDTrainProcess):
             pass
 
         # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
-        with self.timer('scheduler_step'):
-            self.lr_scheduler.step()
+        if not forward_only:
+            with self.timer('scheduler_step'):
+                self.lr_scheduler.step()
 
         if self.embedding is not None:
             with self.timer('restore_embeddings'):
@@ -2928,9 +2946,14 @@ class SDTrainer(BaseSDTrainProcess):
                 # Let's make sure we don't update any embedding weights besides the newly added token
                 self.adapter.restore_embeddings()
 
-        loss_dict = OrderedDict(
-            {'loss': (total_loss / len(batch_list)).item()}
-        )
+        # forward-only steps carry no loss; the empty dict keeps every
+        # downstream iteration site (tensorboard, additional logs) intact
+        if total_loss is None:
+            loss_dict = OrderedDict()
+        else:
+            loss_dict = OrderedDict(
+                {'loss': (total_loss / len(batch_list)).item()}
+            )
 
         if _st:
             torch.cuda.synchronize()
