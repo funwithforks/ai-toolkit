@@ -2201,6 +2201,10 @@ class LatentCachingMixin:
                     print_acc(f"Error processing {kind}: {prep_item.path}")
                     print_acc(f"Error: {str(e)}")
                     print_acc(" - Skipping file and removing it from the dataset")
+                    # the item keeps its full decode (self.tensor) bound;
+                    # without this the failed_items list retains ~one
+                    # decoded video per failure until the pass ends
+                    prep_item.cleanup()
                     return prep_item, None, None, False
                 return prep_item, prep_latent_path, None, True
 
@@ -2229,6 +2233,9 @@ class LatentCachingMixin:
                         self._cache_one_latent(file_item, latent_path, cached_state_dict, needs_encode, to_disk, to_memory)
                     except UnusableFileError as e:
                         pbar.write(f"Skipping unusable file {file_item.path}: {e}")
+                        # same retention hole as the _prep failure path:
+                        # the item's decode is still bound when it lands here
+                        file_item.cleanup()
                         failed_items.append(file_item)
                         pbar.update(1)
                         continue
