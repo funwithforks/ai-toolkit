@@ -279,6 +279,12 @@ class MiniMaxH3Pipeline:
                 # target-video token grid (patch 1x2x2); consumed only by VSA models
                 vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
                 pdd_weights=model._pdd_weights(sv, sv_next),
+                # Sol3 prefix: rows before the first target-video row (text,
+                # conditioning, target audio) stay exact; shape metadata only
+                sol3_prefix=int(
+                    tags.shape[1]
+                    - (video_indices.shape[0] - layout.num_condition_video_rows)
+                ),
             )
             v_video = video_pred[:, num_cond:].float()
             v_audio = audio_pred[:, layout.num_condition_audio_rows :].float()

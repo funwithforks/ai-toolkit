@@ -137,6 +137,14 @@ def set_frost_sdpa(flag: bool) -> None:
     _FROST_SDPA = bool(flag)
 
 
+_SOL3_ATTN = False
+
+
+def set_sol3_attn(flag: bool) -> None:
+    global _SOL3_ATTN
+    _SOL3_ATTN = bool(flag)
+
+
 def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     """x (B, S, H, D); cos/sin (B, S, rot) rotate the leading ``rot`` channels."""
     # fused Triton path when available; returns None (and the env kill switch
@@ -203,6 +211,9 @@ class MiniMaxH3Attention(nn.Module):
         self.to_gate_compress = (
             nn.Linear(hidden, inner, bias=False) if gate_compress else None
         )
+        # only the main blocks route through Sol3; the token refiner's
+        # text-only attention keeps its own dense path
+        self.sol3_eligible = False
 
     def forward(
         self,
@@ -211,6 +222,7 @@ class MiniMaxH3Attention(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,  # (B, 1, 1, S) bool, True = attend
         varlen_ctx=None,  # (idx, cu, max_len) packed live rows, or None
         vsa=None,  # H3VSAContext or None (dense)
+        sol3_prefix: Optional[int] = None,  # first target-video row index
     ) -> torch.Tensor:
         b, s, _ = x.shape
         if self.qkv_proj is not None:
@@ -235,6 +247,43 @@ class MiniMaxH3Attention(nn.Module):
 
             gate = self.to_gate_compress(x).view(b, s, self.heads, self.head_dim)
             out = vsa_attention(q, k, v, gate, vsa)
+            return self.out_proj(out.reshape(b, s, -1))
+
+        if _SOL3_ATTN and self.sol3_eligible:
+            # Opt-in Sol3 sparse attention (model_kwargs sol3_attn):
+            # forward-only, valid only where no graph is built. Every other
+            # context raises instead of running dense -- a silent fallback
+            # would corrupt both the timing and the output comparison.
+            if torch.is_grad_enabled():
+                raise RuntimeError(
+                    "sol3_attn is forward-only and requires a no_grad "
+                    "context (sampling or train.forward_only runs); the "
+                    "training backward does not exist yet"
+                )
+            if b != 1:
+                raise RuntimeError(
+                    f"sol3_attn requires batch size 1, got {b}; multi-sample "
+                    "packing needs the varlen backward (pending)"
+                )
+            if attn_mask is not None or varlen_ctx is not None:
+                raise RuntimeError(
+                    "sol3_attn requires an unpadded batch (no attn_mask "
+                    "or varlen_ctx)"
+                )
+            if sol3_prefix is None:
+                raise RuntimeError(
+                    "sol3_attn requires the sol3_prefix row index (first "
+                    "target-video row); the caller did not supply one"
+                )
+            try:
+                from sol3_attn import sol3_attn as _sol3_fn
+            except ImportError as e:
+                from toolkit.util.kernel_report import report_missing
+
+                report_missing("h3_sol3_attn", f"sol3_attn package unavailable: {e}")
+                raise
+            qs, ks, vs = (t.contiguous() for t in (q, k, v))
+            out = _sol3_fn(qs, ks, vs, prefix_tokens=sol3_prefix)
             return self.out_proj(out.reshape(b, s, -1))
 
         if varlen_ctx is not None:
@@ -389,6 +438,7 @@ class MiniMaxH3Block(nn.Module):
             apply_silu=p.adaln_apply_silu,
             bias=p.adaln_bias,
         )
+        self.attn.sol3_eligible = True
 
     def forward(
         self,
@@ -399,6 +449,7 @@ class MiniMaxH3Block(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         varlen_ctx=None,  # (idx, cu, max_len) packed live rows, or None
         vsa=None,  # H3VSAContext or None (dense)
+        sol3_prefix: Optional[int] = None,  # first target-video row index
     ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaln_proj(temb)
@@ -413,7 +464,7 @@ class MiniMaxH3Block(nn.Module):
         x = gated_residual(
             x,
             gate_msa,
-            self.attn(h, rotary_emb, attn_mask, varlen_ctx, vsa),
+            self.attn(h, rotary_emb, attn_mask, varlen_ctx, vsa, sol3_prefix),
             adaln_indices,
         )
 
@@ -765,6 +816,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         # PDD checkpoints only: per-sample (video, audio) head weights, each
         # (B, pdd_steps), from packing.build_pdd_grid_weights
         pdd_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        sol3_prefix: Optional[int] = None,  # first target-video row index
     ):
         """Returns (video_out (B, Nv, 96), audio_out (B, Na, 32)) — the
         data-ward velocity ``clean - noise`` for every row, in input order.
@@ -887,6 +939,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                     attn_mask,
                     varlen_ctx,
                     vsa_ctx,
+                    sol3_prefix,
                     use_reentrant=False,
                 )
             else:
@@ -898,6 +951,7 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                     attn_mask,
                     varlen_ctx,
                     vsa_ctx,
+                    sol3_prefix,
                 )
 
         video_all, audio_all = self.final_layer(x, temb, inverse, pdd_weights)

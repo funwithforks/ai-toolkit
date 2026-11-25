@@ -523,6 +523,15 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
                 "  - FROST sm120 SDPA enabled via model_kwargs frost_sdpa "
                 "(suited to uniform-shape datasets; default is torch SDPA)"
             )
+        if self.model_config.model_kwargs.get("sol3_attn", False):
+            from .src.transformer import set_sol3_attn
+
+            set_sol3_attn(True)
+            print(
+                "  - Sol3 sparse attention enabled via model_kwargs "
+                "sol3_attn (forward-only: sampling and train.forward_only "
+                "runs; training steps raise)"
+            )
         transformer = MiniMaxH3Transformer.load_model(
             dit_path,
             dtype=self.torch_dtype,
@@ -1318,6 +1327,10 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             # target-video token grid (patch 1x2x2); consumed only by VSA models
             vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
             pdd_weights=self._pdd_weights(sigma_v),
+            # Sol3 prefix: rows before the first target-video row (text,
+            # conditioning, target audio) stay exact; shape metadata only,
+            # no device sync
+            sol3_prefix=int(token_tags.shape[1] - (video_indices.shape[0] - num_cond)),
         )
 
         if num_cond_audio > 0:

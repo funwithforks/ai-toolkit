@@ -60,10 +60,17 @@ _kit = TrainerKit(
                  "forward on quantized linears (no resident copies; the "
                  "weight buffer is already the operand layout)",
         ),
+        "sol3": Param(
+            "bool", default=False,
+            desc="sol3_attn model kwarg: Sol3 sparse attention "
+                 "(forward-only — sampling and fwd_only runs; training "
+                 "steps raise)",
+        ),
     },
     switches={
         "cutlass_bwd": _MK + ".int8_cutlass_bwd",
         "cutlass_fwd": _MK + ".int8_cutlass_gemm",
+        "sol3": _MK + ".sol3_attn",
     },
     extra_markers={
         "mask_pass": r"Mask pass: loading '(?P<model>\S+)' for (?P<ndatasets>\d+) dataset",
@@ -85,6 +92,7 @@ _kit = TrainerKit(
         *([] if params.get("cutlass_bwd", "fc2") == "fc2"
           else ["cutlass_" + params["cutlass_bwd"]]),
         *(["cutlassfwd"] if params.get("cutlass_fwd") else []),
+        *(["sol3"] if params.get("sol3") else []),
     ],
     build_env=lambda params, paths: {
         "H3_VARLEN_ATTN": "1" if params.get("varlen", True) else "0",
