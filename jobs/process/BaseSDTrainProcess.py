@@ -64,7 +64,8 @@ from tqdm import tqdm
 
 from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, NetworkConfig, TrainConfig, ModelConfig, \
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
-    DecoratorConfig, MASK_MODEL_PASS_ORDER, CONTROL_PASS_ORDER, DEFAULT_VALIDATION_SIGMAS
+    DecoratorConfig, MASK_MODEL_PASS_ORDER, CONTROL_PASS_ORDER, DEFAULT_VALIDATION_SIGMAS, \
+    sanitize_metric_label
 from toolkit.validation_schedule import sigmas_from_schedule
 from toolkit.control_generator import ControlGenerator
 from toolkit.logging_aitk import create_logger
@@ -290,9 +291,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # cached latents, prompt embeds, and fixed noise for validation
         self._validation_cache = None
         self._validation_items = None
-        # val loss at the first validation round; later rounds log their
-        # delta against it
-        self._validation_baseline = None
+        # first-round aggregate per metric namespace ('concept', 'neutral');
+        # later rounds log their delta against it
+        self._validation_baselines = {}
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
@@ -1926,13 +1927,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
             )
         return True
 
+    def _validation_item_keys(self):
+        """Metric-key suffix per valid validation item, in item order:
+        item{index} or item{index}_{sanitized label}."""
+        keys = []
+        for idx, item in enumerate(self._valid_validation_items()):
+            label = sanitize_metric_label(getattr(item, 'label', '') or '')
+            keys.append(f"item{idx}" if not label else f"item{idx}_{label}")
+        return keys
+
     def _validation_prompts(self):
-        """Trigger-injected prompts for the valid validation items, in item
-        order -- the embed cache digest covers the injected form."""
+        """Prompts for the valid validation items, in item order -- the embed
+        cache digest covers the injected form. Concept items get the trigger
+        injection; neutral items use their caption verbatim."""
         prompts = []
         for item in self._valid_validation_items():
             prompt = item.prompt
-            if self.trigger_word is not None:
+            if (self.trigger_word is not None and getattr(item, 'kind', 'concept') == 'concept'):
                 prompt = self.sd.inject_trigger_into_prompt(
                     prompt,
                     trigger=self.trigger_word,
@@ -2018,14 +2029,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         items = self._valid_validation_items()
         if not items or self.sd is None:
             return False
-        for idx, item in enumerate(items):
-            prompt = item.prompt
-            if self.trigger_word is not None:
-                prompt = self.sd.inject_trigger_into_prompt(
-                    prompt,
-                    trigger=self.trigger_word,
-                    add_if_not_present=False,
-                )
+        for idx, prompt in enumerate(self._validation_prompts()):
             cache_path = self._validation_embed_cache_path(idx, prompt)
             if not os.path.exists(cache_path) or not self.sd.embed_file_valid(cache_path):
                 return True
@@ -2234,22 +2238,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 val_config.validation_schedule, self.sd.noise_scheduler.sigmas)
         return list(self.sd.validation_sigmas())
 
-    def _log_validation_metrics(self, tier: str, sigmas, per_sigma_losses,
+    def _log_validation_metrics(self, namespace: str, sigmas, per_sigma_losses,
                                 per_sigma_cosines, item_losses, val_loss):
-        """Push the validation metric vector into additional_logs. The
-        aggregate keeps its historical key; everything else is additive so
-        the loss graph picks the new keys up as plain metric series."""
+        """Push one namespace's validation metric vector into
+        additional_logs. Concept items log under val/, neutral items under
+        val/neutral/ -- a neutral item's drift is the bleed signal and must
+        not dilute the concept aggregates."""
         fmt = lambda s: f"{s:g}"
-        self.additional_logs['val/loss'] = val_loss
+        prefix = 'val' if namespace == 'concept' else f'val/{namespace}'
+        self.additional_logs[f'{prefix}/loss'] = val_loss
         for i, sigma in enumerate(sigmas):
-            self.additional_logs[f'val/loss_s{fmt(sigma)}'] = per_sigma_losses[i]
-            self.additional_logs[f'val/cos_s{fmt(sigma)}'] = per_sigma_cosines[i]
-        for i, item_loss in enumerate(item_losses):
-            self.additional_logs[f'val/loss_item{i}'] = item_loss
-        if self._validation_baseline is not None:
-            self.additional_logs['val/loss_delta'] = val_loss - self._validation_baseline
+            self.additional_logs[f'{prefix}/loss_s{fmt(sigma)}'] = per_sigma_losses[i]
+            self.additional_logs[f'{prefix}/cos_s{fmt(sigma)}'] = per_sigma_cosines[i]
+        for key, item_loss in item_losses:
+            self.additional_logs[f'{prefix}/loss_{key}'] = item_loss
+        baseline = self._validation_baselines.get(namespace)
+        if baseline is not None:
+            self.additional_logs[f'{prefix}/loss_delta'] = val_loss - baseline
         else:
-            self._validation_baseline = val_loss
+            self._validation_baselines[namespace] = val_loss
 
     def validate(self, tier: str = 'frequent'):
         val_config = self.train_config.validation_config
@@ -2283,80 +2290,99 @@ class BaseSDTrainProcess(BaseTrainProcess):
             timesteps = torch.tensor(timestep_values, device=device)
             num_sigmas = len(sigmas)
 
-            # images can have different aspect ratios, so each image is predicted as its
-            # own batch with all sigmas at once
-            # per-sigma accumulators across items; the sigma batch is laid
-            # out as num_sigmas consecutive chunks of the item's batch size
-            sigma_loss_sums = torch.zeros(num_sigmas, dtype=torch.float64)
-            sigma_cos_sums = torch.zeros(num_sigmas, dtype=torch.float64)
-            item_losses = []
-            for latents_cpu, noise_cpu, embeds_cpu in zip(cache['latents'], cache['noise'], cache['embeds']):
+            # one forward per sigma at the item's natural batch size: a
+            # sigma-concatenated batch scales every intermediate (and the
+            # int8 mm outputs) with the probe count and OOMs the fit tier
+            # on video models; this way the peak transient matches a
+            # training forward and the probe cost is only time-linear
+            item_keys = self._validation_item_keys()
+            kinds = [getattr(it, 'kind', 'concept') or 'concept'
+                     for it in self._valid_validation_items()]
+            accumulators = {
+                kind: {'sigma_loss': torch.zeros(num_sigmas, dtype=torch.float64),
+                       'sigma_cos': torch.zeros(num_sigmas, dtype=torch.float64),
+                       'items': []}
+                for kind in set(kinds)
+            }
+            for idx, (latents_cpu, noise_cpu, embeds_cpu) in enumerate(
+                    zip(cache['latents'], cache['noise'], cache['embeds'])):
                 latents = latents_cpu.to(device, dtype=dtype)
                 noise = noise_cpu.to(device, dtype=dtype)
-                batch_latents = torch.cat([latents] * num_sigmas, dim=0)
-                batch_noise = torch.cat([noise] * num_sigmas, dim=0)
-                batch_embeds = concat_prompt_embeds([embeds_cpu.clone().to(device, dtype=dtype)] * num_sigmas)
+                embeds = embeds_cpu.clone().to(device, dtype=dtype)
 
-                noisy_latents = self.sd.add_noise(batch_latents, batch_noise, timesteps).detach()
-
-                noise_pred = self.sd.predict_noise(
-                    latents=noisy_latents.to(device, dtype=dtype),
-                    conditional_embeddings=batch_embeds,
-                    timestep=timesteps,
-                    guidance_scale=1.0,
-                    guidance_embedding_scale=self.train_config.cfg_scale,
-                    bypass_guidance_embedding=self.train_config.bypass_guidance_embedding,
-                )
-
-                if self.sd.is_flow_matching:
-                    if hasattr(self.sd, 'get_loss_target'):
-                        # the model owns the train-layout conversion of its
-                        # latents (the cache holds the shared canonical form);
-                        # a bare namespace is enough -- get_loss_target reads
-                        # batch.latents only
-                        target = self.sd.get_loss_target(
-                            noise=batch_noise,
-                            batch=SimpleNamespace(latents=batch_latents),
-                        ).detach()
-                    else:
-                        target = batch_noise - batch_latents
-                elif self.sd.prediction_type == 'v_prediction':
-                    target = self.sd.noise_scheduler.get_velocity(batch_latents, batch_noise, timesteps)
-                else:
-                    target = batch_noise
-
-                # split the sigma-batched forward into per-sigma chunks
-                item_bs = latents.shape[0]
                 item_sigma_losses = []
                 item_sigma_cosines = []
                 for i in range(num_sigmas):
-                    chunk = slice(i * item_bs, (i + 1) * item_bs)
-                    pred_c = noise_pred[chunk].float()
-                    target_c = target[chunk].float()
-                    item_sigma_losses.append(
-                        torch.nn.functional.mse_loss(pred_c, target_c))
-                    item_sigma_cosines.append(torch.nn.functional.cosine_similarity(
-                        pred_c.reshape(pred_c.shape[0], -1),
-                        target_c.reshape(target_c.shape[0], -1), dim=1).mean())
-                item_losses.append(torch.stack(item_sigma_losses).mean().item())
-                sigma_loss_sums += torch.stack(item_sigma_losses).double().cpu()
-                sigma_cos_sums += torch.stack(item_sigma_cosines).double().cpu()
+                    ts_i = timesteps[i:i + 1]
+                    noisy_latents = self.sd.add_noise(latents, noise, ts_i).detach()
 
-            num_items = len(item_losses)
-            per_sigma_losses = (sigma_loss_sums / num_items).tolist()
-            per_sigma_cosines = (sigma_cos_sums / num_items).tolist()
-            val_loss = sum(item_losses) / num_items
-            self._log_validation_metrics(
-                tier, sigmas, per_sigma_losses, per_sigma_cosines, item_losses, val_loss)
+                    noise_pred = self.sd.predict_noise(
+                        latents=noisy_latents.to(device, dtype=dtype),
+                        conditional_embeddings=embeds,
+                        timestep=ts_i,
+                        guidance_scale=1.0,
+                        guidance_embedding_scale=self.train_config.cfg_scale,
+                        bypass_guidance_embedding=self.train_config.bypass_guidance_embedding,
+                    )
+
+                    if self.sd.is_flow_matching:
+                        if hasattr(self.sd, 'get_loss_target'):
+                            # the model owns the train-layout conversion of
+                            # its latents (the cache holds the shared
+                            # canonical form); a bare namespace is enough --
+                            # get_loss_target reads batch.latents only
+                            target = self.sd.get_loss_target(
+                                noise=noise,
+                                batch=SimpleNamespace(latents=latents),
+                            ).detach()
+                        else:
+                            target = noise - latents
+                    elif self.sd.prediction_type == 'v_prediction':
+                        target = self.sd.noise_scheduler.get_velocity(latents, noise, ts_i)
+                    else:
+                        target = noise
+
+                    pred_f = noise_pred.float()
+                    target_f = target.float()
+                    item_sigma_losses.append(
+                        torch.nn.functional.mse_loss(pred_f, target_f))
+                    item_sigma_cosines.append(torch.nn.functional.cosine_similarity(
+                        pred_f.reshape(pred_f.shape[0], -1),
+                        target_f.reshape(target_f.shape[0], -1), dim=1).mean())
+                acc = accumulators[kinds[idx]]
+                acc['items'].append((item_keys[idx], torch.stack(item_sigma_losses).mean().item()))
+                acc['sigma_loss'] += torch.stack(item_sigma_losses).double().cpu()
+                acc['sigma_cos'] += torch.stack(item_sigma_cosines).double().cpu()
+
+            for kind, acc in accumulators.items():
+                num_items = len(acc['items'])
+                if num_items == 0:
+                    continue
+                per_sigma_losses = (acc['sigma_loss'] / num_items).tolist()
+                per_sigma_cosines = (acc['sigma_cos'] / num_items).tolist()
+                val_loss = sum(l for _, l in acc['items']) / num_items
+                self._log_validation_metrics(
+                    kind, sigmas, per_sigma_losses, per_sigma_cosines,
+                    acc['items'], val_loss)
+
+                val_loss = sum(l for _, l in acc['items']) / num_items
+                self._log_validation_metrics(
+                    kind, sigmas, per_sigma_losses, per_sigma_cosines,
+                    acc['items'], val_loss)
         network.multiplier = start_multiplier
         if was_unet_training:
             self.sd.unet.train()
-        delta = ''
-        if self._validation_baseline is not None and val_loss != self._validation_baseline:
-            delta = f", delta {val_loss - self._validation_baseline:+.4f}"
+        parts = []
+        for kind, acc in accumulators.items():
+            num_items = len(acc['items'])
+            if num_items == 0:
+                continue
+            kind_loss = sum(l for _, l in acc['items']) / num_items
+            name = 'loss' if kind == 'concept' else f'{kind} loss'
+            parts.append(f"{name} {kind_loss:.4f} x {num_items} items")
         print_acc(
-            f"validation ({tier} tier, step {self.step_num}): loss {val_loss:.4f} "
-            f"over {num_sigmas} sigmas x {num_items} items{delta}"
+            f"validation ({tier} tier, step {self.step_num}): "
+            f"{num_sigmas} sigmas -- " + ", ".join(parts)
         )
 
     def _run_masking_pass(self, all_dataset_objs):

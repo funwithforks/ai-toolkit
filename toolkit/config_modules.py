@@ -389,9 +389,28 @@ class AdapterConfig:
 
 
 class ValidationItem:
+    KINDS = ('concept', 'neutral')
+
     def __init__(self, **kwargs):
         self.image_path: str = kwargs.get('image_path', '')
         self.prompt: str = kwargs.get('prompt', '')
+        # concept: an image of the trained subject, feeds the concept
+        # aggregates. neutral: a different subject, prompt used verbatim,
+        # logged under val/neutral/ -- its drift is the bleed signal.
+        self.kind = kwargs.get('kind', 'concept') or 'concept'
+        if self.kind not in self.KINDS:
+            raise ValueError(
+                f"validation item kind must be one of {list(self.KINDS)}, got {self.kind!r}"
+            )
+        self.label: str = kwargs.get('label', '') or ''
+
+
+def sanitize_metric_label(label: str) -> str:
+    """Label text as it appears inside a metric key: lowercase word chars."""
+    cleaned = label.strip().lower()
+    cleaned = ''.join(c if c.isalnum() else '_' for c in cleaned)
+    cleaned = '_'.join(p for p in cleaned.split('_') if p)
+    return cleaned
 
 
 # probe grid used when neither the config nor the arch declares one

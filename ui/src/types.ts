@@ -160,6 +160,8 @@ export interface CheckpointValidation {
 export interface ValidationItem {
   image_path: string;
   prompt: string;
+  kind?: 'concept' | 'neutral';
+  label?: string;
 }
 
 export interface ValidationConfig {

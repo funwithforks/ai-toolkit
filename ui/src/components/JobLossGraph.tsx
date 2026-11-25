@@ -121,6 +121,7 @@ interface PersistedSettings {
   plotStride: number;
   clipOutliers: boolean;
   enabled: Record<string, boolean>;
+  collapsedGroups: Record<string, boolean>;
 }
 
 // Key by the exact URL so each job remembers its own settings independently.
@@ -166,6 +167,9 @@ export default function JobLossGraph({ job }: Props) {
   // initial defaults don't clobber what was saved before the load effect runs.
   const [hydrated, setHydrated] = useState(false);
 
+  // which series segments are collapsed
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
+
   // Restored series selection, kept so the lossKeys-sync effect can honor it for
   // keys that arrive after load rather than falling back to the default.
   const persistedEnabledRef = useRef<Record<string, boolean> | null>(null);
@@ -193,6 +197,9 @@ export default function JobLossGraph({ job }: Props) {
           persistedEnabledRef.current = s.enabled;
           setEnabled(s.enabled);
         }
+        if (s.collapsedGroups && typeof s.collapsedGroups === 'object') {
+          setCollapsedGroups(s.collapsedGroups);
+        }
       }
     } catch {
       // ignore malformed / unavailable storage
@@ -206,12 +213,12 @@ export default function JobLossGraph({ job }: Props) {
     const key = settingsStorageKey();
     if (!key) return;
     try {
-      const payload: PersistedSettings = { useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled };
+      const payload: PersistedSettings = { useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled, collapsedGroups };
       localStorage.setItem(key, JSON.stringify(payload));
     } catch {
       // ignore unavailable storage
     }
-  }, [hydrated, useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled]);
+  }, [hydrated, useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled, collapsedGroups]);
 
   // keep enabled map in sync with discovered keys. "loss/loss" and "val/loss"
   // are on by default; every other metric starts deactivated (user can toggle
@@ -224,7 +231,8 @@ export default function JobLossGraph({ job }: Props) {
       const next = { ...prev };
       for (const k of lossKeys) {
         if (next[k] === undefined)
-          next[k] = persistedEnabledRef.current?.[k] ?? (k === 'loss/loss' || k === 'val/loss');
+          next[k] = persistedEnabledRef.current?.[k] ??
+            (k === 'loss/loss' || k === 'val/loss' || k === 'val/neutral/loss');
       }
       for (const k of Object.keys(next)) {
         if (!lossKeys.includes(k)) delete next[k];
@@ -245,6 +253,29 @@ export default function JobLossGraph({ job }: Props) {
       m[k] = PALETTE[i % PALETTE.length];
     });
     return m;
+  }, [lossKeys]);
+
+  // Series segments: keys grouped by prefix so the list stays navigable as
+  // per-item and per-sigma series accumulate. Unknown prefixes land in Other
+  // so a new key type can never disappear from the list.
+  const seriesGroups = useMemo(() => {
+    const order: string[] = [];
+    const groups: Record<string, string[]> = {};
+    const push = (g: string, k: string) => {
+      if (!groups[g]) {
+        groups[g] = [];
+        order.push(g);
+      }
+      groups[g].push(k);
+    };
+    for (const k of lossKeys) {
+      if (k.startsWith('val/neutral/')) push('Neutral', k);
+      else if (k.startsWith('val/') && k.includes('_item')) push('Validation items', k);
+      else if (k.startsWith('val/')) push('Validation', k);
+      else if (k === 'learning_rate' || k.startsWith('loss/')) push('Training', k);
+      else push('Other', k);
+    }
+    return { order, groups };
   }, [lossKeys]);
 
   // Build uPlot-aligned data + series configs.
@@ -653,25 +684,50 @@ export default function JobLossGraph({ job }: Props) {
             {lossKeys.length === 0 ? (
               <div className="text-sm text-gray-400">No loss keys found yet.</div>
             ) : (
-              <div className="flex flex-wrap gap-2">
-                {lossKeys.map(k => (
-                  <button
-                    key={k}
-                    type="button"
-                    onClick={() => setEnabled(prev => ({ ...prev, [k]: !(prev[k] ?? true) }))}
-                    className={[
-                      'px-3 py-1 rounded-md text-xs border transition-colors',
-                      enabled[k] === false
-                        ? 'bg-gray-900 text-gray-400 border-gray-800 hover:bg-gray-800/60'
-                        : 'bg-gray-900 text-gray-200 border-gray-800 hover:bg-gray-800/60',
-                    ].join(' ')}
-                    aria-pressed={enabled[k] !== false}
-                    title={k}
-                  >
-                    <span className="inline-block h-2 w-2 rounded-full mr-2" style={{ background: colorByKey[k] }} />
-                    {k}
-                  </button>
-                ))}
+              <div className="space-y-2">
+                {seriesGroups.order.map(g => {
+                  const keys = seriesGroups.groups[g];
+                  const collapsed = collapsedGroups[g] === true;
+                  // per-item series stack one per line; aggregates wrap
+                  const vertical = keys.some(k => k.includes('_item'));
+                  return (
+                    <div key={g}>
+                      <button
+                        type="button"
+                        onClick={() => setCollapsedGroups(prev => ({ ...prev, [g]: !collapsed }))}
+                        className="w-full flex items-center justify-between text-xs text-gray-400 hover:text-gray-200 py-1"
+                      >
+                        <span>{g}</span>
+                        <span>{keys.length}</span>
+                      </button>
+                      {!collapsed && (
+                        <div className={vertical ? 'flex flex-col gap-1' : 'flex flex-wrap gap-2'}>
+                          {keys.map(k => (
+                            <button
+                              key={k}
+                              type="button"
+                              onClick={() => setEnabled(prev => ({ ...prev, [k]: !(prev[k] ?? true) }))}
+                              className={[
+                                'px-3 py-1 rounded-md text-xs border transition-colors',
+                                enabled[k] === false
+                                  ? 'bg-gray-900 text-gray-400 border-gray-800 hover:bg-gray-800/60'
+                                  : 'bg-gray-900 text-gray-200 border-gray-800 hover:bg-gray-800/60',
+                              ].join(' ')}
+                              aria-pressed={enabled[k] !== false}
+                              title={k}
+                            >
+                              <span
+                                className="inline-block h-2 w-2 rounded-full mr-2"
+                                style={{ background: colorByKey[k] }}
+                              />
+                              {k}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

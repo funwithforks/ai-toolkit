@@ -1209,6 +1209,35 @@ export default function SimpleJob({
                               placeholder="Enter prompt"
                             />
                           </div>
+                          <div className="w-40">
+                            <TextInput
+                              label="Label"
+                              value={item.label ?? ''}
+                              onChange={value =>
+                                setJobConfig(
+                                  value,
+                                  `config.process[0].train.validation_config.validation_items[${i}].label`,
+                                )
+                              }
+                              placeholder="eg. holdout"
+                            />
+                          </div>
+                          <div className="w-36">
+                            <SelectInput
+                              label="Kind"
+                              value={item.kind ?? 'concept'}
+                              onChange={value =>
+                                setJobConfig(
+                                  value,
+                                  `config.process[0].train.validation_config.validation_items[${i}].kind`,
+                                )
+                              }
+                              options={[
+                                { value: 'concept', label: 'concept' },
+                                { value: 'neutral', label: 'neutral' },
+                              ]}
+                            />
+                          </div>
                           <div>
                             <button
                               type="button"
