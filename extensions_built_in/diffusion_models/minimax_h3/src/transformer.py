@@ -276,7 +276,7 @@ class MiniMaxH3Attention(nn.Module):
                     "target-video row); the caller did not supply one"
                 )
             try:
-                from sol3_attn import sol3_attn as _sol3_fn
+                from toolkit.attention.sol3_vendored.sol3_attn import sol3_attn as _sol3_fn
             except ImportError as e:
                 from toolkit.util.kernel_report import report_missing
 
