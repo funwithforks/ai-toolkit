@@ -453,6 +453,15 @@ class BaseModel:
         # any existing file counts, matching long-standing behavior.
         return True
 
+    def validation_sigmas(self) -> List[float]:
+        # arch-tunable default probe grid for validation, used when the
+        # config declares neither sigmas nor a schedule. The shared fallback
+        # lives in config_modules.DEFAULT_VALIDATION_SIGMAS; override per
+        # arch only after measuring that arch's own sigma scale.
+        from toolkit.config_modules import DEFAULT_VALIDATION_SIGMAS
+
+        return list(DEFAULT_VALIDATION_SIGMAS)
+
     def release_encode_phase_components(self):
         # frees components a model loaded only for the text-embedding phase
         # (e.g. projection layers that convert embeds, loaded lazily during

@@ -394,6 +394,26 @@ class ValidationItem:
         self.prompt: str = kwargs.get('prompt', '')
 
 
+# probe grid used when neither the config nor the arch declares one
+DEFAULT_VALIDATION_SIGMAS = [1.0, 0.75, 0.5, 0.25]
+
+
+class CheckpointValidationConfig:
+    """Extensive validation pass. Fires at every checkpoint save by
+    default; `every` overrides that with its own step interval. Sigma grid
+    resolution is the same as the frequent tier (sigmas > schedule > arch
+    default > shared fallback), read from this block first."""
+
+    def __init__(self, **kwargs):
+        self.every = kwargs.get('every', None)
+        self.sigmas = kwargs.get('sigmas', None)
+        self.schedule = kwargs.get('schedule', None)
+        if self.sigmas is not None and self.schedule is not None:
+            raise ValueError(
+                "checkpoint_validation: set either sigmas or schedule, not both"
+            )
+
+
 class ValidationConfig:
     def __init__(self, **kwargs):
         self.validation_items: List[ValidationItem] = [
@@ -402,7 +422,20 @@ class ValidationConfig:
         ]
         self.resolution: int = kwargs.get('resolution', 512)
         self.validate_every_n_steps: int = kwargs.get('validate_every_n_steps', 10)
-        self.validation_sigmas: List[float] = kwargs.get('validation_sigmas', [1.0, 0.75, 0.5, 0.25])
+        # None -> arch default (BaseModel.validation_sigmas) -> shared fallback
+        self.validation_sigmas = kwargs.get('validation_sigmas', None)
+        # {'scheduler': 'normal'|'simple'|'beta', 'steps': n} -- probe grid
+        # from the inference scheduler; mutually exclusive with sigmas
+        self.validation_schedule = kwargs.get('validation_schedule', None)
+        if self.validation_sigmas is not None and self.validation_schedule is not None:
+            raise ValueError(
+                "validation_config: set either validation_sigmas or "
+                "validation_schedule, not both"
+            )
+        ck = kwargs.get('checkpoint_validation', None)
+        self.checkpoint_validation = None if ck is None else (
+            ck if isinstance(ck, CheckpointValidationConfig) else CheckpointValidationConfig(**ck)
+        )
 
 
 class EmbeddingConfig:

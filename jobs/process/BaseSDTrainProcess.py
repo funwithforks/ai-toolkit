@@ -64,7 +64,8 @@ from tqdm import tqdm
 
 from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, NetworkConfig, TrainConfig, ModelConfig, \
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
-    DecoratorConfig, MASK_MODEL_PASS_ORDER, CONTROL_PASS_ORDER
+    DecoratorConfig, MASK_MODEL_PASS_ORDER, CONTROL_PASS_ORDER, DEFAULT_VALIDATION_SIGMAS
+from toolkit.validation_schedule import sigmas_from_schedule
 from toolkit.control_generator import ControlGenerator
 from toolkit.logging_aitk import create_logger
 from toolkit.ragged import RaggedBatch, is_ragged
@@ -289,6 +290,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # cached latents, prompt embeds, and fixed noise for validation
         self._validation_cache = None
         self._validation_items = None
+        # val loss at the first validation round; later rounds log their
+        # delta against it
+        self._validation_baseline = None
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
@@ -2213,7 +2217,41 @@ class BaseSDTrainProcess(BaseTrainProcess):
             "this run's config excluded the prep phases"
         )
 
-    def validate(self):
+    def _resolve_validation_sigmas(self, val_config, tier: str):
+        """Probe grid for a validation tier. Resolution order: the tier's own
+        explicit grid (checkpoint block) > the config's sigmas or schedule >
+        the arch's default > the shared fallback."""
+        ck = getattr(val_config, 'checkpoint_validation', None)
+        if tier == 'checkpoint' and ck is not None:
+            if ck.sigmas is not None:
+                return list(ck.sigmas)
+            if ck.schedule is not None:
+                return sigmas_from_schedule(ck.schedule, self.sd.noise_scheduler.sigmas)
+        if val_config.validation_sigmas is not None:
+            return list(val_config.validation_sigmas)
+        if getattr(val_config, 'validation_schedule', None) is not None:
+            return sigmas_from_schedule(
+                val_config.validation_schedule, self.sd.noise_scheduler.sigmas)
+        return list(self.sd.validation_sigmas())
+
+    def _log_validation_metrics(self, tier: str, sigmas, per_sigma_losses,
+                                per_sigma_cosines, item_losses, val_loss):
+        """Push the validation metric vector into additional_logs. The
+        aggregate keeps its historical key; everything else is additive so
+        the loss graph picks the new keys up as plain metric series."""
+        fmt = lambda s: f"{s:g}"
+        self.additional_logs['val/loss'] = val_loss
+        for i, sigma in enumerate(sigmas):
+            self.additional_logs[f'val/loss_s{fmt(sigma)}'] = per_sigma_losses[i]
+            self.additional_logs[f'val/cos_s{fmt(sigma)}'] = per_sigma_cosines[i]
+        for i, item_loss in enumerate(item_losses):
+            self.additional_logs[f'val/loss_item{i}'] = item_loss
+        if self._validation_baseline is not None:
+            self.additional_logs['val/loss_delta'] = val_loss - self._validation_baseline
+        else:
+            self._validation_baseline = val_loss
+
+    def validate(self, tier: str = 'frequent'):
         val_config = self.train_config.validation_config
         if val_config is None:
             return
@@ -2224,7 +2262,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             return
         device = self.device_torch
         dtype = get_torch_dtype(self.train_config.dtype)
-        sigmas = val_config.validation_sigmas
+        sigmas = self._resolve_validation_sigmas(val_config, tier)
         cache = self._validation_cache
 
         was_unet_training = self.sd.unet.training
@@ -2243,16 +2281,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     for sigma in sigmas
                 ]
             timesteps = torch.tensor(timestep_values, device=device)
+            num_sigmas = len(sigmas)
 
             # images can have different aspect ratios, so each image is predicted as its
             # own batch with all sigmas at once
-            losses = []
+            # per-sigma accumulators across items; the sigma batch is laid
+            # out as num_sigmas consecutive chunks of the item's batch size
+            sigma_loss_sums = torch.zeros(num_sigmas, dtype=torch.float64)
+            sigma_cos_sums = torch.zeros(num_sigmas, dtype=torch.float64)
+            item_losses = []
             for latents_cpu, noise_cpu, embeds_cpu in zip(cache['latents'], cache['noise'], cache['embeds']):
                 latents = latents_cpu.to(device, dtype=dtype)
                 noise = noise_cpu.to(device, dtype=dtype)
-                batch_latents = torch.cat([latents] * len(sigmas), dim=0)
-                batch_noise = torch.cat([noise] * len(sigmas), dim=0)
-                batch_embeds = concat_prompt_embeds([embeds_cpu.clone().to(device, dtype=dtype)] * len(sigmas))
+                batch_latents = torch.cat([latents] * num_sigmas, dim=0)
+                batch_noise = torch.cat([noise] * num_sigmas, dim=0)
+                batch_embeds = concat_prompt_embeds([embeds_cpu.clone().to(device, dtype=dtype)] * num_sigmas)
 
                 noisy_latents = self.sd.add_noise(batch_latents, batch_noise, timesteps).detach()
 
@@ -2282,13 +2325,39 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     target = batch_noise
 
-                losses.append(torch.nn.functional.mse_loss(noise_pred.float(), target.float()))
+                # split the sigma-batched forward into per-sigma chunks
+                item_bs = latents.shape[0]
+                item_sigma_losses = []
+                item_sigma_cosines = []
+                for i in range(num_sigmas):
+                    chunk = slice(i * item_bs, (i + 1) * item_bs)
+                    pred_c = noise_pred[chunk].float()
+                    target_c = target[chunk].float()
+                    item_sigma_losses.append(
+                        torch.nn.functional.mse_loss(pred_c, target_c))
+                    item_sigma_cosines.append(torch.nn.functional.cosine_similarity(
+                        pred_c.reshape(pred_c.shape[0], -1),
+                        target_c.reshape(target_c.shape[0], -1), dim=1).mean())
+                item_losses.append(torch.stack(item_sigma_losses).mean().item())
+                sigma_loss_sums += torch.stack(item_sigma_losses).double().cpu()
+                sigma_cos_sums += torch.stack(item_sigma_cosines).double().cpu()
 
-            val_loss = torch.stack(losses).mean()
-            self.additional_logs['val/loss'] = val_loss.item()
+            num_items = len(item_losses)
+            per_sigma_losses = (sigma_loss_sums / num_items).tolist()
+            per_sigma_cosines = (sigma_cos_sums / num_items).tolist()
+            val_loss = sum(item_losses) / num_items
+            self._log_validation_metrics(
+                tier, sigmas, per_sigma_losses, per_sigma_cosines, item_losses, val_loss)
         network.multiplier = start_multiplier
         if was_unet_training:
             self.sd.unet.train()
+        delta = ''
+        if self._validation_baseline is not None and val_loss != self._validation_baseline:
+            delta = f", delta {val_loss - self._validation_baseline:+.4f}"
+        print_acc(
+            f"validation ({tier} tier, step {self.step_num}): loss {val_loss:.4f} "
+            f"over {num_sigmas} sigmas x {num_items} items{delta}"
+        )
 
     def _run_masking_pass(self, all_dataset_objs):
         """One model load per mask model; every dataset requesting that model
@@ -3710,11 +3779,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # run validation before any possible sampling/logging for this step
             if not did_oom and self.train_config.validation_config is not None:
                 val_config = self.train_config.validation_config
+                ck_config = getattr(val_config, 'checkpoint_validation', None)
+                is_checkpoint_val_step = False
+                if ck_config is not None:
+                    # the extensive tier fires at every checkpoint save by
+                    # default; 'every' overrides with its own step interval
+                    if ck_config.every is not None:
+                        is_checkpoint_val_step = self.step_num % ck_config.every == 0
+                    elif self.save_config.disable_saving:
+                        if not getattr(self, '_checkpoint_val_never_fires_printed', False):
+                            print_acc(
+                                "checkpoint_validation has no 'every' interval and "
+                                "saving is disabled: the extensive tier will never fire"
+                            )
+                            self._checkpoint_val_never_fires_printed = True
+                    else:
+                        is_checkpoint_val_step = is_save_step
                 is_validate_step = (
                     self.step_num == self.start_step
                     or (val_config.validate_every_n_steps and self.step_num % val_config.validate_every_n_steps == 0)
                 )
-                if is_validate_step:
+                if is_checkpoint_val_step:
+                    with self.timer('validate_checkpoint'):
+                        self.validate(tier='checkpoint')
+                elif is_validate_step:
                     with self.timer('validate'):
                         self.validate()
 
