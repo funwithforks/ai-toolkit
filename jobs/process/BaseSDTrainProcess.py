@@ -1905,6 +1905,38 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if item.image_path and os.path.exists(item.image_path)
         ]
 
+    def _validation_items_configured(self):
+        """True when a validation config with items exists; raises when the
+        config has items but none of the image paths exist -- that config
+        can never validate, and a silent skip would read as a working
+        validation that never runs. The gates keep using the silent
+        _valid_validation_items filter and stay exception-free."""
+        val_config = self.train_config.validation_config
+        if val_config is None or not val_config.validation_items:
+            return False
+        if not self._valid_validation_items():
+            raise ValueError(
+                f"validation_config has {len(val_config.validation_items)} "
+                "items and none of the image paths exist: "
+                f"{[i.image_path for i in val_config.validation_items]}"
+            )
+        return True
+
+    def _validation_prompts(self):
+        """Trigger-injected prompts for the valid validation items, in item
+        order -- the embed cache digest covers the injected form."""
+        prompts = []
+        for item in self._valid_validation_items():
+            prompt = item.prompt
+            if self.trigger_word is not None:
+                prompt = self.sd.inject_trigger_into_prompt(
+                    prompt,
+                    trigger=self.trigger_word,
+                    add_if_not_present=False,
+                )
+            prompts.append(prompt)
+        return prompts
+
     def _validation_latent_cache_info(self):
         """(path, meta, items) for the validation latent cache file, or None
         when validation is not configured with valid images. Pure config,
@@ -1990,7 +2022,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     trigger=self.trigger_word,
                     add_if_not_present=False,
                 )
-            if not os.path.exists(self._validation_embed_cache_path(idx, prompt)):
+            cache_path = self._validation_embed_cache_path(idx, prompt)
+            if not os.path.exists(cache_path) or not self.sd.embed_file_valid(cache_path):
                 return True
         return False
 
@@ -2001,6 +2034,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # 1 holds the vae; a warm run loads the file and never touches it.
         self._validation_items = None
         if not self.accelerator.is_main_process:
+            return
+        if not self._validation_items_configured():
             return
         info = self._validation_latent_cache_info()
         if info is None:
@@ -2087,23 +2122,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
             return
         if not self.accelerator.is_main_process:
             return
+        if not getattr(self.sd, 'has_text_encoder', True):
+            raise ValueError(
+                f"{type(self.sd).__name__} declares no text encoder: "
+                "prompt-embed validation does not exist for encoderless "
+                "archs. Remove validation_config from this run"
+            )
         device = self.device_torch
-        prompt_list = []
-        for item in self._validation_items:
-            prompt = item.prompt
-            if self.trigger_word is not None:
-                prompt = self.sd.inject_trigger_into_prompt(
-                    prompt,
-                    trigger=self.trigger_word,
-                    add_if_not_present=False,
-                )
-            prompt_list.append(prompt)
+        prompt_list = self._validation_prompts()
 
         embeds_list = [None] * len(prompt_list)
         to_encode = []
         for idx, prompt in enumerate(prompt_list):
             cache_path = self._validation_embed_cache_path(idx, prompt)
-            if os.path.exists(cache_path):
+            if os.path.exists(cache_path) and self.sd.embed_file_valid(cache_path):
                 embeds_list[idx] = PromptEmbeds.load(cache_path)
             else:
                 to_encode.append((idx, prompt, cache_path))
@@ -2131,9 +2163,62 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self._validation_cache['embeds'] = embeds_list
         flush()
 
+    def _ensure_validation_cache(self):
+        """Fill _validation_cache from disk for runs whose config excluded
+        the prep phases (phases-subset resumes with warm caches). Disk reads
+        only -- a missing cache raises instead of loading a component, since
+        component-bound prep belongs to the phase that owns the component."""
+        if self._validation_cache is not None:
+            return
+        if not self.accelerator.is_main_process:
+            return
+        if not self._validation_items_configured():
+            return
+        info = self._validation_latent_cache_info()
+        if info is None:
+            # no vae_id: the loud skip is printed by the info helper
+            return
+        latent_path, _, items = info
+        if not os.path.exists(latent_path):
+            raise ValueError(
+                "the validation latent cache does not exist and this run "
+                "does not include the vae phase: run a prep job with the "
+                "vae phase (or a full run) to build it"
+            )
+        if not getattr(self.sd, 'has_text_encoder', True):
+            raise ValueError(
+                f"{type(self.sd).__name__} declares no text encoder: "
+                "prompt-embed validation does not exist for encoderless "
+                "archs. Remove validation_config from this run"
+            )
+        embeds_list = []
+        for idx, prompt in enumerate(self._validation_prompts()):
+            cache_path = self._validation_embed_cache_path(idx, prompt)
+            if not os.path.exists(cache_path) or not self.sd.embed_file_valid(cache_path):
+                raise ValueError(
+                    "a validation prompt embeds cache is missing or stale "
+                    "and this run does not include the text-encoder phase: "
+                    "run a prep job with the text-encoder phase (or a full "
+                    f"run) to build it ({cache_path})"
+                )
+            embeds_list.append(PromptEmbeds.load(cache_path))
+        state_dict = load_file(latent_path, device='cpu')
+        self._validation_cache = {
+            'latents': [state_dict[f'latent_{i}'] for i in range(len(items))],
+            'noise': [state_dict[f'noise_{i}'] for i in range(len(items))],
+            'embeds': embeds_list,
+        }
+        print_acc(
+            f"Loaded validation caches from disk ({len(items)} items) -- "
+            "this run's config excluded the prep phases"
+        )
+
     def validate(self):
         val_config = self.train_config.validation_config
-        if val_config is None or self._validation_cache is None:
+        if val_config is None:
+            return
+        self._ensure_validation_cache()
+        if self._validation_cache is None:
             return
         if not self.accelerator.is_main_process:
             return
