@@ -73,13 +73,17 @@ def main(argv=None):
     # covers `runtool --machine NAME <op> ...`, the shared parent covers
     # `runtool <op> ... --machine NAME`. The subparser value wins when both
     # are given (standard argparse: explicit beats earlier default).
+    # SUPPRESS (not None) on both: a subparser applies its default to the
+    # namespace even when the flag is absent, which would silently erase a
+    # pre-op value and run the op locally; SUPPRESS writes only on an
+    # explicit flag, so pre-op and post-op both delegate.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
-        "--machine", default=None, metavar="NAME",
+        "--machine", default=argparse.SUPPRESS, metavar="NAME",
         help="run the op on a registered machine over its web server and "
              "print its response verbatim (registry: <runs_root>/"
              "machines.json, hand-edited, gitignored)")
-    ap.add_argument("--machine", default=None, metavar="NAME",
+    ap.add_argument("--machine", default=argparse.SUPPRESS, metavar="NAME",
                     help="same as the per-op --machine")
     sub = ap.add_subparsers(dest="op", required=True)
 

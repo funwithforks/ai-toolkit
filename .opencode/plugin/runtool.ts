@@ -29,6 +29,23 @@ function runtoolCall(dir: string, args: string[], signal: AbortSignal): Promise<
 type Args = Record<string, unknown>
 const str = (v: unknown): string => (typeof v === "string" ? v : v == null ? "" : String(v))
 
+// Remote ops: an optional machine name appends `--machine NAME`, which the
+// CLI answers by forwarding the op verbatim to that machine's web server
+// (registry: <runs_root>/machines.json; see tools/runtool/transport.py).
+// Omitting it keeps everything local.
+const machineArgs = (a: Args): string[] =>
+  typeof a.machine === "string" && a.machine.trim()
+    ? ["--machine", a.machine.trim()]
+    : []
+const MACHINE_PROP = {
+  machine: {
+    type: "string",
+    description:
+      "run the op on a registered machine over its web server (runtool " +
+      "machines lists names); omit for this machine",
+  },
+} as const
+
 // V1 zod defaults become explicit fallbacks here: JSON Schema inputs are
 // not default-applied before execute.
 const wrap =
@@ -51,9 +68,15 @@ export default Plugin.define({
           "The single vocabulary source: suite ids, variants, typed params " +
           "(defaults/bounds), declared metrics, declared markers (the named " +
           "log facts you can set expectations on), and the config_patch " +
-          "allowlist. Call before submit — never carry params in memory.",
-        input: { type: "object", properties: {}, additionalProperties: false },
-        execute: wrap(dir, () => ["suites"]),
+          "allowlist. Call before submit — never carry params in memory. " +
+          "With machine, this fetches that machine's vocabulary (its " +
+          "suites and params as registered there).",
+        input: {
+          type: "object",
+          properties: { ...MACHINE_PROP },
+          additionalProperties: false,
+        },
+        execute: wrap(dir, (a) => ["suites", ...machineArgs(a)]),
       })
       editor.add({
         name: "runtool_submit",
@@ -73,7 +96,12 @@ export default Plugin.define({
           'Example: {"markers":{"te_skip":"present","plan":{"planned":' +
           '"19"}},"metrics":{"loss_final":{"max":1.5}}}. Jobs-subtree ' +
           "runs are exclusive: while one is live, queue with after " +
-          "instead of racing it.",
+          "instead of racing it. With machine, the job launches on that " +
+          "registered machine (runtool_machines for names; fetch its " +
+          "vocabulary and dataset keys first by passing machine to " +
+          "runtool_suites and runtool_search — the base template path and " +
+          "dataset key must exist there), and every later op on the " +
+          "run_id takes the same machine.",
         input: {
           type: "object",
           properties: {
@@ -114,6 +142,7 @@ export default Plugin.define({
                 "plain submit is refused with the holder named; queue " +
                 "with after instead (max 3 live).",
             },
+            ...MACHINE_PROP,
           },
           required: ["suite", "variant"],
           additionalProperties: false,
@@ -137,6 +166,7 @@ export default Plugin.define({
             : []),
           "--note",
           typeof a.note === "string" ? a.note : "",
+          ...machineArgs(a),
         ]),
       })
       editor.add({
@@ -152,7 +182,10 @@ export default Plugin.define({
           "marker that never appeared is a named FAIL, not a shrug. Queued " +
           "runs count as in-flight: waiting on one also drives the queue " +
           "forward and returns when the run itself finishes (queue time " +
-          "counts toward timeout_s).",
+          "counts toward timeout_s). For a run submitted with machine, " +
+          "pass the same machine to every later op on that run_id " +
+          "(wait/status/cancel/inspect/search) — without it the op queries " +
+          "this machine's records, where the run does not exist.",
         input: {
           type: "object",
           properties: {
@@ -161,6 +194,7 @@ export default Plugin.define({
               type: "number",
               description: "override the suite default wait timeout",
             },
+            ...MACHINE_PROP,
           },
           required: ["run_id"],
           additionalProperties: false,
@@ -169,6 +203,7 @@ export default Plugin.define({
           "wait",
           str(a.run_id),
           ...(a.timeout_s ? ["--timeout-s", String(a.timeout_s)] : []),
+          ...machineArgs(a),
         ]),
       })
       editor.add({
@@ -181,11 +216,14 @@ export default Plugin.define({
           "the final PASS/FAIL.",
         input: {
           type: "object",
-          properties: { run_id: { type: "string" } },
+          properties: {
+            run_id: { type: "string" },
+            ...MACHINE_PROP,
+          },
           required: ["run_id"],
           additionalProperties: false,
         },
-        execute: wrap(dir, (a) => ["status", str(a.run_id)]),
+        execute: wrap(dir, (a) => ["status", str(a.run_id), ...machineArgs(a)]),
       })
       editor.add({
         name: "runtool_inspect",
@@ -216,6 +254,7 @@ export default Plugin.define({
               description: "surrounding lines per grep hit",
             },
             show_config: { type: "boolean" },
+            ...MACHINE_PROP,
           },
           required: ["run_id"],
           additionalProperties: false,
@@ -228,6 +267,7 @@ export default Plugin.define({
             ? ["--grep", a.grep, "--context", String(a.context ?? 0)]
             : []),
           ...(a.show_config ? ["--show-config"] : []),
+          ...machineArgs(a),
         ]),
       })
       editor.add({
@@ -260,6 +300,7 @@ export default Plugin.define({
             since: { type: "number", description: "days" },
             jobs: { type: "boolean" },
             limit: { type: "number" },
+            ...MACHINE_PROP,
           },
           additionalProperties: false,
         },
@@ -279,6 +320,7 @@ export default Plugin.define({
           ...(a.expect ? ["--expect", str(a.expect)] : []),
           ...(a.since != null ? ["--since", String(a.since)] : []),
           ...(a.limit != null ? ["--limit", String(a.limit)] : []),
+          ...machineArgs(a),
         ]),
       })
       editor.add({
@@ -314,11 +356,25 @@ export default Plugin.define({
           "cancels everything queued behind it.",
         input: {
           type: "object",
-          properties: { run_id: { type: "string" } },
+          properties: {
+            run_id: { type: "string" },
+            ...MACHINE_PROP,
+          },
           required: ["run_id"],
           additionalProperties: false,
         },
-        execute: wrap(dir, (a) => ["cancel", str(a.run_id)]),
+        execute: wrap(dir, (a) => ["cancel", str(a.run_id), ...machineArgs(a)]),
+      })
+      editor.add({
+        name: "runtool_machines",
+        description:
+          "List the registered remote machines for the machine parameter " +
+          "(names, urls, auth set/unset; tokens never shown). Call before " +
+          "passing machine to any runtool op to get the exact names; a " +
+          "missing registry is a loud error naming the file the owner " +
+          "edits.",
+        input: { type: "object", properties: {}, additionalProperties: false },
+        execute: wrap(dir, () => ["machines"]),
       })
       editor.add({
         name: "runtool_complain",
