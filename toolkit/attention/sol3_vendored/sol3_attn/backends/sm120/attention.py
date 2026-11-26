@@ -50,7 +50,7 @@ def _report_footprint(q, route, covariance, gamma):
           f"(shape {tuple(q.shape)}, cov_gamma={gamma})")
 
 
-def forward(q, k, v, *, counters=None, config=None, prefix_tokens=0, dense=None):
+def forward(q, k, v, *, counters=None, config=None, prefix_tokens=0, dense=None, lse=None):
     q, k, v = (x.contiguous() for x in (q, k, v))
     if not 0 <= prefix_tokens < q.shape[1] or (prefix_tokens and dense is None):
         raise ValueError("A protected prefix requires the native dense-query callback")
@@ -67,6 +67,7 @@ def forward(q, k, v, *, counters=None, config=None, prefix_tokens=0, dense=None)
         out = compact.attention(
             q, k, v, route, prefix_tokens=prefix_tokens, dense=dense,
             bk=bk, warps=warps, covariance=covariance, cov_gamma=gamma,
+            lse=lse,
         )
         count_launch("joint_walk")
         return out, route

@@ -26,6 +26,43 @@ import triton.language as tl
 
 
 @triton.jit
+def _walk_produce(F, BITS, bh, qi, j, T, N: tl.constexpr):
+    # Per-key-block exact-token scan, shared by the forward walk and the
+    # dq kernel so the sparse pattern is single-sourced. Two Triton
+    # hazards this form avoids (see module docstring): a bare (64,) sel
+    # broadcasts on the position axis (lane-sum corruption), and a
+    # 0-d-condition tl.where feeding a (64,64) where->reduce chain
+    # scrambles values. Returns cnt (route scalar), the per-lane
+    # selection, and the per-lane rank within the selection.
+    ts = tl.arange(0, 64)
+    f = tl.load(F + (bh * N + qi) * N + j)
+    length = tl.minimum(64, tl.maximum(T - j * 64, 0))
+    # cnt from the flag scalar, offsets_kernel's exact formula: no
+    # reduction, and skipped/empty blocks select nothing even though
+    # their bits words are uninitialized
+    cnt = tl.where(f == -1, length, tl.maximum(f, 0))
+    if cnt > 0:
+        in_t = (j * 64 + ts) < T
+        bits_word = tl.load(BITS + (bh * N + qi) * N + j)
+        sel_bit = ((bits_word >> ts.to(tl.uint64)) & 1) != 0
+        lower = (tl.full((64,), 1, tl.uint64) << ts.to(tl.uint64)) - 1
+        rank_popc = tl.inline_asm_elementwise(
+            "popc.b64 $0, $1;", "=r,l", [bits_word & lower], dtype=tl.int32, is_pure=True, pack=1)
+        # scalar-if producer: a 0-d-condition tl.where feeding the
+        # (64,64) broadcast->where->reduce chain scrambles the values
+        if f == -1:
+            sel = in_t
+            rank = ts
+        else:
+            sel = sel_bit & in_t
+            rank = rank_popc
+    else:
+        sel = tl.zeros((64,), tl.int1)
+        rank = tl.zeros((64,), tl.int32)
+    return cnt, sel, rank
+
+
+@triton.jit
 def _exact_flush(q, q8, K, V, qs, vs, ids, valid, m, l, acc, b, h, bh,
                  T: tl.constexpr, D: tl.constexpr, SCALE: tl.constexpr,
                  KST: tl.constexpr, VST: tl.constexpr,
@@ -60,14 +97,14 @@ def _exact_flush(q, q8, K, V, qs, vs, ids, valid, m, l, acc, b, h, bh,
 
 
 @triton.jit
-def packed_attention_walk(Q, K, V, KC, VM, F, BITS, O, KS, VS, COV,
+def packed_attention_walk(Q, K, V, KC, VM, F, BITS, O, KS, VS, COV, LSE,
                           T: tl.constexpr, N: tl.constexpr, H: tl.constexpr,
                           D: tl.constexpr, PREFIX: tl.constexpr, SCALE: tl.constexpr,
                           BK: tl.constexpr = 64, HEAD_MAJOR: tl.constexpr = False,
                           FP8: tl.constexpr = False, BQ: tl.constexpr = 64,
                           GAMMA: tl.constexpr = 0., QST: tl.constexpr = 0,
                           KST: tl.constexpr = 0, VST: tl.constexpr = 0,
-                          OST: tl.constexpr = 0):
+                          OST: tl.constexpr = 0, WRITE_LSE: tl.constexpr = False):
     # grid (n, b*h): one program per (query-block, batch*head). The exact
     # pass merges each key-block's selected tokens (rank-ascending) after
     # the pending carry; when the carry reaches BK tokens, one dot fires
@@ -96,7 +133,7 @@ def packed_attention_walk(Q, K, V, KC, VM, F, BITS, O, KS, VS, COV,
     l = tl.zeros((BQ,), tl.float32)
     acc = tl.zeros((BQ, D), tl.float32)
     # representative pass: fixed original-block value means; residual mass
-    # is the remaining token count. Unchanged from upstream.
+    # is the remaining token count.
     for start in range(0, N, 64):
         js = start + tl.arange(0, 64)
         f = tl.load(F + (bh * N + qi) * N + js, js < N, -1)
@@ -113,38 +150,14 @@ def packed_attention_walk(Q, K, V, KC, VM, F, BITS, O, KS, VS, COV,
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), vm)
         l = l * alpha + tl.sum(p, 1)
         m = mm
-    if GAMMA != 0.:
-        cd = tl.arange(0, D)
-        cov = tl.load(COV + bh * D * D + ds[:, None] * D + cd[None, :])
-        correction = tl.dot(q, cov) * (D ** -.5) * GAMMA
-        acc += l[:, None] * correction
     # exact pass over the selection bitmaps
     ts = tl.arange(0, 64)
     idx = tl.arange(0, BK)
     carry = tl.zeros((BK,), tl.int32)
     ncarry = 0
     for j in range(0, N):
-        f = tl.load(F + (bh * N + qi) * N + j)
-        length = tl.minimum(64, tl.maximum(T - j * 64, 0))
-        # cnt from the flag scalar, offsets_kernel's exact formula: no
-        # reduction, and skipped/empty blocks select nothing even though
-        # their bits words are uninitialized
-        cnt = tl.where(f == -1, length, tl.maximum(f, 0))
+        cnt, sel, rank = _walk_produce(F, BITS, bh, qi, j, T, N)
         if cnt > 0:
-            in_t = (j * 64 + ts) < T
-            bits_word = tl.load(BITS + (bh * N + qi) * N + j)
-            sel_bit = ((bits_word >> ts.to(tl.uint64)) & 1) != 0
-            lower = (tl.full((64,), 1, tl.uint64) << ts.to(tl.uint64)) - 1
-            rank_popc = tl.inline_asm_elementwise(
-                "popc.b64 $0, $1;", "=r,l", [bits_word & lower], dtype=tl.int32, is_pure=True, pack=1)
-            # scalar-if producer: a 0-d-condition tl.where feeding the
-            # (64,64) broadcast->where->reduce chain scrambles the values
-            if f == -1:
-                sel = in_t
-                rank = ts
-            else:
-                sel = sel_bit & in_t
-                rank = rank_popc
             tok = j * 64 + ts
             # named-axis compaction: sel gates LANES (axis 0), the rank
             # equality gates POSITIONS (axis 1). A bare (64,) sel would
@@ -177,12 +190,26 @@ def packed_attention_walk(Q, K, V, KC, VM, F, BITS, O, KS, VS, COV,
         m, l, acc = _exact_flush(q, q8, K, V, qs_s, vs_s, carry, idx < ncarry,
                                  m, l, acc, b, h, bh, T, D, SCALE, KST, VST,
                                  HEAD_MAJOR, FP8)
+    # covariance correction: additive on the finished softmax output
+    # (out = acc/l + gamma * D^-0.5 * q@C). Upstream applied this between
+    # the representative and exact passes, where the exact pass's rescaling
+    # weighted it by the representative mass fraction (measured 0.53x at a
+    # production route); the correction's defined semantics is additive.
+    if GAMMA != 0.:
+        cd = tl.arange(0, D)
+        cov = tl.load(COV + bh * D * D + ds[:, None] * D + cd[None, :])
+        acc += l[:, None] * (tl.dot(q, cov) * (D ** -.5) * GAMMA)
     result = acc / l[:, None]
     tl.store(O + (b * T + rows[:, None]).to(tl.int64) * OST + h * D + ds[None, :], result,
              ((rows < T) & (rows >= PREFIX))[:, None])
+    if WRITE_LSE:
+        # log2-domain, matching the exp2 softmax above; the backward
+        # kernels turn any score s into p = exp2(s - lse).
+        tl.store(LSE + (b * T + rows).to(tl.int64) * H + h, m + tl.log2(l),
+                 (rows < T) & (rows >= PREFIX))
 
 
-def attention(q,k,v,route,*,prefix_tokens=0,dense=None,bk=64,head_major=False,warps=4,fp8=False,stages=1,covariance=None,cov_gamma=0.):
+def attention(q,k,v,route,*,prefix_tokens=0,dense=None,bk=64,head_major=False,warps=4,fp8=False,stages=1,covariance=None,cov_gamma=0.,lse=None):
     b,t,h,d=q.shape;n=triton.cdiv(t,64)
     out=torch.empty_like(q)
     original_k,original_v=k,v
@@ -191,9 +218,10 @@ def attention(q,k,v,route,*,prefix_tokens=0,dense=None,bk=64,head_major=False,wa
         k,v,ks,vs=quantized_kv(k,v);head_major=True
     elif head_major:
         k=k.permute(0,2,1,3).contiguous();v=v.permute(0,2,1,3).contiguous()
-    packed_attention_walk[(n,b*h)](q,k,v,route['kc'],route['vm'],route['flags'],route['bits'],out,ks,vs,covariance if covariance is not None else q,
+    packed_attention_walk[(n,b*h)](q,k,v,route['kc'],route['vm'],route['flags'],route['bits'],out,ks,vs,covariance if covariance is not None else q,out if lse is None else lse,
                               t,n,h,d,prefix_tokens,d**-.5*math.log2(math.e),bk,head_major,fp8,GAMMA=float(cov_gamma),
                               QST=q.stride(1),KST=k.stride(1),VST=v.stride(1),OST=out.stride(1),
+                              WRITE_LSE=lse is not None,
                               num_warps=warps,num_stages=stages)
     if prefix_tokens:
         if dense is None:raise RuntimeError('Selected common dense backend required')
