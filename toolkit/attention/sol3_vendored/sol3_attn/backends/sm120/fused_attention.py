@@ -97,14 +97,15 @@ def _exact_flush(q, q8, K, V, qs, vs, ids, valid, m, l, acc, b, h, bh,
 
 
 @triton.jit
-def packed_attention_walk(Q, K, V, KC, VM, F, BITS, O, KS, VS, COV, LSE,
+def packed_attention_walk(Q, K, V, KC, VM, F, BITS, O, KS, VS, COV, LSE, OSM,
                           T: tl.constexpr, N: tl.constexpr, H: tl.constexpr,
                           D: tl.constexpr, PREFIX: tl.constexpr, SCALE: tl.constexpr,
                           BK: tl.constexpr = 64, HEAD_MAJOR: tl.constexpr = False,
                           FP8: tl.constexpr = False, BQ: tl.constexpr = 64,
                           GAMMA: tl.constexpr = 0., QST: tl.constexpr = 0,
                           KST: tl.constexpr = 0, VST: tl.constexpr = 0,
-                          OST: tl.constexpr = 0, WRITE_LSE: tl.constexpr = False):
+                          OST: tl.constexpr = 0, WRITE_LSE: tl.constexpr = False,
+                          STORE_SM: tl.constexpr = False):
     # grid (n, b*h): one program per (query-block, batch*head). The exact
     # pass merges each key-block's selected tokens (rank-ascending) after
     # the pending carry; when the carry reaches BK tokens, one dot fires
@@ -195,11 +196,22 @@ def packed_attention_walk(Q, K, V, KC, VM, F, BITS, O, KS, VS, COV, LSE,
     # the representative and exact passes, where the exact pass's rescaling
     # weighted it by the representative mass fraction (measured 0.53x at a
     # production route); the correction's defined semantics is additive.
+    result_sm = acc / l[:, None]
+    if STORE_SM:
+        # softmax-only output for the training path: the backward's
+        # delta = rowsum(dO * softmax_out) cancellation identity holds
+        # only for the p-weighted mixture, so it must not see the arm.
+        # Subtracting the arm from the bf16 result later would be pure
+        # cancellation noise once the arm dominates.
+        tl.store(OSM + (b * T + rows[:, None]).to(tl.int64) * OST + h * D + ds[None, :],
+                 result_sm, ((rows < T) & (rows >= PREFIX))[:, None])
     if GAMMA != 0.:
         cd = tl.arange(0, D)
         cov = tl.load(COV + bh * D * D + ds[:, None] * D + cd[None, :])
         acc += l[:, None] * (tl.dot(q, cov) * (D ** -.5) * GAMMA)
-    result = acc / l[:, None]
+        result = acc / l[:, None]
+    else:
+        result = result_sm
     tl.store(O + (b * T + rows[:, None]).to(tl.int64) * OST + h * D + ds[None, :], result,
              ((rows < T) & (rows >= PREFIX))[:, None])
     if WRITE_LSE:
@@ -218,7 +230,7 @@ def attention(q,k,v,route,*,prefix_tokens=0,dense=None,bk=64,head_major=False,wa
         k,v,ks,vs=quantized_kv(k,v);head_major=True
     elif head_major:
         k=k.permute(0,2,1,3).contiguous();v=v.permute(0,2,1,3).contiguous()
-    packed_attention_walk[(n,b*h)](q,k,v,route['kc'],route['vm'],route['flags'],route['bits'],out,ks,vs,covariance if covariance is not None else q,out if lse is None else lse,
+    packed_attention_walk[(n,b*h)](q,k,v,route['kc'],route['vm'],route['flags'],route['bits'],out,ks,vs,covariance if covariance is not None else q,out if lse is None else lse,q,
                               t,n,h,d,prefix_tokens,d**-.5*math.log2(math.e),bk,head_major,fp8,GAMMA=float(cov_gamma),
                               QST=q.stride(1),KST=k.stride(1),VST=v.stride(1),OST=out.stride(1),
                               WRITE_LSE=lse is not None,

@@ -50,15 +50,16 @@ def _dq_flush(q, dO_t, lse, delta, K, V, ids, valid, dq, b, h, bh,
 
 
 @triton.jit
-def dq_walk(Q, dO, O, K, V, KC, VM, F, BITS, LSE, DELTA, DQ, COV,
+def dq_walk(Q, dO, O_SM, K, V, KC, VM, F, BITS, LSE, DELTA, DQ, COV,
             T: tl.constexpr, N: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
             PREFIX: tl.constexpr, SCALE: tl.constexpr,
             BK: tl.constexpr = 64, BQ: tl.constexpr = 64,
             GAMMA: tl.constexpr = 0.,
             QST: tl.constexpr = 0, KST: tl.constexpr = 0, VST: tl.constexpr = 0,
             DST: tl.constexpr = 0):
-    # dL/dq for the video rows; also writes DELTA = rowsum(dO*O) for the
-    # dkdv pass (launched first on the same stream).
+    # dL/dq for the video rows; also writes DELTA = rowsum(dO*O_SM) for
+    # the dkdv pass (launched first on the same stream), O_SM being the
+    # softmax-only output: the arm must not enter the delta.
     qtile, bh = tl.program_id(0), tl.program_id(1)
     if (qtile + 1) * BQ <= PREFIX:
         return
@@ -71,7 +72,7 @@ def dq_walk(Q, dO, O, K, V, KC, VM, F, BITS, LSE, DELTA, DQ, COV,
                 in_rows[:, None], 0)
     dO_t = tl.load(dO + (b * T + rows[:, None]).to(tl.int64) * DST + h * D + ds[None, :],
                    in_rows[:, None], 0)
-    o = tl.load(O + (b * T + rows[:, None]).to(tl.int64) * DST + h * D + ds[None, :],
+    o = tl.load(O_SM + (b * T + rows[:, None]).to(tl.int64) * DST + h * D + ds[None, :],
                 in_rows[:, None], 0).to(tl.float32)
     delta = tl.sum(dO_t.to(tl.float32) * o, 1)
     tl.store(DELTA + (b * T + rows).to(tl.int64) * H + h, delta, in_rows)
@@ -280,8 +281,11 @@ def backward(dO, q, k, v, out, route, lse, covariance, *, gamma, prefix,
     """Return (dq, dk, dv) bf16 for the walk forward.
 
     route: dict from make_route (flags/bits/kc/vm); lse the forward's
-    WRITE_LSE tensor (b,T,h) fp32; out the forward output (video rows);
-    covariance the (b*h,D,D) tensor or None when gamma == 0.
+    WRITE_LSE tensor (b,T,h) fp32; out the forward's STORE_SM softmax-only
+    output (video rows, without the additive covariance arm — the
+    p*(dp-delta) cancellation identity requires delta=rowsum(dO*O) over
+    the softmax mixture alone); covariance the (b*h,D,D) tensor or None
+    when gamma == 0.
     """
     b, t, h, d = q.shape
     n = triton.cdiv(t, 64)

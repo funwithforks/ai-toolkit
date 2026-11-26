@@ -35,16 +35,19 @@ class Sol3WalkFn(torch.autograd.Function):
                       if gamma else None)
         _report_footprint(q, route, covariance, gamma)
         out = torch.empty_like(q)
+        out_sm = torch.empty_like(q)
         lse = torch.empty((b, t, h), device=q.device, dtype=torch.float32)
         n = (t + 63) // 64
         compact.packed_attention_walk[(n, b * h)](
             q, k, v, route['kc'], route['vm'], route['flags'], route['bits'],
-            out, q, q, covariance if covariance is not None else q, lse,
+            out, q, q, covariance if covariance is not None else q, lse, out_sm,
             t, n, h, d, prefix_tokens, d ** -0.5 * math.log2(math.e),
             cfg_bk, False, False, GAMMA=float(gamma),
             QST=q.stride(1), KST=k.stride(1), VST=v.stride(1), OST=out.stride(1),
-            WRITE_LSE=True, num_warps=cfg_warps, num_stages=1)
-        ctx.save_for_backward(q, k, v, out, lse)
+            WRITE_LSE=True, STORE_SM=True, num_warps=cfg_warps, num_stages=1)
+        # the backward consumes the softmax-only output (delta identity);
+        # the full output with the additive arm is returned for autograd.
+        ctx.save_for_backward(q, k, v, out_sm, lse)
         ctx.prefix_tokens = prefix_tokens
         ctx.gamma = gamma
         ctx.bk, ctx.warps = bk, warps
@@ -52,13 +55,13 @@ class Sol3WalkFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO):
-        q, k, v, out, lse = ctx.saved_tensors
+        q, k, v, out_sm, lse = ctx.saved_tensors
         prefix = ctx.prefix_tokens
         gamma = ctx.gamma
         route = make_route(q, k, v, {}, prefix)
         covariance = (sol3_kv_covariance.global_covariance(k, v, prefix)
                       if gamma else None)
-        dq, dk, dv = bwd_mod.backward(dO, q, k, v, out, route, lse, covariance,
+        dq, dk, dv = bwd_mod.backward(dO, q, k, v, out_sm, route, lse, covariance,
                                       gamma=gamma, prefix=prefix,
                                       bk=ctx.bk, warps=ctx.warps)
         return dq, dk, dv, None, None, None, None

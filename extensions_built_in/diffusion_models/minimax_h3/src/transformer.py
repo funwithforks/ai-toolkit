@@ -27,6 +27,7 @@ and both heads predict the data-ward velocity ``clean - noise``.
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -139,6 +140,12 @@ def set_frost_sdpa(flag: bool) -> None:
 
 _SOL3_ATTN = False
 
+# Shipped covariance-correction coefficient for the H3 sol3 branch. The
+# package default (1.0) is measured harmful on H3 live layers; 0.0 keeps
+# the sparse forward 0.03-0.08 relative from dense and trains with the
+# control (docs/kernel_opt/sol3/SOL3.md). A/B: SOL3_COV_GAMMA env var.
+_SOL3_GAMMA = 0.0
+
 
 def set_sol3_attn(flag: bool) -> None:
     global _SOL3_ATTN
@@ -250,20 +257,19 @@ class MiniMaxH3Attention(nn.Module):
             return self.out_proj(out.reshape(b, s, -1))
 
         if _SOL3_ATTN and self.sol3_eligible:
-            # Opt-in Sol3 sparse attention (model_kwargs sol3_attn). Only
-            # no-grad runs are enabled: the walk autograd Function
-            # (backends/sm120/trainable.py) is under development -- grad-
-            # enabled steps ran flat-loss/NaN-weights in live paired runs
-            # and it stays off the training path until the oracle ladder
-            # covers real-scale activations. Every other context raises
+            # Opt-in Sol3 sparse attention (model_kwargs sol3_attn). Under
+            # grad the walk autograd Function runs (validated against the
+            # fp32 oracle at live activation scales); without grad the
+            # forward-only kernel entry runs. Every other context raises
             # instead of running dense -- a silent fallback would corrupt
             # both the timing and the output comparison.
-            if torch.is_grad_enabled():
-                raise RuntimeError(
-                    "sol3_attn training steps are not enabled yet: the "
-                    "walk backward is under development. Use "
-                    "train.forward_only or sampling for sol3 timing runs."
-                )
+            #
+            # gamma: the package ships the covariance correction at 1.0,
+            # measured harmful on H3 (live dumps: the arm reaches 0.4-0.8x
+            # of the softmax output and pulls the forward 0.25-1.0 relative
+            # from dense, where gamma=0 sits 0.03-0.08 away and LoRA
+            # training descends with the control). SOL3_COV_GAMMA is the
+            # A/B escape hatch; the shipped default is the measured-best 0.
             if b != 1:
                 raise RuntimeError(
                     f"sol3_attn requires batch size 1, got {b}; multi-sample "
@@ -279,16 +285,24 @@ class MiniMaxH3Attention(nn.Module):
                     "sol3_attn requires the sol3_prefix row index (first "
                     "target-video row); the caller did not supply one"
                 )
+            gamma = float(os.environ.get("SOL3_COV_GAMMA", _SOL3_GAMMA))
+            qs, ks, vs = (t.contiguous() for t in (q, k, v))
             try:
-                from toolkit.attention.sol3_vendored.sol3_attn import \
-                    sol3_attn as _sol3_fn
+                if torch.is_grad_enabled():
+                    from toolkit.attention.sol3_vendored.sol3_attn \
+                        .backends.sm120.trainable import sol3_attn_trainable as _sol3_fn
+                    out = _sol3_fn(qs, ks, vs, prefix_tokens=sol3_prefix,
+                                   gamma=gamma)
+                else:
+                    from toolkit.attention.sol3_vendored.sol3_attn import \
+                        sol3_attn as _sol3_fn
+                    out = _sol3_fn(qs, ks, vs, prefix_tokens=sol3_prefix,
+                                   gamma=gamma)
             except ImportError as e:
                 from toolkit.util.kernel_report import report_missing
 
                 report_missing("h3_sol3_attn", f"sol3_attn package unavailable: {e}")
                 raise
-            qs, ks, vs = (t.contiguous() for t in (q, k, v))
-            out = _sol3_fn(qs, ks, vs, prefix_tokens=sol3_prefix)
             return self.out_proj(out.reshape(b, s, -1))
 
         if varlen_ctx is not None:

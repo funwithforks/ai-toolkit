@@ -72,7 +72,7 @@ def _forward(q, k, v, *, model=None, counters=None, **options):
         return forward(q, k, v, counters=counters, **options)
 
 
-def sol3_attn(q, k, v, *, prefix_tokens=0, dense=None):
+def sol3_attn(q, k, v, *, prefix_tokens=0, dense=None, gamma=None):
     """Compute forward-only, bidirectional attention on SM80 or SM120.
 
     Inputs are contiguous CUDA BF16 tensors of shape [1, T, H, 128].
@@ -80,8 +80,12 @@ def sol3_attn(q, k, v, *, prefix_tokens=0, dense=None):
     queries. Prefix queries use dense attention over the full sequence via
     PyTorch SDPA or dense(q_prefix, k, v). The callback may receive a slice of
     the heads. Return a tensor with the query's shape, dtype and device.
+    gamma selects the covariance correction coefficient (the backend's
+    cov_gamma config); None keeps the backend default.
     """
-    output, _route = _forward(q, k, v, prefix_tokens=prefix_tokens, dense=dense)
+    config = None if gamma is None else {"cov_gamma": float(gamma)}
+    output, _route = _forward(q, k, v, prefix_tokens=prefix_tokens, dense=dense,
+                              config=config)
     return output
 
 

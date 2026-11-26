@@ -63,8 +63,10 @@ _kit = TrainerKit(
         "sol3": Param(
             "bool", default=False,
             desc="sol3_attn model kwarg: Sol3 sparse attention "
-                 "(forward-only — sampling and fwd_only runs; training "
-                 "steps raise while the walk backward is under development)",
+                 "(training steps run the walk autograd Function; "
+                 "no-grad runs use the forward-only kernel entry; "
+                 "covariance correction off by default, SOL3_COV_GAMMA "
+                 "to A/B)",
         ),
     },
     switches={
