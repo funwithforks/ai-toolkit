@@ -250,16 +250,11 @@ class MiniMaxH3Attention(nn.Module):
             return self.out_proj(out.reshape(b, s, -1))
 
         if _SOL3_ATTN and self.sol3_eligible:
-            # Opt-in Sol3 sparse attention (model_kwargs sol3_attn):
-            # forward-only, valid only where no graph is built. Every other
-            # context raises instead of running dense -- a silent fallback
-            # would corrupt both the timing and the output comparison.
-            if torch.is_grad_enabled():
-                raise RuntimeError(
-                    "sol3_attn is forward-only and requires a no_grad "
-                    "context (sampling or train.forward_only runs); the "
-                    "training backward does not exist yet"
-                )
+            # Opt-in Sol3 sparse attention (model_kwargs sol3_attn). Under
+            # grad the walk autograd Function supplies the backward; without
+            # grad the forward-only kernel path runs. Every other context
+            # raises instead of running dense -- a silent fallback would
+            # corrupt both the timing and the output comparison.
             if b != 1:
                 raise RuntimeError(
                     f"sol3_attn requires batch size 1, got {b}; multi-sample "
@@ -276,7 +271,12 @@ class MiniMaxH3Attention(nn.Module):
                     "target-video row); the caller did not supply one"
                 )
             try:
-                from toolkit.attention.sol3_vendored.sol3_attn import sol3_attn as _sol3_fn
+                if torch.is_grad_enabled():
+                    from toolkit.attention.sol3_vendored.sol3_attn \
+                        .backends.sm120.trainable import sol3_attn_trainable as _sol3_fn
+                else:
+                    from toolkit.attention.sol3_vendored.sol3_attn import \
+                        sol3_attn as _sol3_fn
             except ImportError as e:
                 from toolkit.util.kernel_report import report_missing
 
