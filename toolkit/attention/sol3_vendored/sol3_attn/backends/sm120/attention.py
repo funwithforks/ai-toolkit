@@ -25,18 +25,25 @@ from .routing import DEFAULT_COVARIANCE, make_route
 _PROFILE = PROFILES["fast"]
 _WORKSPACE = Workspace("fast", __package__ + ".")
 
-# Upper bound on the (batch*heads, blocks, tokens) int32 compaction index.
-# Above it, heads are processed in chunks sized to fit the budget. The
-# env override is the standard A/B escape hatch.
-_DEFAULT_IDS_BUDGET_BYTES = 512 * 1024 * 1024
+# Floor for the ids budget when free VRAM is plentiful; the budget itself
+# scales with the device's actual free memory at call time, so near-capacity
+# runs degrade into more head chunks instead of OOM. The env override is
+# the standard A/B escape hatch.
+_MIN_IDS_BUDGET_BYTES = 256 * 1024 * 1024
+_VRAM_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 
 
-def _ids_budget_bytes():
+def _ids_budget_bytes(q):
     raw = os.environ.get("SOL3_IDS_BUDGET_MB", "")
     try:
-        return int(raw) * 1024 * 1024 if raw else _DEFAULT_IDS_BUDGET_BYTES
+        if raw:
+            return int(raw) * 1024 * 1024
     except ValueError:
-        return _DEFAULT_IDS_BUDGET_BYTES
+        pass
+    # a quarter of the device's callable headroom, floored: the index is
+    # one of several large per-call allocations and must not starve them
+    budget = (available_memory(q) - _VRAM_RESERVE_BYTES) // 3
+    return max(_MIN_IDS_BUDGET_BYTES, budget)
 
 
 def _head_slice(route, start, end, heads, blocks, dimension):
@@ -92,7 +99,7 @@ def forward(q, k, v, *, counters=None, config=None, prefix_tokens=0, dense=None)
         # budget -- then the heads are processed in chunks, which is
         # purely a memory bound: each kernel program owns one
         # (batch, head) pair, so chunking never enters the math.
-        budget = _ids_budget_bytes()
+        budget = _ids_budget_bytes(q)
         prepared = compact.prepare(q, route, cap_bytes=budget)
         if prepared is not None:
             ids, count = prepared
