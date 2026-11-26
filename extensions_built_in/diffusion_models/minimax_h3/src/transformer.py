@@ -250,11 +250,20 @@ class MiniMaxH3Attention(nn.Module):
             return self.out_proj(out.reshape(b, s, -1))
 
         if _SOL3_ATTN and self.sol3_eligible:
-            # Opt-in Sol3 sparse attention (model_kwargs sol3_attn). Under
-            # grad the walk autograd Function supplies the backward; without
-            # grad the forward-only kernel path runs. Every other context
-            # raises instead of running dense -- a silent fallback would
-            # corrupt both the timing and the output comparison.
+            # Opt-in Sol3 sparse attention (model_kwargs sol3_attn). Only
+            # no-grad runs are enabled: the walk autograd Function
+            # (backends/sm120/trainable.py) is under development -- grad-
+            # enabled steps ran flat-loss/NaN-weights in live paired runs
+            # and it stays off the training path until the oracle ladder
+            # covers real-scale activations. Every other context raises
+            # instead of running dense -- a silent fallback would corrupt
+            # both the timing and the output comparison.
+            if torch.is_grad_enabled():
+                raise RuntimeError(
+                    "sol3_attn training steps are not enabled yet: the "
+                    "walk backward is under development. Use "
+                    "train.forward_only or sampling for sol3 timing runs."
+                )
             if b != 1:
                 raise RuntimeError(
                     f"sol3_attn requires batch size 1, got {b}; multi-sample "
@@ -271,12 +280,8 @@ class MiniMaxH3Attention(nn.Module):
                     "target-video row); the caller did not supply one"
                 )
             try:
-                if torch.is_grad_enabled():
-                    from toolkit.attention.sol3_vendored.sol3_attn \
-                        .backends.sm120.trainable import sol3_attn_trainable as _sol3_fn
-                else:
-                    from toolkit.attention.sol3_vendored.sol3_attn import \
-                        sol3_attn as _sol3_fn
+                from toolkit.attention.sol3_vendored.sol3_attn import \
+                    sol3_attn as _sol3_fn
             except ImportError as e:
                 from toolkit.util.kernel_report import report_missing
 

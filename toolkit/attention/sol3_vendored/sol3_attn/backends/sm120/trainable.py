@@ -28,11 +28,12 @@ class Sol3WalkFn(torch.autograd.Function):
             raise ValueError("sol3 trainable requires contiguous q/k/v")
         if not 0 <= prefix_tokens < t:
             raise ValueError("prefix_tokens must be in [0, T)")
-        from .attention import _PROFILE
+        from .attention import _PROFILE, _report_footprint
         cfg_bk, cfg_warps = _PROFILE.joint_launch if t >= 16385 else (bk, warps)
         route = make_route(q, k, v, {}, prefix_tokens)
         covariance = (sol3_kv_covariance.global_covariance(k, v, prefix_tokens)
                       if gamma else None)
+        _report_footprint(q, route, covariance, gamma)
         out = torch.empty_like(q)
         lse = torch.empty((b, t, h), device=q.device, dtype=torch.float32)
         n = (t + 63) // 64

@@ -529,8 +529,9 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             set_sol3_attn(True)
             print(
                 "  - Sol3 sparse attention enabled via model_kwargs "
-                "sol3_attn (training steps use the walk autograd Function; "
-                "no-grad runs use the forward-only kernel path)"
+                "sol3_attn (forward-only: sampling and train.forward_only "
+                "runs; training steps raise while the walk backward is "
+                "under development)"
             )
         transformer = MiniMaxH3Transformer.load_model(
             dit_path,
