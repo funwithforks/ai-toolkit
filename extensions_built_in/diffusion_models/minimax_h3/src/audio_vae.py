@@ -426,6 +426,10 @@ class MiniMaxH3AudioVAE(nn.Module, OstrisModelMixin):
     aitk_comfy_repo = "Comfy-Org/MiniMax-H3"
     aitk_comfy_weight_names = {
         "Comfy-Org/MiniMax-H3": ["vae/minimax_h3_audio_vae_fp32.safetensors"],
+        # the FastH3 repack mirrors the base model's vae files
+        "FastVideo/FastVideo-FastH3-Comfy": [
+            "vae/minimax_h3_audio_vae_fp32.safetensors",
+        ],
     }
 
     @classmethod

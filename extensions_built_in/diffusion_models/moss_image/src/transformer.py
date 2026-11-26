@@ -274,7 +274,9 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
     # vendor repo (the UI default name_or_path) and the repack repo itself
     aitk_comfy_repo = COMFY_REPO
     aitk_comfy_weight_names = {
-        VENDOR_BASE_REPO: [COMFY_DIT_FILE],
+        # the vendor key names the source repo; the file is the comfy
+        # repack, so the entry pins its host repo
+        VENDOR_BASE_REPO: {"repo": COMFY_REPO, "files": [COMFY_DIT_FILE]},
         COMFY_REPO: [COMFY_DIT_FILE],
     }
 

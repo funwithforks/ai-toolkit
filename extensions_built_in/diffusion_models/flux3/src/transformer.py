@@ -376,7 +376,7 @@ class Flux3Transformer(nn.Module, OstrisModelMixin):
     aitk_comfy_repo = "black-forest-labs/flux-3-image-klein-comfy"
     aitk_comfy_weight_names = {
         "black-forest-labs/flux-3-image-klein-comfy": [
-            "diffusion_models/flux3_image_klein_int8_convrot.safetensors",
+            "diffusion_models/flux3-image-klein-int8-convrot.safetensors",
         ]
     }
 

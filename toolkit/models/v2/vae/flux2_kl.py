@@ -376,13 +376,30 @@ class AutoEncoder(nn.Module, OstrisModelMixin):
     # every standard name_or_path of a model on this vae maps to the same
     # properly-named file; a job naming any of them fetches one shared vae
     aitk_comfy_weight_names = {
-        "black-forest-labs/flux-3-image-klein-comfy": ["vae/flux2-vae.safetensors"],
-        "Comfy-Org/Fibo-2.0": ["vae/flux2-vae.safetensors"],
+        # every standard name_or_path of a model on this vae maps to the same
+        # properly-named file; a job naming any of them fetches one shared vae
+        # from the single ungated source repo (keys name jobs' repos, not
+        # hosts -- some carry no vae/ dir at all, and the flux3 package copy
+        # is not byte-identical), so each non-default entry pins its source
+        "black-forest-labs/flux-3-image-klein-comfy": {
+            "repo": "Comfy-Org/MOSS-Image",
+            "files": ["vae/flux2-vae.safetensors"],
+        },
+        "Comfy-Org/Fibo-2.0": {
+            "repo": "Comfy-Org/MOSS-Image",
+            "files": ["vae/flux2-vae.safetensors"],
+        },
         "Comfy-Org/MOSS-Image": ["vae/flux2-vae.safetensors"],
         # ideogram4's only official release is quantized (fp8/nf4, diffusers
         # layout); its comfy packaging ships the same byte-identical vae
-        "Comfy-Org/Ideogram-4": ["vae/flux2-vae.safetensors"],
-        "OpenMOSS-Team/MOSS-Image-Base": ["vae/flux2-vae.safetensors"],
+        "Comfy-Org/Ideogram-4": {
+            "repo": "Comfy-Org/MOSS-Image",
+            "files": ["vae/flux2-vae.safetensors"],
+        },
+        "OpenMOSS-Team/MOSS-Image-Base": {
+            "repo": "Comfy-Org/MOSS-Image",
+            "files": ["vae/flux2-vae.safetensors"],
+        },
     }
 
     @classmethod

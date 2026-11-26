@@ -602,6 +602,16 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
             "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
             "diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors",
             "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            # the FastH3 distill repack is hosted by FastVideo, not by this
+            # repo: the pair declares its true download repo
+            (
+                "FastVideo/FastVideo-FastH3-Comfy",
+                "diffusion_models/fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors",
+            ),
+        ],
+        # FastH3 jobs naming the FastVideo repack directly: same files
+        # (the partition filter keeps only the fasth3 candidate)
+        "FastVideo/FastVideo-FastH3-Comfy": [
             "diffusion_models/fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors",
         ],
         # MiniMax-H3-Image: the audio-less 6-PDD-head pruned DiT, three

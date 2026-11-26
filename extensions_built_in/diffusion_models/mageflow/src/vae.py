@@ -631,12 +631,32 @@ class MageVAE(nn.Module, OstrisModelMixin):
     _COMFY_VAE = ["vae/mage_flow_vae_bf16.safetensors"]
     aitk_comfy_weight_names = {
         "Comfy-Org/Mage-Flow": _COMFY_VAE,
-        "microsoft/Mage-Flow": _COMFY_VAE,
-        "microsoft/Mage-Flow-Base": _COMFY_VAE,
-        "microsoft/Mage-Flow-Edit-Base": _COMFY_VAE,
-        "mage-flow-community/Mage-Flow": _COMFY_VAE,
-        "mage-flow-community/Mage-Flow-Base": _COMFY_VAE,
-        "mage-flow-community/Mage-Flow-Edit-Base": _COMFY_VAE,
+        # vendor/community keys name source repos, not this file's host;
+        # each entry pins the comfy repack repo
+        "microsoft/Mage-Flow": {
+            "repo": "Comfy-Org/Mage-Flow",
+            "files": _COMFY_VAE,
+        },
+        "microsoft/Mage-Flow-Base": {
+            "repo": "Comfy-Org/Mage-Flow",
+            "files": _COMFY_VAE,
+        },
+        "microsoft/Mage-Flow-Edit-Base": {
+            "repo": "Comfy-Org/Mage-Flow",
+            "files": _COMFY_VAE,
+        },
+        "mage-flow-community/Mage-Flow": {
+            "repo": "Comfy-Org/Mage-Flow",
+            "files": _COMFY_VAE,
+        },
+        "mage-flow-community/Mage-Flow-Base": {
+            "repo": "Comfy-Org/Mage-Flow",
+            "files": _COMFY_VAE,
+        },
+        "mage-flow-community/Mage-Flow-Edit-Base": {
+            "repo": "Comfy-Org/Mage-Flow",
+            "files": _COMFY_VAE,
+        },
     }
 
     @classmethod

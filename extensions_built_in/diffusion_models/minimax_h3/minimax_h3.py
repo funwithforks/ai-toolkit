@@ -55,8 +55,8 @@ from toolkit.models.base_model import BaseModel
 from toolkit.models.phased_load import PhasedLoadMixin
 from toolkit.models.v2.text_encoders.qwen3_vl import Qwen3VLTextEncoder
 from toolkit.models.v2.resolver import (
+    candidate_file,
     find_file_recursive,
-    repo_id_from_name_or_path,
     resolve_comfy_file,
 )
 from toolkit.paths import MODELS_PATH
@@ -385,7 +385,7 @@ class MinimaxH3Model(PhasedLoadMixin, BaseModel):
             needle = "fastvideo_fasth3"
         else:
             needle = f"minimax_h3_{partition}"
-        filtered = [c for c in candidates if needle in os.path.basename(c)]
+        filtered = [c for c in candidates if needle in os.path.basename(candidate_file(c))]
         if not filtered:
             raise ValueError(
                 f"No {component} candidate matches partition {partition!r} "

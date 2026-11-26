@@ -33,7 +33,7 @@ import os
 import torch
 from PIL import Image
 
-from toolkit.models.v2.resolver import comfy_precision_rank
+from toolkit.models.v2.resolver import candidate_file, comfy_precision_rank
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
@@ -107,12 +107,12 @@ class MinimaxH3ImageModel(MinimaxH3Ref2VAModel):
             return None
         qtype = self.model_config.qtype if self.model_config.quantize else "convrot8"
 
-        def rank(candidate: str):
-            if "w4a8" in os.path.basename(candidate):
+        def rank(candidate):
+            if "w4a8" in os.path.basename(candidate_file(candidate)):
                 wanted = qtype is not None and "w4a8" in str(qtype).lower()
                 return (0 if wanted else 9, candidates.index(candidate))
             return (
-                1 + comfy_precision_rank(candidate, qtype=qtype),
+                1 + comfy_precision_rank(candidate_file(candidate), qtype=qtype),
                 candidates.index(candidate),
             )
 

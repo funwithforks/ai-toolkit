@@ -37,9 +37,20 @@ class Qwen35TextOnlyEncoder(Qwen3_5TextModel, OstrisTransformersMixin):
 
     aitk_comfy_repo = QWEN35_COMFY_REPO
     aitk_comfy_weight_names = {
-        "Qwen/Qwen3.5-2B": ["text_encoders/qwen3.5_2b_bf16.safetensors"],
-        "Qwen/Qwen3.5-4B": ["text_encoders/qwen3.5_4b_bf16.safetensors"],
-        "Qwen/Qwen3.5-9B": ["text_encoders/qwen3.5_9b_bf16.safetensors"],
+        # keys are the stock Qwen source ids a job may name; every file is
+        # the comfy repack, so each entry pins its host repo
+        "Qwen/Qwen3.5-2B": {
+            "repo": QWEN35_COMFY_REPO,
+            "files": ["text_encoders/qwen3.5_2b_bf16.safetensors"],
+        },
+        "Qwen/Qwen3.5-4B": {
+            "repo": QWEN35_COMFY_REPO,
+            "files": ["text_encoders/qwen3.5_4b_bf16.safetensors"],
+        },
+        "Qwen/Qwen3.5-9B": {
+            "repo": QWEN35_COMFY_REPO,
+            "files": ["text_encoders/qwen3.5_9b_bf16.safetensors"],
+        },
     }
 
     _PREFIXES = ("model.language_model.", "language_model.", "model.")

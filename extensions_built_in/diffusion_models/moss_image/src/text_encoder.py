@@ -44,7 +44,9 @@ class MossQwen35Encoder(Qwen35TextOnlyEncoder):
     aitk_config_repo = QWEN35_9B_REPO
     aitk_comfy_repo = COMFY_REPO  # same package repo as the DiT candidates
     aitk_comfy_weight_names = {
-        VENDOR_BASE_REPO: [COMFY_TE_FILE],
+        # the vendor key names the source repo; the file is the comfy
+        # repack, so the entry pins its host repo
+        VENDOR_BASE_REPO: {"repo": COMFY_REPO, "files": [COMFY_TE_FILE]},
         COMFY_REPO: [COMFY_TE_FILE],
     }
 

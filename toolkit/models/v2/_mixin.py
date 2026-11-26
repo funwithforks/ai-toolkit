@@ -893,8 +893,19 @@ class OstrisModelMixin:
 
         Candidate keys may be plain repo ids or ``(repo_id, subfolder)``
         tuples for checkpoints holding several of this component (e.g.
-        wan2.2's transformer / transformer_2)."""
-        from toolkit.models.v2.resolver import resolve_comfy_candidates, resolve_comfy_file, comfy_local_rel
+        wan2.2's transformer / transformer_2).
+
+        Download repo precedence: an entry's explicit ``{"repo": ...}``
+        override (the intentional-divergence channel — the files live in a
+        repo other than the key names), else a hub-style key treated as the
+        source repo (the key names the repo whose repack the candidates
+        are), else the class ``aitk_comfy_repo`` default."""
+        from toolkit.models.v2.resolver import (
+            repo_id_from_name_or_path,
+            resolve_comfy_candidates,
+            resolve_comfy_file,
+            comfy_local_rel,
+        )
 
         if override_path is not None:
             if not os.path.exists(override_path):
@@ -909,6 +920,11 @@ class OstrisModelMixin:
         if candidates is None:
             candidates = cls.aitk_comfy_weight_names.get(name_or_path)
         repo_id = cls.aitk_comfy_repo
+        if candidates is not None:
+            # the matched key names the source repo whose repack the
+            # candidates are (phase-0 semantics; a local dir or a
+            # .safetensors path keeps the class default)
+            repo_id = repo_id_from_name_or_path(name_or_path, repo_id)
         if isinstance(candidates, dict):
             # entries may carry their own comfy repo ({"repo": ..., "files": [...]})
             repo_id = candidates.get("repo", repo_id)

@@ -74,13 +74,27 @@ class QwenImageVAE(AutoencoderKLQwenImage, OstrisModelMixin):
 
     aitk_subfolder = "vae"
     aitk_comfy_repo = "Comfy-Org/Qwen-Image"
-    # one physical file behind every name this vae ships under
+    # one physical file behind every name this vae ships under; the comfy
+    # repos nest it differently (Qwen-Image under its packaging prefix,
+    # Krea-2 at the plain comfy path), so each entry names its own repo
+    # and true repo-relative path
     aitk_comfy_weight_names = {
-        "Comfy-Org/Qwen-Image": ["vae/qwen_image_vae.safetensors"],
-        "Qwen/Qwen-Image": ["vae/qwen_image_vae.safetensors"],
+        "Comfy-Org/Qwen-Image": [
+            "split_files/vae/qwen_image_vae.safetensors",
+        ],
+        "Qwen/Qwen-Image": {
+            "repo": "Comfy-Org/Qwen-Image",
+            "files": ["split_files/vae/qwen_image_vae.safetensors"],
+        },
         "Comfy-Org/Krea-2": ["vae/qwen_image_vae.safetensors"],
-        "krea/Krea-2-Raw": ["vae/qwen_image_vae.safetensors"],
-        "krea/Krea-2-Turbo": ["vae/qwen_image_vae.safetensors"],
+        "krea/Krea-2-Raw": {
+            "repo": "Comfy-Org/Krea-2",
+            "files": ["vae/qwen_image_vae.safetensors"],
+        },
+        "krea/Krea-2-Turbo": {
+            "repo": "Comfy-Org/Krea-2",
+            "files": ["vae/qwen_image_vae.safetensors"],
+        },
     }
 
     @classmethod

@@ -58,6 +58,11 @@ class Qwen3VLTextEncoder(Qwen3VLForConditionalGeneration, OstrisTransformersMixi
         "Comfy-Org/MiniMax-H3-Image": [
             "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
         ],
+        # FastH3 repack carries the same 32B encoder files at the same
+        # repo-relative paths (mirrored from MiniMax-H3)
+        "FastVideo/FastVideo-FastH3-Comfy": [
+            "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        ],
     }
 
     @classmethod

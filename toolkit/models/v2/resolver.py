@@ -16,7 +16,18 @@ from typing import Callable, Iterable, Optional
 from toolkit.paths import MODELS_PATH
 
 
-def comfy_precision_rank(filename: str, qtype: Optional[str] = None) -> int:
+def candidate_file(candidate) -> str:
+    """The repo-relative path of a comfy candidate. Plain candidates are
+    strings; a ``(repo_id, repo_rel_path)`` pair declares its own download
+    repo — the mechanism for one component whose identical file a second
+    repo hosts under a different repo-relative path. Filters that inspect
+    candidates should read the path through here."""
+    if isinstance(candidate, (tuple, list)):
+        return str(candidate[1])
+    return str(candidate)
+
+
+def comfy_precision_rank(filename, qtype: Optional[str] = None) -> int:
     """Load-preference rank for a comfy weight filename, given the REQUESTED
     quantization. A file whose shipped quantization matches the request loads
     with no work; anything else costs a dequantize/requantize pass, so:
@@ -31,7 +42,7 @@ def comfy_precision_rank(filename: str, qtype: Optional[str] = None) -> int:
       backend: bf16 (0) > fp16 (1) > convrot (2) > fp8 mixed (3) > fp8 (4) >
       other (5) — clean weights beat paying a dequantize
     """
-    name = os.path.basename(filename).lower()
+    name = os.path.basename(candidate_file(filename)).lower()
     is_convrot = "convrot" in name
     is_nvfp4 = "nvfp4" in name
     is_fp8 = ("fp8" in name or "float8" in name or "e4m3" in name) and not is_nvfp4
@@ -65,7 +76,7 @@ def comfy_local_rel(repo_rel: str) -> str:
 
 
 def resolve_comfy_candidates(
-    candidates: Iterable[str],
+    candidates: Iterable,
     repo_id: str,
     hf_token: Optional[str] = None,
     status_fn: Optional[Callable[[str], None]] = None,
@@ -74,20 +85,28 @@ def resolve_comfy_candidates(
     extra_roots: Optional[Iterable[str]] = None,
 ) -> Optional[str]:
     """Pick the best comfy weight file among precision variants of one
-    component (repo-relative paths, ranked by comfy_precision_rank for the
+    component (repo-relative paths, or ``(repo_id, repo_rel_path)`` pairs
+    carrying their own download repo; ranked by comfy_precision_rank for the
     requested qtype, then list order). The best-ranked LOCAL candidate wins;
     only when no candidate is local is the best-ranked one downloaded to its
-    comfy-layout location under MODELS_PATH. ``extra_roots`` are searched
+    comfy-layout location under MODELS_PATH, from its own repo (plain
+    candidates download from ``repo_id``). ``extra_roots`` are searched
     locally alongside MODELS_PATH (a local checkpoint dir holding the
     component); downloads always land in the MODELS_PATH layout regardless."""
     candidates = list(candidates)
     ordered = sorted(
         candidates,
-        key=lambda c: (comfy_precision_rank(c, qtype=qtype), candidates.index(c)),
+        key=lambda c: (
+            comfy_precision_rank(candidate_file(c), qtype=qtype),
+            candidates.index(c),
+        ),
     )
-    for repo_rel in ordered:
+    for cand in ordered:
         found = resolve_comfy_file(
-            comfy_local_rel(repo_rel), repo_id, local_only=True, extra_roots=extra_roots
+            comfy_local_rel(candidate_file(cand)),
+            repo_id,
+            local_only=True,
+            extra_roots=extra_roots,
         )
         if found is not None:
             return found
@@ -97,11 +116,13 @@ def resolve_comfy_candidates(
     import huggingface_hub
 
     best = ordered[0]
-    local_rel = comfy_local_rel(best)
+    best_repo = best[0] if isinstance(best, (tuple, list)) else repo_id
+    best_file = candidate_file(best)
+    local_rel = comfy_local_rel(best_file)
     if status_fn is not None:
-        status_fn(f"Downloading {best} from {repo_id} into {MODELS_PATH}")
+        status_fn(f"Downloading {best_file} from {best_repo} into {MODELS_PATH}")
     path = huggingface_hub.hf_hub_download(
-        repo_id=repo_id, filename=best, token=hf_token, local_dir=MODELS_PATH
+        repo_id=best_repo, filename=best_file, token=hf_token, local_dir=MODELS_PATH
     )
     if status_fn is not None:
         # explicit sequence marker: the download is fully on disk before any
