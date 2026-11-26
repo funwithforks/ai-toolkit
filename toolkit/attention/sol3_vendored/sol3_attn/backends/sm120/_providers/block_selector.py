@@ -497,16 +497,22 @@ def fused_attention(Q,K,V,KC,VM,KV,QB,FLAGS,INDEX,FULL,COUNTS,O,
 
 
 
-def buffers(q,capacity,vm_bf16,fused=False):
- b,t,h,d=q.shape;n=triton.cdiv(t,64);key=(tuple(q.shape),q.device,capacity,vm_bf16,fused)
+def buffers(q,capacity,vm_bf16,fused=False,walk=False):
+ b,t,h,d=q.shape;n=triton.cdiv(t,64);key=(tuple(q.shape),q.device,capacity,vm_bf16,fused,walk)
  if key not in CACHE:
   CACHE.clear();SAMPLE_CACHE.clear();VALUE_CACHE.clear()
   kc=torch.empty((b*h,n,d),device=q.device,dtype=torch.bfloat16)
   vm=torch.empty_like(kc,dtype=torch.bfloat16 if vm_bf16 else torch.float32);kv=torch.empty_like(kc,dtype=torch.float32)
   c=torch.empty((b*h,n),device=q.device,dtype=torch.float32);mom=torch.empty((b*h,2*d+2),device=q.device,dtype=torch.float32)
   qb=torch.empty_like(kc,dtype=torch.float32);th=torch.empty_like(c);th2=torch.empty_like(c)
-  flags=torch.empty((b*h,n,n),device=q.device,dtype=torch.int32);bits=torch.empty_like(flags,dtype=torch.uint64);off=torch.empty_like(flags);full=torch.empty_like(flags)
-  counts=torch.empty((b*h,n,3),device=q.device,dtype=torch.int32);index=torch.empty((b*h,n,capacity),device=q.device,dtype=torch.int32)
+  flags=torch.empty((b*h,n,n),device=q.device,dtype=torch.int32);bits=torch.empty_like(flags,dtype=torch.uint64)
+  if walk:
+   # The bitmap-walk path reads only flags/bits/kc/vm; the ids-path
+   # sidecars (off/full/counts/index) are never written on this route.
+   off=full=counts=index=None
+  else:
+   off=torch.empty_like(flags);full=torch.empty_like(flags)
+   counts=torch.empty((b*h,n,3),device=q.device,dtype=torch.int32);index=torch.empty((b*h,n,capacity),device=q.device,dtype=torch.int32)
   if fused:us=ls=ms=[]
   else:
    us=[torch.empty_like(q,dtype=torch.float32) for _ in range(2)];ls=[torch.empty((b,t,h),device=q.device,dtype=torch.float32) for _ in range(2)];ms=[torch.empty_like(ls[0]) for _ in range(2)]

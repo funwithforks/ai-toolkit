@@ -26,6 +26,28 @@ from .routing import DEFAULT_COVARIANCE, make_route
 
 _PROFILE = PROFILES["fast"]
 _WORKSPACE = Workspace("fast", __package__ + ".")
+_REPORTED = set()
+
+
+def _report_footprint(q, route, covariance, gamma):
+    # One-time route footprint per shape: the resident route tensors are
+    # the sol3-vs-stock peak-memory delta, so they must be attributable
+    # at a glance (768p verdict, docs/kernel_opt/sol3/SOL3.md).
+    key = (tuple(q.shape), q.device)
+    if key in _REPORTED:
+        return
+    _REPORTED.add(key)
+    from ._providers import h3_mu_route
+    nbytes = sum(x.numel() * x.element_size() for x in route.values()
+                 if torch.is_tensor(x))
+    for val in h3_mu_route.CACHE.values():
+        tensors = val if isinstance(val, tuple) else (val,)
+        nbytes += sum(x.numel() * x.element_size() for x in tensors
+                      if torch.is_tensor(x))
+    if covariance is not None:
+        nbytes += covariance.numel() * covariance.element_size()
+    print(f"  sol3 route footprint: {nbytes / 2**20:.1f} MiB resident "
+          f"(shape {tuple(q.shape)}, cov_gamma={gamma})")
 
 
 def forward(q, k, v, *, counters=None, config=None, prefix_tokens=0, dense=None):
@@ -40,6 +62,7 @@ def forward(q, k, v, *, counters=None, config=None, prefix_tokens=0, dense=None)
     with _WORKSPACE.call(q, counters) as state:
         route = make_route(q, k, v, cfg, prefix_tokens)
         covariance = sol3_kv_covariance.global_covariance(k, v, prefix_tokens) if gamma else None
+        _report_footprint(q, route, covariance, gamma)
         bk, warps = _PROFILE.joint_launch if state.optimized else (128, 8)
         out = compact.attention(
             q, k, v, route, prefix_tokens=prefix_tokens, dense=dense,
